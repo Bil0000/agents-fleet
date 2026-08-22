@@ -1,0 +1,12 @@
+[Unit]
+Description=Check for validated Fleet updates every minute
+
+[Timer]
+OnActiveSec=1m
+OnUnitActiveSec=1m
+AccuracySec=1us
+Persistent=true
+Unit=fleet-update.service
+
+[Install]
+WantedBy=timers.target

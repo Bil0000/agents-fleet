@@ -1,0 +1,18 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Local Fleet state and secrets
+memory.toml
+.env
+.env.*
+!.env.example
+*.cred
+*.db
+*.sqlite*
+
+# Local worktrees and generated output
+.worktrees/
+dist/
+build/
+

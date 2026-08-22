@@ -1,0 +1,6 @@
+[Unit]
+Description=Back up shared Fleet Claude-mem database
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/fleet memory backup

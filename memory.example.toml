@@ -1,0 +1,8 @@
+version = "13.15.3"
+server_host = "memory-server"
+client_host = "local-mac"
+ssh_target = "user@server.example"
+worker_host = "127.0.0.1"
+worker_port = 37702
+tunnel_port = 37703
+backup_retention_days = 14

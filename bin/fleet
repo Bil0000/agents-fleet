@@ -1,0 +1,129 @@
+#!/bin/bash
+set -eu
+PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin
+export PATH
+
+script=$0
+while [ -L "$script" ]; do
+  directory=$(cd "$(dirname "$script")" && pwd)
+  link=$(readlink "$script")
+  case "$link" in
+    /*) script=$link ;;
+    *) script=$directory/$link ;;
+  esac
+done
+root=$(cd "$(dirname "$script")/.." && pwd)
+
+find_python() {
+  for candidate in /usr/local/bin/python3 /opt/homebrew/bin/python3 /usr/bin/python3; do
+    if [ -x "$candidate" ] && "$candidate" -I -c 'import tomllib' >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  echo "Fleet needs Python 3.11 or newer." >&2
+  return 1
+}
+
+case "${1:-}" in
+  check)
+    python=$(find_python)
+    "$python" -B -I - "$root" <<'PY'
+import json
+import re
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+root = Path(sys.argv[1])
+errors = []
+ignored = {".git", ".fleet", ".worktrees", "__pycache__"}
+paths = [path for path in root.rglob("*") if not ignored.intersection(path.relative_to(root).parts)]
+for path in paths:
+    if path.is_symlink():
+        errors.append(f"{path.relative_to(root)}: symlink is not allowed")
+files = [
+    path
+    for path in paths
+    if path.is_file()
+    and not path.is_symlink()
+]
+
+for path in files:
+    relative = path.relative_to(root)
+    try:
+        if path.suffix == ".json":
+            data = json.loads(path.read_text())
+        elif path.suffix == ".toml":
+            data = tomllib.loads(path.read_text())
+            if path.name == "host.toml" and path.parent.parent == root / "hosts":
+                host = data
+                if set(host) != {"id", "os", "role"}:
+                    raise ValueError("required keys are id, os, and role")
+                if host["id"] != path.parent.name:
+                    errors.append(f"{relative}: host ID must match directory name")
+                if not isinstance(host["os"], str) or host["os"] not in {"macos", "linux"}:
+                    errors.append(f"{relative}: host OS must be macos or linux")
+                if not isinstance(host["role"], str) or not host["role"].strip():
+                    errors.append(f"{relative}: host role must be non-empty")
+
+    except (UnicodeDecodeError, json.JSONDecodeError, tomllib.TOMLDecodeError, ValueError) as error:
+        errors.append(f"{relative}: invalid {path.suffix[1:].upper()}: {error}")
+
+shell_files = [path for path in files if path.suffix == ".sh" or path.parent.name == "bin"]
+for path in shell_files:
+    result = subprocess.run(["/bin/bash", "-n", str(path)], capture_output=True, text=True)
+    if result.returncode:
+        errors.append(f"{path.relative_to(root)}: invalid shell: {result.stderr.strip()}")
+
+secret_patterns = (
+    re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    re.compile(rb"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
+    re.compile(rb"\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b"),
+)
+credential_pair = re.compile(
+    rb"(?i)\b(?:pg|postgres(?:ql)?|minio)\b[^\r\n()]{0,64}"
+    rb"\([A-Za-z0-9_.@-]{2,}/[A-Za-z0-9_.@-]{2,}(?:/[A-Za-z0-9_.-]+)?\)"
+)
+for path in files:
+    contents = path.read_bytes()
+    if any(pattern.search(contents) for pattern in secret_patterns):
+        errors.append(f"{path.relative_to(root)}: possible secret")
+    if credential_pair.search(contents):
+        errors.append(f"{path.relative_to(root)}: possible credential pair")
+    relative = path.relative_to(root)
+    if relative.parts[0] != "hosts" and re.search(
+        rb"/(?:Users|home)/[A-Za-z0-9._-]+(?:/|\b)", contents
+    ):
+        errors.append(f"{relative}: device path is only allowed under hosts")
+
+if errors:
+    print("\n".join(errors), file=sys.stderr)
+    raise SystemExit(1)
+PY
+    "$python" -B -I "$root/lib/fleet_mcp.py" "$root" validate
+    "$python" -B -I "$root/lib/fleet_apply.py" "$root" check
+    echo "Fleet check passed."
+    ;;
+  auth|mcp)
+    python=$(find_python)
+    exec "$python" -B -I "$root/lib/fleet_mcp.py" "$root" "$@"
+    ;;
+  memory)
+    python=$(find_python)
+    exec "$python" -B -I "$root/lib/fleet_memory.py" "$root" "${@:2}"
+    ;;
+  status|update|scan|adopt)
+    python=$(find_python)
+    exec "$python" -B -I "$root/lib/fleet_discovery.py" "$root" "$@"
+    ;;
+  apply|rollback|enable-updates|disable-updates)
+    python=$(find_python)
+    exec "$python" -B -I "$root/lib/fleet_apply.py" "$root" "$@"
+    ;;
+  *)
+    echo "Usage: fleet check | fleet apply | fleet status | fleet scan | fleet adopt ... | fleet update | fleet rollback | fleet enable-updates | fleet disable-updates | fleet auth ... | fleet mcp ... | fleet memory ..." >&2
+    exit 2
+    ;;
+esac

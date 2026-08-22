@@ -1,0 +1,10 @@
+[Unit]
+Description=Back up shared Fleet Claude-mem database daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=fleet-memory-backup.service
+
+[Install]
+WantedBy=timers.target

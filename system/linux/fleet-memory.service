@@ -1,0 +1,12 @@
+[Unit]
+Description=Run shared Fleet Claude-mem worker
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/fleet memory worker
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

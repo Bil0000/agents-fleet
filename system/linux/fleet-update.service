@@ -1,0 +1,6 @@
+[Unit]
+Description=Update and apply Fleet configuration
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/fleet update
