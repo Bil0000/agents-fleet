@@ -4,7 +4,7 @@
 
 A blank, working source of truth for Claude Code and Codex across macOS and Linux.
 
-Fleet keeps your own rules, settings, skills, commands, hooks, plugins, MCP servers, secrets, updates, and Claude-Mem setup consistent. This repository contains the engine and empty folders. It does not contain the author's configuration.
+Fleet keeps your own rules, settings, skills, commands, hooks, plugins, MCP servers, secrets, updates, and Claude-Mem setup consistent. This repository contains the engine and empty folders. It does not contain my own configuration.
 
 ## Start here
 
