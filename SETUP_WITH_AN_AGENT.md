@@ -2,6 +2,34 @@
 
 This file is an execution contract for the agent that sets up Fleet. Finish every required step. Do not stop after a plan.
 
+## Before anything else: confirm repository ownership
+
+Do not fork `Bil0000/agents-fleet`. A public fork stays public.
+
+The normal setup is a new private repository created with GitHub's **Use this template** button. Use only the default `main` branch from the template. GitHub Actions creates `live` after the user's first passing push.
+
+Before writing any personal content, run:
+
+```bash
+git remote get-url origin
+git remote -v
+git status --short --branch
+```
+
+If `origin` points to `Bil0000/agents-fleet`, do not continue in that clone.
+
+- For GitHub sync, have the user create a private repository from the template, clone it, and continue there.
+- For a local-only setup, run `git remote remove origin` only after the user confirms they do not want GitHub sync.
+
+For a GitHub setup, verify all of these before continuing:
+
+- The user or their organization owns `origin`.
+- The repository is private.
+- The default branch is `main`.
+- No writable remote points to `Bil0000/agents-fleet`.
+
+Never push personal rules, host profiles, or setup data to the public template.
+
 ## Required outcome
 
 - The user's current Claude Code and Codex setup is preserved.
@@ -14,7 +42,7 @@ This file is an execution contract for the agent that sets up Fleet. Finish ever
 
 - Use one local device unless the user explicitly asks for multiple devices.
 - Use local Claude-Mem unless the user explicitly asks for one shared memory database.
-- Keep the repository private when it contains personal rules or machine overlays.
+- Use a private repository owned by the user. A local clone with no remote is also supported.
 - Add the smallest configuration that reproduces the user's current intent.
 - Do not copy third-party skills or plugins into this repository. Declare or install them from their original source.
 - Stop only for a login, an OAuth screen, a missing key that only the user can provide, payment, or an irreversible action.
@@ -31,13 +59,14 @@ node --version
 npx --version
 command -v claude || true
 command -v codex || true
+command -v gh || true
 git status --short
 git remote -v
 ```
 
 Fleet supports macOS and Linux. Python must be 3.11 or newer. Claude-Mem requires Node.js 20.12 or newer. Fleet-managed Linux secrets also require `/usr/bin/systemd-creds` and non-interactive `sudo` access to that command.
 
-If this is the public template, fork it or copy it to a repository owned by the user. Use a private repository when personal configuration will be pushed. Local-only users can keep the clone without a remote.
+If the ownership checks above did not pass, stop here. Do not solve an ownership problem by pushing to a different branch of the public template.
 
 ## 2. Back up current state
 
@@ -162,22 +191,37 @@ bash tests/test_fleet.sh
 
 Inspect the dry-run targets. They must stay under the current user's home directory.
 
-## 8. Apply and enable updates
+## 8. Push, apply, and enable updates
 
-Run:
+When the user has a private GitHub repository, push `main`:
+
+```bash
+git push origin main
+```
+
+Wait for the repository's **Check** workflow to pass on macOS and Linux. It must create or update `live`. Then verify the two remote branches match:
+
+```bash
+git fetch origin main live
+test "$(git rev-parse origin/main)" = "$(git rev-parse origin/live)"
+```
+
+Do not enable updates if the workflow failed or `live` does not match `main`.
+
+Apply the tested commit:
 
 ```bash
 ./bin/fleet apply --host HOST
 ~/.local/bin/fleet status --host HOST
 ```
 
-When the repository has an `origin` remote and GitHub Actions promotes passing commits to `live`, enable automatic updates:
+Enable automatic updates:
 
 ```bash
 ~/.local/bin/fleet enable-updates
 ```
 
-For a clone with no remote, use `./bin/fleet apply --host HOST` after local edits and do not enable the updater.
+For a clone with no remote, use `./bin/fleet apply --host HOST` after local checks. Do not push or enable the updater.
 
 Restart Claude Code and Codex. Confirm:
 
@@ -199,9 +243,21 @@ For each device:
 4. Store its MCP secrets locally.
 5. Run check, dry run, apply, enable updates, and status.
 
-Push user changes to `main`. GitHub Actions checks macOS and Linux, then advances `live`. Devices apply `live` on their next one-minute check.
+Push user changes to their repository's `main` branch. GitHub Actions checks macOS and Linux, then advances that repository's `live` branch. Devices apply `origin/live` on their next one-minute check.
 
-## 10. Final report
+## 10. Update the Fleet engine
+
+A repository created from this template is independent. New versions of `Bil0000/agents-fleet` do not enter the user's repository automatically.
+
+When the user asks for a template update:
+
+1. Compare the public template with the user's current Fleet.
+2. Back up the user's Fleet and managed client files.
+3. Move only the engine and documentation changes that the user wants.
+4. Preserve all user rules, hosts, skills, hooks, plugins, MCPs, secrets, and memory data.
+5. Run check, tests, dry run, GitHub Actions, apply, and status again.
+
+## 11. Final report
 
 Report only:
 

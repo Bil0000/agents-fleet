@@ -150,5 +150,16 @@ class PublicRepositoryValidationTest(unittest.TestCase):
                 discovery.fleet.check_repository(root)
 
 
+class PublicDocumentationTest(unittest.TestCase):
+    def test_setup_starts_with_a_user_owned_private_repository(self):
+        readme = (ROOT / "README.md").read_text()
+        setup = (ROOT / "SETUP_WITH_AN_AGENT.md").read_text()
+
+        self.assertIn("Use this template", readme)
+        self.assertIn("git remote get-url origin", setup)
+        self.assertIn("Do not fork", readme + setup)
+        self.assertNotIn("actions/workflows/check.yml/badge.svg", readme)
+
+
 if __name__ == "__main__":
     unittest.main(argv=[sys.argv[0]])
