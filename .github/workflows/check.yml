@@ -1,0 +1,44 @@
+{
+  "name": "Check",
+  "on": {
+    "pull_request": {},
+    "push": { "branches": ["main"] },
+    "workflow_dispatch": {}
+  },
+  "permissions": { "contents": "read" },
+  "jobs": {
+    "check": {
+      "strategy": {
+        "fail-fast": false,
+        "matrix": { "os": ["ubuntu-latest", "macos-latest"] }
+      },
+      "runs-on": "${{ matrix.os }}",
+      "timeout-minutes": 10,
+      "steps": [
+        {
+          "uses": "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+          "with": { "persist-credentials": false }
+        },
+        { "name": "Check Fleet", "run": "bin/fleet check" },
+        { "name": "Test Fleet", "run": "bash tests/test_fleet.sh" }
+      ]
+    },
+    "promote": {
+      "needs": "check",
+      "if": "github.event_name == 'push' && github.ref == 'refs/heads/main'",
+      "runs-on": "ubuntu-latest",
+      "permissions": { "contents": "write" },
+      "timeout-minutes": 5,
+      "steps": [
+        {
+          "uses": "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+          "with": { "fetch-depth": 0 }
+        },
+        {
+          "name": "Promote tested commit",
+          "run": "git push origin \"${GITHUB_SHA}:refs/heads/live\""
+        }
+      ]
+    }
+  }
+}
