@@ -61,9 +61,9 @@ DOCS_API_KEY
 Store the value on each device:
 
 ```bash
-fleet auth set DOCS_API_KEY
+./bin/fleet auth set DOCS_API_KEY
 ```
 
 Use a host overlay under `hosts/HOST/mcp/` for a server that exists on only one device. A host overlay has the same three manifest files.
 
-Run `fleet check` after every change. Static credentials, credential-like command arguments, unsafe URLs, mismatched client entries, and undeclared secrets are rejected.
+Run `./bin/fleet check` after every change. Static credentials, credential-like command arguments, unsafe URLs, mismatched client entries, and undeclared secrets are rejected.

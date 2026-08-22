@@ -7,7 +7,7 @@ This file is an execution contract for the agent that sets up Fleet. Finish ever
 - The user's current Claude Code and Codex setup is preserved.
 - The Fleet repository contains only the user's chosen portable configuration.
 - Claude-Mem works for every selected client.
-- `fleet check`, the test suite, a dry run, apply, status, and automatic updates work.
+- Check, tests, dry run, apply, and status work. Automatic updates work when a remote is configured.
 - No secret, OAuth state, session transcript, cache, database, or private machine path is committed.
 
 ## Safe defaults
@@ -130,9 +130,9 @@ Use this only when the user asks for one database shared by a macOS client and a
 3. Copy `memory.example.toml` to `memory.toml`.
 4. Set `server_host`, `client_host`, `ssh_target`, and the installed Claude-Mem `version`.
 5. Make sure the macOS client can use key-based SSH to the Linux server.
-6. Apply Fleet on the Linux server, then run `fleet memory enable --host SERVER_HOST`.
-7. Apply Fleet on the macOS client, then run `fleet memory enable --host CLIENT_HOST`.
-8. Run `fleet memory status --host HOST` on both devices.
+6. Apply Fleet on the Linux server, then run `~/.local/bin/fleet memory enable --host SERVER_HOST`.
+7. Apply Fleet on the macOS client, then run `~/.local/bin/fleet memory enable --host CLIENT_HOST`.
+8. Run `~/.local/bin/fleet memory status --host HOST` on both devices.
 9. Confirm new observations written from each client appear in the server database.
 
 Do not merge old databases unless the user asks. When a merge is required, work on snapshots, verify schema compatibility and foreign keys, keep both originals, and replace nothing until the merged copy passes checks.
@@ -177,7 +177,7 @@ When the repository has an `origin` remote and GitHub Actions promotes passing c
 ~/.local/bin/fleet enable-updates
 ```
 
-For a clone with no remote, use `fleet apply --host HOST` after local edits and do not enable the updater.
+For a clone with no remote, use `./bin/fleet apply --host HOST` after local edits and do not enable the updater.
 
 Restart Claude Code and Codex. Confirm:
 

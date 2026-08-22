@@ -174,8 +174,6 @@ def configure_client(home, config):
             "CLAUDE_MEM_RUNTIME": "worker",
             "CLAUDE_MEM_WORKER_HOST": config.worker_host,
             "CLAUDE_MEM_WORKER_PORT": str(config.worker_port),
-            "CLAUDE_MEM_PROVIDER": "claude",
-            "CLAUDE_MEM_CLAUDE_AUTH_METHOD": "subscription",
         }
     )
     atomic_json(settings_path, settings, 0o600)
@@ -417,8 +415,6 @@ def run_worker(home, config, *, executor=os.execve):
         "CLAUDE_MEM_RUNTIME": "worker",
         "CLAUDE_MEM_WORKER_HOST": config.worker_host,
         "CLAUDE_MEM_WORKER_PORT": str(config.worker_port),
-        "CLAUDE_MEM_PROVIDER": "claude",
-        "CLAUDE_MEM_CLAUDE_AUTH_METHOD": "subscription",
     }
     executable = str(bun)
     executor(executable, [executable, str(script), "--daemon"], environment)

@@ -140,7 +140,15 @@ class FleetMemoryRuntimeTest(unittest.TestCase):
     def test_configure_client_preserves_unmanaged_settings_and_freezes_only_claude_mem(self):
         settings = self.home / ".claude-mem/settings.json"
         settings.parent.mkdir()
-        settings.write_text(json.dumps({"PRIVATE": "keep", "CLAUDE_MEM_WORKER_PORT": "1"}))
+        settings.write_text(
+            json.dumps(
+                {
+                    "PRIVATE": "keep",
+                    "CLAUDE_MEM_WORKER_PORT": "1",
+                    "CLAUDE_MEM_PROVIDER": "gemini",
+                }
+            )
+        )
         marketplaces = self.home / ".claude/plugins/known_marketplaces.json"
         marketplaces.parent.mkdir(parents=True)
         marketplaces.write_text(
@@ -159,8 +167,8 @@ class FleetMemoryRuntimeTest(unittest.TestCase):
         self.assertEqual(applied["CLAUDE_MEM_RUNTIME"], "worker")
         self.assertEqual(applied["CLAUDE_MEM_WORKER_HOST"], "127.0.0.1")
         self.assertEqual(applied["CLAUDE_MEM_WORKER_PORT"], "37702")
-        self.assertEqual(applied["CLAUDE_MEM_PROVIDER"], "claude")
-        self.assertEqual(applied["CLAUDE_MEM_CLAUDE_AUTH_METHOD"], "subscription")
+        self.assertEqual(applied["CLAUDE_MEM_PROVIDER"], "gemini")
+        self.assertNotIn("CLAUDE_MEM_CLAUDE_AUTH_METHOD", applied)
         self.assertEqual(os.stat(settings).st_mode & 0o777, 0o600)
         frozen = json.loads(marketplaces.read_text())
         self.assertFalse(frozen["thedotmack"]["autoUpdate"])
@@ -334,7 +342,8 @@ class FleetMemoryRuntimeTest(unittest.TestCase):
         self.assertEqual(captured["arguments"], [str(bun), str(worker.resolve()), "--daemon"])
         self.assertEqual(captured["environment"]["CLAUDE_MEM_WORKER_HOST"], "127.0.0.1")
         self.assertEqual(captured["environment"]["CLAUDE_MEM_WORKER_PORT"], "37702")
-        self.assertEqual(captured["environment"]["CLAUDE_MEM_CLAUDE_AUTH_METHOD"], "subscription")
+        self.assertNotIn("CLAUDE_MEM_PROVIDER", captured["environment"])
+        self.assertNotIn("CLAUDE_MEM_CLAUDE_AUTH_METHOD", captured["environment"])
 
     def test_disable_server_stops_services_without_deleting_memory(self):
         database = self.home / ".claude-mem/claude-mem.db"
