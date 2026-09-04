@@ -38,7 +38,7 @@ BACKUP_NAME = re.compile(r"^[0-9]{8}T[0-9]{12}Z-(?:none|[0-9a-f]{40}(?:[0-9a-f]{
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 PLUGIN_ID = re.compile(r"^[a-z0-9][a-z0-9-]*@[a-z0-9][a-z0-9-]*$")
 GITHUB_SOURCE = re.compile(r"^(?:https://github\.com/)?([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?$")
-CODEX_SCALARS = ("model", "model_reasoning_effort", "personality", "web_search", "service_tier")
+CODEX_SCALARS = ("personality", "web_search", "service_tier")
 CODEX_FEATURES = ("multi_agent", "memories", "chronicle")
 CODEX_REMOVED_FEATURES = ("plugin_hooks", "js_repl")
 CODEX_HOOK_EVENTS = {
@@ -46,8 +46,6 @@ CODEX_HOOK_EVENTS = {
     "SessionEnd", "SessionStart", "Stop", "SubagentStart", "SubagentStop", "UserPromptSubmit",
 }
 CLAUDE_STRING_LEAVES = {
-    "model",
-    "effortLevel",
     "theme",
     "tui",
     "preferredNotifChannel",
@@ -1338,6 +1336,8 @@ def build_plan(root, home, host, temporary, credential_reader, *, sha=None, arch
         [
             path_operation(home, ".local/share/fleet/current", link=f"releases/{sha}"),
             path_operation(home, ".local/bin/fleet", link="../share/fleet/current/bin/fleet"),
+            path_operation(home, ".local/bin/fleet-codex", link="../share/fleet/current/bin/fleet-client"),
+            path_operation(home, ".local/bin/fleet-claude", link="../share/fleet/current/bin/fleet-client"),
             path_operation(home, ".codex/AGENTS.md", data=compose_rules(source_root, host, "codex").encode(), mode=0o644),
             path_operation(home, ".claude/CLAUDE.md", data=compose_rules(source_root, host, "claude").encode(), mode=0o644),
         ]
@@ -1433,6 +1433,20 @@ def fingerprint_node(path, base, output, managed_mcp):
                 contents = json.dumps(managed, sort_keys=True, separators=(",", ":")).encode()
             except (AttributeError, TypeError, UnicodeError, tomllib.TOMLDecodeError):
                 fail("Invalid Codex configuration file.")
+        elif relative == ".claude/settings.json":
+            try:
+                config = json.loads(contents)
+                managed = {key: config[key] for key in sorted(CLAUDE_LEAVES) if key in config}
+                for parent, leaves in CLAUDE_NESTED.items():
+                    values = config.get(parent, {})
+                    if not isinstance(values, dict):
+                        raise TypeError
+                    selected = {key: values[key] for key in sorted(leaves) if key in values}
+                    if selected:
+                        managed[parent] = selected
+                contents = json.dumps(managed, sort_keys=True, separators=(",", ":")).encode()
+            except (AttributeError, TypeError, UnicodeError, json.JSONDecodeError):
+                fail("Invalid Claude settings file.")
         elif relative == ".claude.json":
             try:
                 servers = json.loads(contents).get("mcpServers", {})
@@ -1456,7 +1470,11 @@ def live_fingerprints(home, relatives=None, managed_mcp=None):
     home = Path(home)
     managed_mcp = [] if managed_mcp is None else managed_mcp
     output = {}
-    roots = relatives or [".agents", ".codex", ".claude", ".claude.json", ".local/bin/fleet", ".local/share/fleet/current", ".local/share/fleet/tools"]
+    roots = relatives or [
+        ".agents", ".codex", ".claude", ".claude.json", ".local/bin/fleet",
+        ".local/bin/fleet-codex", ".local/bin/fleet-claude",
+        ".local/share/fleet/current", ".local/share/fleet/tools",
+    ]
     for relative in roots:
         target = safe_target(home, relative)
         fingerprint_node(target, home, output, managed_mcp)
@@ -1502,7 +1520,7 @@ def allowed_backup_root(relative):
     if relative in {
         ".codex/AGENTS.md", ".claude/CLAUDE.md", ".codex/config.toml",
         ".codex/hooks.json", ".claude/settings.json", ".claude/statusline.sh",
-        ".claude.json", ".local/bin/fleet",
+        ".claude.json", ".local/bin/fleet", ".local/bin/fleet-codex", ".local/bin/fleet-claude",
         ".local/share/fleet/current", ".local/state/fleet/last-applied.json",
     }:
         return True

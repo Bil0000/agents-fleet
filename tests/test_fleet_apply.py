@@ -84,8 +84,34 @@ class FleetApplyTest(unittest.TestCase):
         self.assertEqual(state["mcpServers"], {"mine": {"command": "mine"}})
         self.assertEqual((self.home / ".codex/AGENTS.md").read_text(), "\n")
         self.assertEqual((self.home / ".claude/CLAUDE.md").read_text(), "\n")
+        self.assertEqual((self.home / ".local/bin/fleet-codex").readlink(), Path("../share/fleet/current/bin/fleet-client"))
+        self.assertEqual((self.home / ".local/bin/fleet-claude").readlink(), Path("../share/fleet/current/bin/fleet-client"))
         self.assertEqual(result["managed_mcp"], [])
         self.assertEqual(result["plugins"], {"claude": [], "codex": []})
+
+    def test_provider_models_and_account_routing_stay_unmanaged(self):
+        self.apply()
+        state = json.loads((self.home / ".local/state/fleet/last-applied.json").read_text())
+        codex = self.home / ".codex/config.toml"
+        codex.write_text(
+            codex.read_text().replace('model = "keep"', 'model = "new"')
+            + '\nmodel_reasoning_effort = "high"\n[model_providers.local]\nname = "Local"\n'
+        )
+        claude = self.home / ".claude/settings.json"
+        value = json.loads(claude.read_text())
+        value.update({"model": "new", "effortLevel": "high", "apiKeyHelper": "/bin/true"})
+        value.setdefault("env", {})["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8317"
+        claude.write_text(json.dumps(value))
+
+        self.assertEqual(
+            fleet.live_fingerprints(self.home, state["roots"], state["managed_mcp"]),
+            state["fingerprints"],
+        )
+
+    def test_template_cannot_hardcode_provider_models(self):
+        (self.repo / "settings/codex.toml").write_text('model = "pinned"\n')
+        with self.assertRaisesRegex(fleet.FleetError, "Invalid managed Codex settings"):
+            fleet.check_repository(self.repo)
 
     def test_rules_stay_in_their_client_scope(self):
         (self.repo / "rules/common.md").write_text("COMMON\n")
