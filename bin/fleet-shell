@@ -1,0 +1,13 @@
+codex() {
+  case "${1:-}:${2:-}" in
+    login:*|logout:*) command fleet-codex "$@" ;;
+    *) command codex "$@" ;;
+  esac
+}
+
+claude() {
+  case "${1:-}:${2:-}:${3:-}" in
+    auth:login:*|auth:logout:*) command fleet-claude "$@" ;;
+    *) command claude "$@" ;;
+  esac
+}

@@ -1,0 +1,34 @@
+#!/bin/bash
+set -eu
+
+directory=$(cd "$(dirname "$0")" && pwd)
+name=${0##*/}
+client=${name#fleet-}
+case "$client" in
+  codex|claude) ;;
+  *) echo "Run this as codex or claude." >&2; exit 2 ;;
+esac
+
+native=
+old_ifs=$IFS
+IFS=:
+for path in $PATH; do
+  [ -n "$path" ] || path=.
+  candidate=$path/$client
+  if [ -x "$candidate" ] && ! [ "$candidate" -ef "$0" ]; then
+    native=$candidate
+    break
+  fi
+done
+IFS=$old_ifs
+[ -n "$native" ] || { echo "The native $client executable was not found." >&2; exit 2; }
+
+case "$client:${1:-}:${2:-}:${3:-}" in
+  codex:login:status:*|codex:login:-h:*|codex:login:--help:*|codex:logout:-h:*|codex:logout:--help:*|claude:auth:status:*|claude:auth:login:-h|claude:auth:login:--help|claude:auth:logout:-h|claude:auth:logout:--help)
+    exec "$native" "$@"
+    ;;
+  codex:login:*:*|codex:logout:*:*|claude:auth:login:*|claude:auth:logout:*)
+    exec "$directory/fleet" account native-auth "$client" "$native" "$@"
+    ;;
+  *) exec "$native" "$@" ;;
+esac
