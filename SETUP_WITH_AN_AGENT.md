@@ -43,6 +43,7 @@ Never push personal rules, host profiles, or setup data to the public template.
 - Use one local device unless the user explicitly asks for multiple devices.
 - Use local Claude-Mem unless the user explicitly asks for one shared memory database.
 - Use a private repository owned by the user. A local clone with no remote is also supported.
+- Leave multi-account routing off unless the user asks for it.
 - Add the smallest configuration that reproduces the user's current intent.
 - Do not copy third-party skills or plugins into this repository. Declare or install them from their original source.
 - Stop only for a login, an OAuth screen, a missing key that only the user can provide, payment, or an irreversible action.
@@ -215,6 +216,10 @@ Apply the tested commit:
 ~/.local/bin/fleet status --host HOST
 ```
 
+The apply installs `~/.local/bin/fleet`. Make sure the user's shell includes `~/.local/bin` in `PATH`. Preserve the startup file, do not add the path twice, and do not use sudo. Start a fresh login shell in `/tmp` and confirm that `fleet status` works.
+
+If the user wants multi-account routing, run `fleet account setup` once on this device. It must finish with `fleet account setup --check` passing. Then open a new terminal and let the user add accounts with the normal `codex login` or `claude auth login` flow. Do not add OAuth files to the repository. Keep the proxy on localhost. Use `fleet account auto PROVIDER on` only after the user has added a fallback account.
+
 Enable automatic updates:
 
 ```bash
@@ -229,6 +234,7 @@ Restart Claude Code and Codex. Confirm:
 - `~/.claude/CLAUDE.md` has common and Claude rules.
 - Managed skills, commands, and hooks resolve to the Fleet release.
 - Existing unmanaged configuration remains present.
+- Native Claude and Codex commands still work, and optional account routing changes only quota consumption.
 - Declared plugins and MCPs are available.
 - Claude-Mem loads memory in a new session.
 - The update service is active when a remote is configured.

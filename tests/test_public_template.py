@@ -158,6 +158,9 @@ class PublicDocumentationTest(unittest.TestCase):
         self.assertIn("Use this template", readme)
         self.assertIn("git remote get-url origin", setup)
         self.assertIn("Do not fork", readme + setup)
+        self.assertIn("fleet account setup", readme + setup)
+        self.assertIn("normal provider commands", readme)
+        self.assertIn("does not contain a model list", readme)
         self.assertNotIn("actions/workflows/check.yml/badge.svg", readme)
 
 

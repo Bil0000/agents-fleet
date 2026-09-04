@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A blank, working source of truth for Claude Code and Codex across macOS and Linux.
+A blank, working source of truth for Claude Code and Codex across macOS and Linux, with optional multi-account failover.
 
 Fleet keeps your own rules, settings, skills, commands, hooks, plugins, MCP servers, secrets, updates, and Claude-Mem setup consistent. This repository contains the engine and empty folders. It does not contain my own configuration.
 
@@ -63,6 +63,43 @@ Inspect local additions:
 ~/.local/bin/fleet scan
 ```
 
+## Multiple accounts
+
+Fleet can route any number of Claude and Codex subscriptions through one shared client home. Only the account that pays for a request changes. Threads, transcripts, memory, rules, settings, models, reasoning options, and native client behavior stay shared and provider-owned.
+
+Set it up once on each macOS or Linux device:
+
+```bash
+fleet account setup
+```
+
+Fleet downloads and verifies CLIProxyAPI 7.2.149, installs a small retry bridge, and keeps both endpoints and their private keys on localhost. No separate proxy install or sudo access is needed. If Fleet finds a proxy setup that it does not own, it stops without changing it.
+
+Use this only with accounts you own and where each provider's terms and plan allow it.
+
+Open a new terminal, then use the normal provider commands to add or refresh accounts:
+
+```bash
+codex login
+claude auth login
+fleet account list
+```
+
+The same native logout commands remove the matching routed account. Logging in to the same account refreshes it instead of creating a duplicate. Fleet labels can be changed at any time.
+
+```bash
+fleet account rename codex ACCOUNT "Work Pro"
+fleet account use codex "Work Pro"
+fleet account auto codex on
+fleet account current codex
+```
+
+Auto mode defaults to `limits only`: it switches accounts only for a structured subscription-limit response before output starts. `fleet account auto codex on --when any` also switches for temporary provider errors and can spend fallback quota. Each new request tries the chosen primary first again, so Fleet returns to it after its limit resets. Fleet never replays a request after output starts because that could repeat tool work or other side effects.
+
+The same commands work with `claude`. Run `fleet account auto --help` to see the switching modes. `fleet account current` reports the account used by the latest successful 10-minute request bucket. Use `fleet account enroll` only to adopt credentials from an existing CLIProxyAPI setup.
+
+Fleet does not contain a model list. New models, aliases, reasoning controls, auth screens, and non-auth client commands continue to come directly from Claude and Codex.
+
 ## Safety model
 
 - Fleet refuses dirty releases, symlinks, common secret formats, unsafe paths, and invalid manifests.
@@ -84,6 +121,11 @@ Inspect local additions:
 ~/.local/bin/fleet scan --host HOST
 ~/.local/bin/fleet rollback
 ~/.local/bin/fleet auth set SECRET_NAME
+~/.local/bin/fleet account setup
+~/.local/bin/fleet account list
+~/.local/bin/fleet account current
+~/.local/bin/fleet account use codex ACCOUNT
+~/.local/bin/fleet account auto codex on
 ```
 
 ## Requirements
