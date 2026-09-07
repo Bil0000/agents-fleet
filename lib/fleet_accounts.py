@@ -48,6 +48,16 @@ fleet = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fleet)
 
 
+def supported_setup_version(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", value):
+        return False
+    return tuple(map(int, value.split("."))) >= tuple(map(int, SETUP_VERSION.split(".")))
+
+
+def managed_setup_version(home):
+    return load_setup_state(home, allow_newer=True)["version"]
+
+
 def account_home():
     configured = os.environ.get("FLEET_ACCOUNT_HOME")
     return Path(configured) if configured else Path.home()
@@ -187,8 +197,8 @@ def release_asset(system=None, machine=None):
         raise fleet.FleetError("CLIProxyAPI setup supports macOS and Linux on arm64 or x86_64.") from None
 
 
-def setup_paths(home, platform_name):
-    binary = fleet.safe_target(home, f".local/share/fleet/cliproxyapi/{SETUP_VERSION}/cli-proxy-api")
+def setup_paths(home, platform_name, version=SETUP_VERSION):
+    binary = fleet.safe_target(home, f".local/share/fleet/cliproxyapi/{version}/cli-proxy-api")
     paths = {
         "binary": binary,
         "bridge": binary.with_name("fleet-retry-bridge"),
@@ -223,6 +233,8 @@ def setup_config(auth, client_key, management_key, routing=None):
         "  bootstrap-retries: 0\n"
         "codex:\n"
         "  stream-bootstrap-buffering: true\n"
+        "provider-model-lists:\n"
+        "  enabled: true\n"
         "claude-header-defaults:\n"
         '  user-agent: "claude-cli/2.1.258 (external, cli)"\n'
         + error_rules_yaml(routing)
@@ -230,6 +242,18 @@ def setup_config(auth, client_key, management_key, routing=None):
         "  allow-remote: false\n"
         f"  secret-key: {json.dumps(management_key)}\n"
         "  disable-control-panel: true\n"
+    ).encode()
+
+
+def setup_plugin_config(paths):
+    return (
+        "plugins:\n"
+        "  enabled: true\n"
+        f'  dir: {json.dumps(str(paths["binary"].parent / "plugins"))}\n'
+        "  configs:\n"
+        "    fleet-provider-router:\n"
+        "      enabled: true\n"
+        "      priority: 100\n"
     ).encode()
 
 
@@ -241,19 +265,20 @@ def valid_setup_config(paths, client_key, management_key):
         current = paths["config"].read_bytes()
     except OSError:
         return False
-    if current == expected:
+    with_plugin = expected.replace(b"api-keys:\n", setup_plugin_config(paths) + b"api-keys:\n", 1)
+    if current in {expected, with_plugin}:
         return True
     normalized, count = re.subn(
         rb'(?m)^  secret-key: "\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}"$',
         b"  secret-key: " + json.dumps(management_key).encode(),
         current,
     )
-    return count == 1 and normalized == expected
+    return count == 1 and normalized in {expected, with_plugin}
 
 
-def setup_service(home, platform_name):
-    bridge = f"%h/.local/share/fleet/cliproxyapi/{SETUP_VERSION}/fleet-retry-bridge"
-    binary = f"%h/.local/share/fleet/cliproxyapi/{SETUP_VERSION}/cli-proxy-api"
+def setup_service(home, platform_name, version=SETUP_VERSION):
+    bridge = f"%h/.local/share/fleet/cliproxyapi/{version}/fleet-retry-bridge"
+    binary = f"%h/.local/share/fleet/cliproxyapi/{version}/cli-proxy-api"
     config = "%h/.config/fleet/cliproxyapi.yaml"
     if platform_name == "linux":
         return (
@@ -266,8 +291,8 @@ def setup_service(home, platform_name):
         {
             "Label": "com.fleet.cliproxyapi",
             "ProgramArguments": [
-                str(fleet.safe_target(home, f".local/share/fleet/cliproxyapi/{SETUP_VERSION}/fleet-retry-bridge")),
-                str(fleet.safe_target(home, f".local/share/fleet/cliproxyapi/{SETUP_VERSION}/cli-proxy-api")),
+                str(fleet.safe_target(home, f".local/share/fleet/cliproxyapi/{version}/fleet-retry-bridge")),
+                str(fleet.safe_target(home, f".local/share/fleet/cliproxyapi/{version}/cli-proxy-api")),
                 str(fleet.safe_target(home, ".config/fleet/cliproxyapi.yaml")),
             ],
             "RunAtLoad": True,
@@ -339,7 +364,7 @@ def existing_unmanaged_proxy(home):
     return False
 
 
-def load_setup_state(home, *, allow_upgrade=False):
+def load_setup_state(home, *, allow_upgrade=False, allow_newer=False):
     path = setup_state_path(home)
     try:
         value = json.loads(path.read_text())
@@ -347,9 +372,9 @@ def load_setup_state(home, *, allow_upgrade=False):
         raise fleet.FleetError("Invalid Fleet CLIProxyAPI setup state.") from None
     if not regular_private_file(path, 0o600):
         raise fleet.FleetError("Invalid Fleet CLIProxyAPI setup state.")
-    if value != {"version": SETUP_VERSION} and not (
-        allow_upgrade and value.get("version") in UPGRADABLE_SETUP_VERSIONS and set(value) == {"version"}
-    ):
+    valid_upgrade = allow_upgrade and value.get("version") in UPGRADABLE_SETUP_VERSIONS
+    valid_newer = allow_newer and supported_setup_version(value.get("version"))
+    if set(value) != {"version"} or not (value["version"] == SETUP_VERSION or valid_upgrade or valid_newer):
         raise fleet.FleetError("Invalid Fleet CLIProxyAPI setup state.")
     return value
 
@@ -465,11 +490,11 @@ def managed_key(paths, name):
     return value[:-1]
 
 
-def verify_setup_binary(home, path):
+def verify_setup_binary(home, path, version=SETUP_VERSION):
     if not regular_private_file(path, 0o700):
         raise fleet.FleetError("CLIProxyAPI binary is missing or unsafe.")
     try:
-        version = subprocess.run(
+        result = subprocess.run(
             [str(path), "-h"],
             capture_output=True,
             text=True,
@@ -478,8 +503,8 @@ def verify_setup_binary(home, path):
         )
     except (OSError, subprocess.TimeoutExpired):
         raise fleet.FleetError("Could not verify the CLIProxyAPI binary.") from None
-    if f"CLIProxyAPI Version: {SETUP_VERSION}" not in version.stdout + version.stderr:
-        raise fleet.FleetError(f"CLIProxyAPI {SETUP_VERSION} is required.")
+    if f"CLIProxyAPI Version: {version}" not in result.stdout + result.stderr:
+        raise fleet.FleetError(f"CLIProxyAPI {version} is required.")
 
 
 def setup_bridge():
@@ -689,7 +714,9 @@ def setup_proxy(home, *, platform_name=None, machine=None, downloader=None, nati
     release_asset(platform_name, machine)
     paths = setup_paths(home, platform_name)
     if os.path.lexists(paths["state"]):
-        load_setup_state(home, allow_upgrade=True)
+        setup = load_setup_state(home, allow_upgrade=True, allow_newer=True)
+        if setup["version"] != SETUP_VERSION and setup["version"] not in UPGRADABLE_SETUP_VERSIONS:
+            return
         logs, logs_created = prepare_setup_logs(home)
         logs_identity = directory_identity(logs)
         try:
@@ -899,7 +926,7 @@ def codex_routing_config(current, url, client_key_path):
         stripped = line.lstrip()
         if stripped.startswith("["):
             break
-        if re.match(r"^model_provider\s*=", stripped):
+        if re.match(r"^(model_provider|openai_base_url)\s*=", stripped):
             lines[index] = ""
     existing = "".join(lines)
     if existing and not existing.endswith("\n"):
@@ -908,11 +935,7 @@ def codex_routing_config(current, url, client_key_path):
         existing += "\n"
     rendered = (
         f"{ROUTING_BEGIN}\n"
-        f'model_provider = "{FLEET_PROVIDER}"\n'
-        f'model_providers.{FLEET_PROVIDER} = {{ name = "Fleet CLIProxyAPI", base_url = "{url}/v1", '
-        'wire_api = "responses", request_max_retries = 100, stream_max_retries = 0, '
-        'requires_openai_auth = false, supports_websockets = false, '
-        f'auth = {{ command = "/bin/cat", args = [{json.dumps(str(client_key_path))}] }} }}\n'
+        f'openai_base_url = "{url}/v1"\n'
         f"{ROUTING_END}\n\n"
         f"{existing}"
     ).encode()
@@ -1047,6 +1070,40 @@ def restore_codex_contents(current, prior, written):
     try:
         current_value = tomllib.loads(current.decode())
         written_value = tomllib.loads(written.decode())
+        if "openai_base_url" in written_value:
+            if current_value.get("openai_base_url") != written_value["openai_base_url"]:
+                raise ValueError
+            reformatted = begin not in current and marker not in current
+            if reformatted:
+                current_prefix, current_rest = b"", current
+            else:
+                current_prefix, current_block, current_rest = split(current)
+                if current_block != split(written)[1]:
+                    raise ValueError
+            lines = []
+            top_level = True
+            removed = reformatted is False
+            for line in current_rest.decode().splitlines(keepends=True):
+                if re.match(r"^\s*\[", line):
+                    top_level = False
+                if reformatted and top_level and re.match(r"^\s*openai_base_url\s*=", line):
+                    removed = True
+                    continue
+                lines.append(line)
+            if not removed:
+                raise ValueError
+            prior_keys = []
+            for line in prior.decode().splitlines(keepends=True):
+                stripped = line.lstrip()
+                if stripped.startswith("["):
+                    break
+                if re.match(r"^(model_provider|openai_base_url)\s*=", stripped):
+                    prior_keys.append(line if line.endswith("\n") else line + "\n")
+            restored = current_prefix + "".join(prior_keys).encode() + "".join(lines).encode()
+            value = tomllib.loads(restored.decode()) if restored.strip() else {}
+            if value.get("model_provider") == FLEET_PROVIDER or FLEET_PROVIDER in value.get("model_providers", {}):
+                raise ValueError
+            return restored
         written_prefix, written_block, _ = split(written)
         if current_value.get("model_provider") != FLEET_PROVIDER:
             raise ValueError
@@ -1181,16 +1238,10 @@ def provider_routing_valid(home, provider, url):
         raw = path.read_bytes()
         if provider == "codex":
             value = tomllib.loads(raw.decode())
-            provider_config = value.get("model_providers", {}).get(FLEET_PROVIDER, {})
             return (
-                value.get("model_provider") == FLEET_PROVIDER
-                and provider_config.get("base_url") == url + "/v1"
-                and provider_config.get("wire_api") == "responses"
-                and provider_config.get("request_max_retries") == 100
-                and provider_config.get("stream_max_retries") == 0
-                and provider_config.get("requires_openai_auth") is False
-                and provider_config.get("supports_websockets") is False
-                and provider_config.get("auth") == {"command": "/bin/cat", "args": [str(client_key_path)]}
+                value.get("openai_base_url") == url + "/v1"
+                and "model_provider" not in value
+                and FLEET_PROVIDER not in value.get("model_providers", {})
             )
         value = json.loads(raw)
         return (
@@ -1315,7 +1366,7 @@ def managed_runtime_config(paths, config):
 def probe_setup(home):
     client = ManagementClient(home=home)
     config = client.config()
-    paths = setup_paths(home, "darwin" if sys.platform == "darwin" else "linux")
+    paths = setup_paths(home, "darwin" if sys.platform == "darwin" else "linux", managed_setup_version(home))
     client_key = managed_runtime_config(paths, config)
     require_safe_failover_config(config, client_key)
     probe_inference_endpoint(client.url, client_key)
@@ -1326,14 +1377,19 @@ def check_setup(home, *, platform_name=None, machine=None, native_runner=None, p
     platform_name = "linux" if platform_name.startswith("linux") else platform_name
     try:
         release_asset(platform_name, machine)
-        paths = setup_paths(home, platform_name)
-        if not paths["state"].exists():
+        if not setup_state_path(home).exists():
             raise fleet.FleetError("CLIProxyAPI is not set up. Run fleet account setup.")
-        load_setup_state(home)
+        setup = load_setup_state(home, allow_newer=True)
+        paths = setup_paths(home, platform_name, setup["version"])
         client_key, management_key = verify_managed_config(paths)
-        if not regular_private_file(paths["service"], 0o600) or paths["service"].read_bytes() != setup_service(home, platform_name):
+        if setup["version"] != SETUP_VERSION:
+            suffix = ".dylib" if platform_name == "darwin" else ".so"
+            plugin = paths["binary"].parent / f"plugins/fleet-provider-router{suffix}"
+            if not regular_private_file(plugin, 0o700) or setup_plugin_config(paths) not in paths["config"].read_bytes():
+                raise fleet.FleetError("CLIProxyAPI provider router does not match Fleet setup.")
+        if not regular_private_file(paths["service"], 0o600) or paths["service"].read_bytes() != setup_service(home, platform_name, setup["version"]):
             raise fleet.FleetError("CLIProxyAPI user service does not match Fleet setup.")
-        verify_setup_binary(home, paths["binary"])
+        verify_setup_binary(home, paths["binary"], setup["version"])
         if not valid_setup_bridge(paths["bridge"]):
             raise fleet.FleetError("Fleet retry bridge does not match Fleet setup.")
         if not native_setup_status(home, platform_name, native_runner):
@@ -1519,7 +1575,7 @@ class ManagementClient:
                 headers={"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"},
             )
             with self.open(request, timeout=5) as response:
-                if response.headers.get("X-CPA-VERSION") != SETUP_VERSION:
+                if not supported_setup_version(response.headers.get("X-CPA-VERSION")):
                     raise fleet.FleetError(f"Fleet account management requires CLIProxyAPI {SETUP_VERSION}.")
                 raw = response.read(4 * 1024 * 1024 + 1)
         except fleet.FleetError:
@@ -1879,11 +1935,13 @@ def resolve_account(state, provider, entries, wanted):
 def runtime_for_mutation(home):
     client = ManagementClient()
     config = client.config()
-    paths = setup_paths(home, "darwin" if sys.platform == "darwin" else "linux")
-    if os.path.lexists(paths["state"]):
-        load_setup_state(home)
+    platform_name = "darwin" if sys.platform == "darwin" else "linux"
+    state = setup_state_path(home)
+    if os.path.lexists(state):
+        paths = setup_paths(home, platform_name, managed_setup_version(home))
         client_key = managed_runtime_config(paths, config)
     else:
+        paths = setup_paths(home, platform_name)
         client_key = managed_key(paths, "client_key")
     require_safe_failover_config(config, client_key)
     safe_auth_dir(home, config)
@@ -2041,7 +2099,12 @@ def login_auth_dir(home, path):
 
 def proxy_binary():
     configured = os.environ.get("FLEET_CLIPROXYAPI")
-    managed = setup_paths(account_home(), "darwin" if sys.platform == "darwin" else "linux")["binary"]
+    home = account_home()
+    try:
+        managed_version = managed_setup_version(home)
+    except fleet.FleetError:
+        managed_version = SETUP_VERSION
+    managed = home / f".local/share/fleet/cliproxyapi/{managed_version}/cli-proxy-api"
     candidates = [configured] if configured else [managed, shutil.which("cliproxyapi"), shutil.which("cli-proxy-api"), "/opt/homebrew/bin/cliproxyapi", "/usr/local/bin/cliproxyapi"]
     for candidate in candidates:
         if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
@@ -2049,7 +2112,8 @@ def proxy_binary():
                 version = subprocess.run([candidate, "-h"], capture_output=True, text=True, timeout=5)
             except (OSError, subprocess.TimeoutExpired):
                 continue
-            if f"CLIProxyAPI Version: {SETUP_VERSION}" not in version.stdout + version.stderr:
+            found = re.findall(r"CLIProxyAPI Version: ([0-9.]+)", version.stdout + version.stderr)
+            if not any(supported_setup_version(value) for value in found):
                 raise fleet.FleetError(f"Fleet account management requires CLIProxyAPI {SETUP_VERSION}.")
             return candidate
     raise fleet.FleetError(f"CLIProxyAPI {SETUP_VERSION} is not installed.")

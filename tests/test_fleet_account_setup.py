@@ -13,7 +13,8 @@ import tarfile
 import tempfile
 import tomllib
 import unittest
-from contextlib import redirect_stderr
+import urllib.parse
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest import mock
@@ -209,6 +210,7 @@ class FleetAccountSetupTest(unittest.TestCase):
         self.assertNotIn(f'api-keys:\n  - "{management_key.read_text().strip()}"', config_text)
         self.assertIn('claude-header-defaults:\n  user-agent: "claude-cli/2.1.258 (external, cli)"', config_text)
         self.assertIn("codex:\n  stream-bootstrap-buffering: true", config_text)
+        self.assertIn("provider-model-lists:\n  enabled: true", config_text)
         self.assertIn("oauth-request-scoped-errors:\n  claude:", config_text)
         self.assertIn('      - "rate_limit_error"', config_text)
         self.assertIn("  codex:", config_text)
@@ -247,6 +249,7 @@ class FleetAccountSetupTest(unittest.TestCase):
             ("/usr/bin/systemctl", "--user", "is-enabled", "fleet-cliproxyapi.service"),
             ("/usr/bin/systemctl", "--user", "is-active", "fleet-cliproxyapi.service"),
         ])
+
 
     def test_setup_rerun_keeps_an_explicit_any_policy(self):
         native = LinuxNative(self.home)
@@ -385,6 +388,7 @@ class FleetAccountSetupTest(unittest.TestCase):
             ],
         )
 
+
     def test_provider_routing_preserves_shared_client_config(self):
         client_key = self.home / ".local/state/fleet/cliproxyapi-client-key"
         client_key.parent.mkdir(parents=True)
@@ -409,13 +413,9 @@ class FleetAccountSetupTest(unittest.TestCase):
         codex_value = tomllib.loads(codex.read_text())
         self.assertEqual(codex_value["model"], "gpt-5.5")
         self.assertTrue(codex_value["features"]["memories"])
-        self.assertEqual(codex_value["model_provider"], "fleet_cliproxyapi")
-        provider = codex_value["model_providers"]["fleet_cliproxyapi"]
-        self.assertEqual(provider["base_url"], "http://127.0.0.1:8317/v1")
-        self.assertEqual(provider["wire_api"], "responses")
-        self.assertEqual(provider["request_max_retries"], 100)
-        self.assertFalse(provider["supports_websockets"])
-        self.assertEqual(provider["auth"], {"command": "/bin/cat", "args": [str(client_key)]})
+        self.assertNotIn("model_provider", codex_value)
+        self.assertNotIn("fleet_cliproxyapi", codex_value.get("model_providers", {}))
+        self.assertEqual(codex_value["openai_base_url"], "http://127.0.0.1:8317/v1")
 
     def test_provider_routing_can_refresh_existing_codex_route(self):
         client_key = self.home / ".local/state/fleet/cliproxyapi-client-key"
@@ -443,12 +443,7 @@ class FleetAccountSetupTest(unittest.TestCase):
         config.write_text('model_provider = "old"\nmodel = "gpt-5.5"\n')
         ACCOUNTS.configure_provider_routing(self.home, "codex", "http://127.0.0.1:8317", probe=lambda _url: None)
         config.write_text(
-            f'model_provider = "{ACCOUNTS.FLEET_PROVIDER}"\nmodel = "gpt-5.6"\n\n'
-            f'[model_providers.{ACCOUNTS.FLEET_PROVIDER}]\n'
-            'name = "Fleet CLIProxyAPI"\nbase_url = "http://127.0.0.1:8317/v1"\nwire_api = "responses"\n'
-            'request_max_retries = 100\nstream_max_retries = 0\nrequires_openai_auth = false\nsupports_websockets = false\n\n'
-            f'[model_providers.{ACCOUNTS.FLEET_PROVIDER}.auth]\n'
-            f'command = "/bin/cat"\nargs = [{json.dumps(str(client_key))}]\n'
+            'openai_base_url = "http://127.0.0.1:8317/v1"\nmodel = "gpt-5.6"\n'
         )
 
         ACCOUNTS.configure_provider_routing(self.home, "codex", "http://127.0.0.1:8317", probe=lambda _url: None)
@@ -781,6 +776,69 @@ class FleetAccountSetupTest(unittest.TestCase):
         self.assertIn("codex login", output.getvalue())
         self.assertIn("Claude is not routed", output.getvalue())
         self.assertIn("Codex is not routed", output.getvalue())
+
+    def test_setup_check_requires_router_for_newer_managed_proxy(self):
+        native = LinuxNative(self.home)
+        ACCOUNTS.setup_proxy(self.home, **self.linux_setup_args(native))
+        old = self.home / ".local/share/fleet/cliproxyapi/7.2.149"
+        current = old.with_name("7.2.151")
+        old.rename(current)
+        (current / "cli-proxy-api").write_text("#!/bin/sh\necho 'CLIProxyAPI Version: 7.2.151'\n")
+        (current / "cli-proxy-api").chmod(0o700)
+        state = ACCOUNTS.setup_state_path(self.home)
+        state.write_text('{"version":"7.2.151"}\n')
+        service = self.home / ".config/systemd/user/fleet-cliproxyapi.service"
+        service.write_text(service.read_text().replace("7.2.149", "7.2.151"))
+
+        with redirect_stderr(StringIO()):
+            self.assertFalse(ACCOUNTS.check_setup(
+                self.home,
+                platform_name="linux",
+                machine="amd64",
+                native_runner=native,
+                probe=lambda _home: None,
+            ))
+
+        paths = ACCOUNTS.setup_paths(self.home, "linux", "7.2.151")
+        config = paths["config"]
+        plugin_config = (
+            "plugins:\n"
+            "  enabled: true\n"
+            f'  dir: "{current}/plugins"\n'
+            "  configs:\n"
+            "    fleet-provider-router:\n"
+            "      enabled: true\n"
+            "      priority: 100\n"
+        ).encode()
+        config.write_bytes(config.read_bytes().replace(b"api-keys:\n", plugin_config + b"api-keys:\n"))
+        plugin = current / "plugins/fleet-provider-router.so"
+        plugin.parent.mkdir()
+        plugin.write_bytes(b"plugin")
+        plugin.chmod(0o700)
+
+        self.assertTrue(ACCOUNTS.check_setup(
+            self.home,
+            platform_name="linux",
+            machine="amd64",
+            native_runner=native,
+            probe=lambda _home: None,
+        ))
+
+    def test_setup_does_not_downgrade_newer_managed_proxy(self):
+        state = ACCOUNTS.setup_state_path(self.home)
+        state.parent.mkdir(parents=True)
+        state.write_text('{"version":"7.2.151"}\n')
+        state.chmod(0o600)
+        downloader = mock.Mock()
+
+        ACCOUNTS.setup_proxy(
+            self.home,
+            platform_name="linux",
+            machine="amd64",
+            downloader=downloader,
+        )
+
+        downloader.assert_not_called()
 
     def test_setup_check_accepts_enrolled_codex_with_client_routing(self):
         native = LinuxNative(self.home)

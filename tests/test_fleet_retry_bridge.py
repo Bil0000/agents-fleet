@@ -28,6 +28,7 @@ class UpstreamHandler(BaseHTTPRequestHandler):
     first_chunk = None
     finish_stream = None
     truncate = False
+    authorizations = []
 
     def log_message(self, *_args):
         pass
@@ -44,6 +45,7 @@ class UpstreamHandler(BaseHTTPRequestHandler):
         self.respond()
 
     def do_POST(self):
+        type(self).authorizations = self.headers.get_all("Authorization", [])
         self.rfile.read(int(self.headers.get("Content-Length", "0")))
         self.respond()
 
@@ -82,6 +84,7 @@ class RetryBridgeTest(unittest.TestCase):
         UpstreamHandler.first_chunk = None
         UpstreamHandler.finish_stream = None
         UpstreamHandler.truncate = False
+        UpstreamHandler.authorizations = []
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
         self.upstream_thread = threading.Thread(target=self.upstream.serve_forever, daemon=True)
         self.upstream_thread.start()
@@ -103,13 +106,25 @@ class RetryBridgeTest(unittest.TestCase):
         self.upstream_thread.join()
         self.temporary.cleanup()
 
-    def request(self, method="POST", path="/v1/responses", body=b"{}"):
+    def request(self, method="POST", path="/v1/responses", body=b"{}", headers=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.bridge.server_port, timeout=3)
-        connection.request(method, path, body=body, headers={"Content-Type": "application/json"})
+        connection.request(method, path, body=body, headers={"Content-Type": "application/json", **(headers or {})})
         response = connection.getresponse()
         result = response.status, dict(response.getheaders()), response.read()
         connection.close()
         return result
+
+    def test_provider_requests_use_only_the_local_router_key_upstream(self):
+        self.bridge.client_key = "router-key"
+
+        for path in ("/v1/responses", "/v1/messages"):
+            with self.subTest(path=path):
+                status, _headers, _body = self.request(
+                    path=path, headers={"authorization": "Bearer native-provider-token"}
+                )
+
+                self.assertEqual(status, 200)
+                self.assertEqual(UpstreamHandler.authorizations, ["Bearer router-key"])
 
     def test_structured_codex_quota_retries_before_output(self):
         bodies = (
@@ -130,6 +145,11 @@ class RetryBridgeTest(unittest.TestCase):
                 self.assertEqual(headers["Content-Type"], "text/plain")
                 self.assertEqual(received, b"recovered")
                 self.assertEqual(UpstreamHandler.calls, 2)
+
+    def test_long_reset_hints_wait_at_most_five_minutes(self):
+        body = b'{"error":{"type":"usage_limit_reached","resets_at":4102444800,"resets_in_seconds":444419}}'
+        self.assertEqual(BRIDGE.quota_retry_delay("/v1/responses", 429, {}, body), 300)
+        self.assertEqual(BRIDGE.quota_retry_delay("/v1/responses", 429, {"Retry-After": "444419"}, body), 300)
 
     def test_structured_claude_limit_retries_before_output(self):
         UpstreamHandler.responses = [

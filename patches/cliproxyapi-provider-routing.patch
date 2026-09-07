@@ -1,0 +1,897 @@
+diff --git a/internal/api/server_provider_models.go b/internal/api/server_provider_models.go
+new file mode 100644
+index 0000000..4185265
+--- /dev/null
++++ b/internal/api/server_provider_models.go
+@@ -0,0 +1,99 @@
++package api
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"strings"
++
++	"github.com/gin-gonic/gin"
++	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
++	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
++	log "github.com/sirupsen/logrus"
++)
++
++// providerModelListsEnabled reports whether /v1/models must be answered by the
++// provider itself through an enrolled OAuth credential.
++func (s *Server) providerModelListsEnabled() bool {
++	return s != nil && s.cfg != nil && s.cfg.ProviderModelLists.Enabled && !s.cfg.Home.Enabled
++}
++
++// providerModelsHandler forwards the client's own model list request to the
++// provider. Codex clients (client_version query) reach the ChatGPT Codex backend;
++// Anthropic clients reach api.anthropic.com. The response body is returned
++// unchanged so the client sees exactly what its subscription offers. It returns
++// false when the local catalog must answer instead.
++func (s *Server) providerModelsHandler(c *gin.Context) bool {
++	if !s.providerModelListsEnabled() || s.handlers == nil || s.handlers.AuthManager == nil {
++		return false
++	}
++	provider := ""
++	upstreamURL := ""
++	headers := make(http.Header)
++	headers.Set("Accept", "application/json")
++	if value := strings.TrimSpace(c.GetHeader("User-Agent")); value != "" {
++		headers.Set("User-Agent", value)
++	}
++	if _, ok := c.Request.URL.Query()["client_version"]; ok {
++		provider = "codex"
++		upstreamURL = "https://chatgpt.com/backend-api/codex/models?" + c.Request.URL.RawQuery
++		headers.Set("Originator", "codex_cli_rs")
++		for _, name := range []string{"Version", "Session_id", "X-Client-Request-Id"} {
++			if value := strings.TrimSpace(c.GetHeader(name)); value != "" {
++				headers.Set(name, value)
++			}
++		}
++	} else if isAnthropicModelsRequest(c) {
++		provider = "claude"
++		upstreamURL = "https://api.anthropic.com/v1/models"
++		if c.Request.URL.RawQuery != "" {
++			upstreamURL += "?" + c.Request.URL.RawQuery
++		}
++		headers.Set("Anthropic-Version", "2023-06-01")
++		headers.Set("Anthropic-Beta", "oauth-2025-04-20")
++	} else {
++		return false
++	}
++
++	ctx := context.WithValue(c.Request.Context(), "gin", c)
++	selected, err := s.handlers.AuthManager.SelectAuth(ctx, provider, "", coreexecutor.Options{Headers: c.Request.Header.Clone()})
++	if err != nil || selected == nil || selected.AuthKind() != auth.AuthKindOAuth {
++		log.WithField("provider", provider).WithError(err).Debug("provider model list: no OAuth credential available, using local catalog")
++		return false
++	}
++	if provider == "codex" {
++		if accountID, ok := selected.Metadata["account_id"].(string); ok && strings.TrimSpace(accountID) != "" {
++			headers.Set("Chatgpt-Account-Id", accountID)
++		}
++	}
++	req, err := s.handlers.AuthManager.NewHttpRequest(ctx, selected, http.MethodGet, upstreamURL, nil, headers)
++	if err != nil {
++		log.WithField("provider", provider).WithError(err).Warn("provider model list: request build failed, using local catalog")
++		return false
++	}
++	resp, err := s.handlers.AuthManager.HttpRequest(ctx, selected, req)
++	if err != nil {
++		log.WithField("provider", provider).WithError(err).Warn("provider model list: upstream request failed, using local catalog")
++		return false
++	}
++	defer func() {
++		if errClose := resp.Body.Close(); errClose != nil {
++			log.WithError(errClose).Debug("provider model list: close response body")
++		}
++	}()
++	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
++	if err != nil {
++		log.WithField("provider", provider).WithError(err).Warn("provider model list: read failed, using local catalog")
++		return false
++	}
++	if resp.StatusCode != http.StatusOK {
++		log.WithFields(log.Fields{"provider": provider, "status": resp.StatusCode}).Warn("provider model list: upstream error, using local catalog")
++		return false
++	}
++	contentType := resp.Header.Get("Content-Type")
++	if contentType == "" {
++		contentType = "application/json"
++	}
++	c.Data(http.StatusOK, contentType, body)
++	return true
++}
+diff --git a/internal/api/server_provider_models_test.go b/internal/api/server_provider_models_test.go
+new file mode 100644
+index 0000000..ef46f30
+--- /dev/null
++++ b/internal/api/server_provider_models_test.go
+@@ -0,0 +1,173 @@
++package api
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
++	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
++)
++
++type providerModelsCaptureExecutor struct {
++	provider string
++	request  *http.Request
++	body     string
++	status   int
++}
++
++func (e *providerModelsCaptureExecutor) Identifier() string { return e.provider }
++func (e *providerModelsCaptureExecutor) Execute(context.Context, *auth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
++	return coreexecutor.Response{}, nil
++}
++func (e *providerModelsCaptureExecutor) ExecuteStream(context.Context, *auth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
++	return nil, nil
++}
++func (e *providerModelsCaptureExecutor) Refresh(_ context.Context, a *auth.Auth) (*auth.Auth, error) {
++	return a, nil
++}
++func (e *providerModelsCaptureExecutor) CountTokens(context.Context, *auth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
++	return coreexecutor.Response{}, nil
++}
++func (e *providerModelsCaptureExecutor) PrepareRequest(req *http.Request, a *auth.Auth) error {
++	if token, _ := a.Metadata["access_token"].(string); token != "" {
++		req.Header.Set("Authorization", "Bearer "+token)
++	}
++	return nil
++}
++func (e *providerModelsCaptureExecutor) HttpRequest(_ context.Context, _ *auth.Auth, req *http.Request) (*http.Response, error) {
++	e.request = req.Clone(req.Context())
++	status := e.status
++	if status == 0 {
++		status = http.StatusOK
++	}
++	return &http.Response{
++		StatusCode: status,
++		Header:     http.Header{"Content-Type": []string{"application/json"}},
++		Body:       io.NopCloser(strings.NewReader(e.body)),
++	}, nil
++}
++
++func TestProviderModelListsForwardToProvider(t *testing.T) {
++	cases := []struct {
++		name        string
++		provider    string
++		path        string
++		header      map[string]string
++		metadata    map[string]any
++		wantURL     string
++		wantHeaders map[string]string
++	}{
++		{
++			name:     "codex",
++			provider: "codex",
++			path:     "/v1/models?client_version=0.153.3",
++			header:   map[string]string{"User-Agent": "codex_cli_rs/0.153.3"},
++			metadata: map[string]any{"access_token": "codex-token", "account_id": "account-123"},
++			wantURL:  "https://chatgpt.com/backend-api/codex/models?client_version=0.153.3",
++			wantHeaders: map[string]string{
++				"Chatgpt-Account-Id": "account-123",
++				"Originator":         "codex_cli_rs",
++				"User-Agent":         "codex_cli_rs/0.153.3",
++			},
++		},
++		{
++			name:     "claude",
++			provider: "claude",
++			path:     "/v1/models?limit=1000",
++			header:   map[string]string{"User-Agent": "claude-cli/2.1.258 (external, cli)", "Anthropic-Version": "2023-06-01"},
++			metadata: map[string]any{"access_token": "claude-token"},
++			wantURL:  "https://api.anthropic.com/v1/models?limit=1000",
++			wantHeaders: map[string]string{
++				"Anthropic-Version": "2023-06-01",
++				"Anthropic-Beta":    "oauth-2025-04-20",
++			},
++		},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			server := newTestServer(t)
++			server.cfg.ProviderModelLists.Enabled = true
++			executor := &providerModelsCaptureExecutor{provider: tc.provider, body: `{"provider":"` + tc.provider + `"}`}
++			server.handlers.AuthManager.RegisterExecutor(executor)
++			credential := &auth.Auth{ID: tc.provider + "-auth", Provider: tc.provider, Status: auth.StatusActive, Metadata: tc.metadata}
++			if _, err := server.handlers.AuthManager.Register(context.Background(), credential); err != nil {
++				t.Fatalf("register auth: %v", err)
++			}
++
++			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
++			req.Header.Set("Authorization", "Bearer test-key")
++			for name, value := range tc.header {
++				req.Header.Set(name, value)
++			}
++			rr := httptest.NewRecorder()
++			server.engine.ServeHTTP(rr, req)
++
++			if rr.Code != http.StatusOK {
++				t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
++			}
++			if got := rr.Body.String(); got != `{"provider":"`+tc.provider+`"}` {
++				t.Fatalf("body = %q, want provider payload unchanged", got)
++			}
++			if executor.request == nil {
++				t.Fatal("provider was not called")
++			}
++			if got := executor.request.URL.String(); got != tc.wantURL {
++				t.Fatalf("upstream URL = %q, want %q", got, tc.wantURL)
++			}
++			for name, want := range tc.wantHeaders {
++				if got := executor.request.Header.Get(name); got != want {
++					t.Fatalf("header %s = %q, want %q", name, got, want)
++				}
++			}
++		})
++	}
++}
++
++func TestProviderModelListsFallBackToCatalogWhenUpstreamFails(t *testing.T) {
++	server := newTestServer(t)
++	server.cfg.ProviderModelLists.Enabled = true
++	executor := &providerModelsCaptureExecutor{provider: "codex", status: http.StatusBadGateway, body: `{"error":"down"}`}
++	server.handlers.AuthManager.RegisterExecutor(executor)
++	credential := &auth.Auth{ID: "codex-auth", Provider: "codex", Status: auth.StatusActive, Metadata: map[string]any{"access_token": "codex-token"}}
++	if _, err := server.handlers.AuthManager.Register(context.Background(), credential); err != nil {
++		t.Fatalf("register auth: %v", err)
++	}
++
++	req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.153.3", nil)
++	req.Header.Set("Authorization", "Bearer test-key")
++	rr := httptest.NewRecorder()
++	server.engine.ServeHTTP(rr, req)
++
++	if rr.Code != http.StatusOK {
++		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
++	}
++	if !strings.Contains(rr.Body.String(), `"models"`) {
++		t.Fatalf("expected local Codex catalog fallback, got %s", rr.Body.String())
++	}
++}
++
++func TestProviderModelListsDisabledUsesCatalog(t *testing.T) {
++	server := newTestServer(t)
++	executor := &providerModelsCaptureExecutor{provider: "codex", body: `{"provider":"codex"}`}
++	server.handlers.AuthManager.RegisterExecutor(executor)
++	credential := &auth.Auth{ID: "codex-auth", Provider: "codex", Status: auth.StatusActive, Metadata: map[string]any{"access_token": "codex-token"}}
++	if _, err := server.handlers.AuthManager.Register(context.Background(), credential); err != nil {
++		t.Fatalf("register auth: %v", err)
++	}
++
++	req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.153.3", nil)
++	req.Header.Set("Authorization", "Bearer test-key")
++	rr := httptest.NewRecorder()
++	server.engine.ServeHTTP(rr, req)
++
++	if executor.request != nil {
++		t.Fatal("provider must not be called when provider model lists are disabled")
++	}
++	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"models"`) {
++		t.Fatalf("expected local catalog, got %d %s", rr.Code, rr.Body.String())
++	}
++}
+diff --git a/internal/api/server_routes.go b/internal/api/server_routes.go
+index fc9de12..38499ff 100644
+--- a/internal/api/server_routes.go
++++ b/internal/api/server_routes.go
+@@ -558,6 +558,10 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
+ 			return
+ 		}
+ 
++		if s.providerModelsHandler(c) {
++			return
++		}
++
+ 		if _, ok := c.Request.URL.Query()["client_version"]; ok {
+ 			clientVersion := c.Query("client_version")
+ 			if s != nil && s.cfg != nil && s.cfg.Home.Enabled {
+diff --git a/internal/config/sdk_config.go b/internal/config/sdk_config.go
+index 1c5a1bb..a72ccc6 100644
+--- a/internal/config/sdk_config.go
++++ b/internal/config/sdk_config.go
+@@ -51,6 +51,9 @@ type SDKConfig struct {
+ 	// ClaudeCode configures Claude Code compatibility behavior.
+ 	ClaudeCode ClaudeCodeConfig `yaml:"claude-code" json:"claude-code"`
+ 
++	// ProviderModelLists serves /v1/models from the provider through an enrolled credential.
++	ProviderModelLists ProviderModelListsConfig `yaml:"provider-model-lists" json:"provider-model-lists"`
++
+ 	// APIKeys is a list of keys for authenticating clients to this proxy server.
+ 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
+ 
+@@ -72,6 +75,12 @@ type ClaudeCodeConfig struct {
+ 	DisableCloakingModelList bool `yaml:"disable-cloaking-model-list" json:"disable-cloaking-model-list"`
+ }
+ 
++// ProviderModelListsConfig forwards client model list requests to the provider
++// through an enrolled OAuth credential instead of answering from the local catalog.
++type ProviderModelListsConfig struct {
++	Enabled bool `yaml:"enabled" json:"enabled"`
++}
++
+ // StreamingConfig holds server streaming behavior configuration.
+ type StreamingConfig struct {
+ 	// KeepAliveSeconds controls how often the server emits SSE heartbeats (": keep-alive\n\n")
+diff --git a/sdk/api/handlers/handlers_execution.go b/sdk/api/handlers/handlers_execution.go
+index 77340df..accaecc 100644
+--- a/sdk/api/handlers/handlers_execution.go
++++ b/sdk/api/handlers/handlers_execution.go
+@@ -59,6 +59,9 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
+ 	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
+ 	reqMeta := requestExecutionMetadata(ctx)
+ 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
++	if routeDecision.Provider != "" {
++		reqMeta[coreexecutor.ProviderRouteMetadataKey] = true
++	}
+ 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
+ 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
+ 	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
+@@ -126,6 +129,9 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
+ 	providers = adjustExecutionProvidersForEntryProtocol(handlerType, providers)
+ 	reqMeta := requestExecutionMetadata(ctx)
+ 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
++	if routeDecision.Provider != "" {
++		reqMeta[coreexecutor.ProviderRouteMetadataKey] = true
++	}
+ 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
+ 	setReasoningEffortMetadata(reqMeta, handlerType, normalizedModel, rawJSON)
+ 	setServiceTierMetadata(reqMeta, rawJSON)
+diff --git a/sdk/api/handlers/handlers_model_router_test.go b/sdk/api/handlers/handlers_model_router_test.go
+index 76bb4dd..01de16a 100644
+--- a/sdk/api/handlers/handlers_model_router_test.go
++++ b/sdk/api/handlers/handlers_model_router_test.go
+@@ -11,6 +11,7 @@ import (
+ 
+ 	"github.com/gin-gonic/gin"
+ 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+ 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+ 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+ 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+@@ -627,6 +628,63 @@ func TestHandlerModelRouterProviderRouteUsesAuthManager(t *testing.T) {
+ 	}
+ }
+ 
++func TestHandlerModelRouterProviderRoutePassesUnregisteredModelThrough(t *testing.T) {
++	for _, provider := range []string{"codex", "claude"} {
++		t.Run(provider, func(t *testing.T) {
++			requestedModel := provider + "-provider-owned-future-model"
++			executor := &modelExecutionCaptureExecutor{
++				provider: provider,
++				stream: func(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
++					chunks := make(chan coreexecutor.StreamChunk, 1)
++					chunks <- coreexecutor.StreamChunk{Payload: []byte("ok")}
++					close(chunks)
++					return &coreexecutor.StreamResult{Chunks: chunks}, nil
++				},
++			}
++			manager := coreauth.NewManager(nil, nil, nil)
++			manager.RegisterExecutor(executor)
++			auth := &coreauth.Auth{ID: provider + "-future-model-auth", Provider: provider, Status: coreauth.StatusActive}
++			registry.GetGlobalRegistry().RegisterClient(auth.ID, provider, []*registry.ModelInfo{{ID: provider + "-known-model"}})
++			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
++			if _, err := manager.Register(context.Background(), auth); err != nil {
++				t.Fatalf("register auth: %v", err)
++			}
++			host := &handlerDirectExecutorRouteHost{}
++			host.hasRouters = true
++			host.route = func(context.Context, pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, bool) {
++				return pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetProvider, Target: provider}, true
++			}
++			handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
++			handler.SetModelRouterHost(host)
++			payload := []byte(fmt.Sprintf(`{"model":%q}`, requestedModel))
++
++			if _, _, errMsg := handler.ExecuteWithAuthManager(context.Background(), provider, requestedModel, payload, ""); errMsg != nil {
++				t.Fatalf("execute future model: %v", errMsg.Error)
++			}
++			if req, _ := executor.captured(); req.Model != requestedModel {
++				t.Fatalf("execute model = %q, want %q", req.Model, requestedModel)
++			}
++
++			if _, _, errMsg := handler.ExecuteCountWithAuthManager(context.Background(), provider, requestedModel, payload, ""); errMsg != nil {
++				t.Fatalf("count future model: %v", errMsg.Error)
++			}
++			if req, _ := executor.captured(); req.Model != requestedModel {
++				t.Fatalf("count model = %q, want %q", req.Model, requestedModel)
++			}
++
++			data, _, errs := handler.ExecuteStreamWithAuthManager(context.Background(), provider, requestedModel, payload, "")
++			for range data {
++			}
++			if errMsg := <-errs; errMsg != nil {
++				t.Fatalf("stream future model: %v", errMsg.Error)
++			}
++			if req, _ := executor.captured(); req.Model != requestedModel {
++				t.Fatalf("stream model = %q, want %q", req.Model, requestedModel)
++			}
++		})
++	}
++}
++
+ func TestHandlerProvidersForExecutionRejectsImageOnlyModelOnProviderRoute(t *testing.T) {
+ 	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil)
+ 	cases := []struct {
+diff --git a/sdk/api/handlers/handlers_stream.go b/sdk/api/handlers/handlers_stream.go
+index 1f36ac4..5999a91 100644
+--- a/sdk/api/handlers/handlers_stream.go
++++ b/sdk/api/handlers/handlers_stream.go
+@@ -319,6 +319,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
+ 	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
+ 	reqMeta := requestExecutionMetadata(ctx)
+ 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
++	if routeDecision.Provider != "" {
++		reqMeta[coreexecutor.ProviderRouteMetadataKey] = true
++	}
+ 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
+ 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
+ 	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
+diff --git a/sdk/api/handlers/model_execution_test.go b/sdk/api/handlers/model_execution_test.go
+index e83337a..55d5b66 100644
+--- a/sdk/api/handlers/model_execution_test.go
++++ b/sdk/api/handlers/model_execution_test.go
+@@ -132,7 +132,8 @@ func (e *modelExecutionCaptureExecutor) Refresh(ctx context.Context, auth *corea
+ 	return auth, nil
+ }
+ 
+-func (e *modelExecutionCaptureExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
++func (e *modelExecutionCaptureExecutor) CountTokens(_ context.Context, _ *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
++	e.capture(req, opts)
+ 	return coreexecutor.Response{Payload: []byte("0")}, nil
+ }
+ 
+diff --git a/sdk/cliproxy/auth/conductor_cooldown.go b/sdk/cliproxy/auth/conductor_cooldown.go
+index 9b8fd94..cf9f2df 100644
+--- a/sdk/cliproxy/auth/conductor_cooldown.go
++++ b/sdk/cliproxy/auth/conductor_cooldown.go
+@@ -1553,7 +1553,7 @@ func retryAfterFromError(err error) *time.Duration {
+ 	if retryAfter == nil {
+ 		return nil
+ 	}
+-	value := *retryAfter
++	value := min(*retryAfter, 5*time.Minute)
+ 	return &value
+ }
+ 
+diff --git a/sdk/cliproxy/auth/conductor_refresh.go b/sdk/cliproxy/auth/conductor_refresh.go
+index 92b0e9c..181d295 100644
+--- a/sdk/cliproxy/auth/conductor_refresh.go
++++ b/sdk/cliproxy/auth/conductor_refresh.go
+@@ -68,6 +68,7 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
+ 
+ 	loop.rebuild(time.Now())
+ 	go loop.run(ctx)
++	go m.runFleetQuotaProbe(ctx)
+ }
+ 
+ // StopAutoRefresh cancels the background refresh loop, if running.
+diff --git a/sdk/cliproxy/auth/conductor_selection.go b/sdk/cliproxy/auth/conductor_selection.go
+index fef8d28..60912cb 100644
+--- a/sdk/cliproxy/auth/conductor_selection.go
++++ b/sdk/cliproxy/auth/conductor_selection.go
+@@ -55,9 +55,10 @@ type requiredAuthKindContextKey struct{}
+ type credentialPolicyContextKey struct{}
+ 
+ type authSelectionEligibility struct {
+-	requiredKind     string
+-	credentialPolicy string
+-	disallowFreeAuth bool
++	requiredKind           string
++	credentialPolicy       string
++	disallowFreeAuth       bool
++	allowUnregisteredModel bool
+ }
+ 
+ func withRequiredAuthKind(ctx context.Context, requiredKind string) context.Context {
+@@ -77,7 +78,11 @@ func credentialPolicyFromContext(ctx context.Context) string {
+ }
+ 
+ func authSelectionEligibilityForRequest(ctx context.Context, opts cliproxyexecutor.Options) authSelectionEligibility {
+-	eligibility := authSelectionEligibility{disallowFreeAuth: disallowFreeAuthFromMetadata(opts.Metadata)}
++	providerRoute, _ := opts.Metadata[cliproxyexecutor.ProviderRouteMetadataKey].(bool)
++	eligibility := authSelectionEligibility{
++		disallowFreeAuth:       disallowFreeAuthFromMetadata(opts.Metadata),
++		allowUnregisteredModel: providerRoute,
++	}
+ 	if ctx != nil {
+ 		eligibility.requiredKind, _ = ctx.Value(requiredAuthKindContextKey{}).(string)
+ 		eligibility.credentialPolicy, _ = ctx.Value(credentialPolicyContextKey{}).(string)
+@@ -531,6 +536,13 @@ func selectionArgForSelector(selector Selector, routeModel string) string {
+ 	return routeModel
+ }
+ 
++func selectionModelArgForSelector(selector Selector, routeModel string, eligibility authSelectionEligibility) string {
++	if eligibility.allowUnregisteredModel && isBuiltInSelector(selector) {
++		return routeModel
++	}
++	return selectionArgForSelector(selector, routeModel)
++}
++
+ func restoreModelCooldownErrorModel(err error, requestedModel string) error {
+ 	if err == nil || requestedModel == "" {
+ 		return err
+@@ -1039,7 +1051,7 @@ func (m *Manager) closestCooldownWaitWithAttempted(providers []string, model str
+ 		if _, ok := providerSet[providerKey]; !ok {
+ 			continue
+ 		}
+-		if model != "" && !m.authSupportsRouteModel(registryRef, auth, model) {
++		if model != "" && !eligibility.allowUnregisteredModel && !m.authSupportsRouteModel(registryRef, auth, model) {
+ 			continue
+ 		}
+ 		effectiveRetry := effectiveRequestRetryLimit(auth, defaultRequestRetry)
+@@ -1131,7 +1143,7 @@ func (m *Manager) retryAllowed(attempt int, providers []string, model string, el
+ 		if _, ok := providerSet[providerKey]; !ok {
+ 			continue
+ 		}
+-		if model != "" && !m.authSupportsRouteModel(registryRef, auth, model) {
++		if model != "" && !eligibility.allowUnregisteredModel && !m.authSupportsRouteModel(registryRef, auth, model) {
+ 			continue
+ 		}
+ 		effectiveRetry := effectiveRequestRetryLimit(auth, defaultRequestRetry)
+@@ -1508,7 +1520,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
+ 		if _, used := tried[candidate.ID]; used {
+ 			continue
+ 		}
+-		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
++		if modelKey != "" && !eligibility.allowUnregisteredModel && !m.authSupportsRouteModel(registryRef, candidate, model) {
+ 			continue
+ 		}
+ 		candidates = append(candidates, candidate)
+@@ -1532,7 +1544,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
+ 	}
+ 	if !handled {
+ 		selectorCtx := withWeightedSelectorStateModel(ctx, selector, model)
+-		selected, errPick = selector.Pick(selectorCtx, provider, selectionArgForSelector(selector, model), opts, selectorAuths)
++		selected, errPick = selector.Pick(selectorCtx, provider, selectionModelArgForSelector(selector, model, eligibility), opts, selectorAuths)
+ 		if errPick != nil {
+ 			if isBuiltInSelector(selector) {
+ 				errPick = restoreModelCooldownErrorModel(errPick, model)
+@@ -1730,10 +1742,10 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
+ 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
+ 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
+ 
+-	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
++	eligibility := authSelectionEligibilityForRequest(ctx, opts)
++	if eligibility.allowUnregisteredModel || m.hasPluginScheduler() || !m.useSchedulerFastPath() {
+ 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
+ 	}
+-	eligibility := authSelectionEligibilityForRequest(ctx, opts)
+ 	if strings.TrimSpace(model) != "" {
+ 		m.mu.RLock()
+ 		for _, candidate := range m.auths {
+@@ -1841,7 +1853,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
+ 		if _, ok := m.executors[providerKey]; !ok {
+ 			continue
+ 		}
+-		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
++		if modelKey != "" && !eligibility.allowUnregisteredModel && !m.authSupportsRouteModel(registryRef, candidate, model) {
+ 			continue
+ 		}
+ 		candidates = append(candidates, candidate)
+@@ -1865,7 +1877,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
+ 	}
+ 	if !handled {
+ 		selectorCtx := withWeightedSelectorStateModel(ctx, selector, model)
+-		selected, errPick = selector.Pick(selectorCtx, "mixed", selectionArgForSelector(selector, model), opts, selectorAuths)
++		selected, errPick = selector.Pick(selectorCtx, "mixed", selectionModelArgForSelector(selector, model, eligibility), opts, selectorAuths)
+ 		if errPick != nil {
+ 			if isBuiltInSelector(selector) {
+ 				errPick = restoreModelCooldownErrorModel(errPick, model)
+@@ -1902,7 +1914,8 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
+ 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = "mixed"
+ 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
+ 
+-	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
++	eligibility := authSelectionEligibilityForRequest(ctx, opts)
++	if eligibility.allowUnregisteredModel || m.hasPluginScheduler() || !m.useSchedulerFastPath() {
+ 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+ 	}
+ 
+@@ -1925,7 +1938,6 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
+ 	if len(eligibleProviders) == 0 {
+ 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
+ 	}
+-	eligibility := authSelectionEligibilityForRequest(ctx, opts)
+ 	if strings.TrimSpace(model) != "" {
+ 		providerSet := make(map[string]struct{}, len(eligibleProviders))
+ 		for _, providerKey := range eligibleProviders {
+@@ -2065,7 +2077,7 @@ func (m *Manager) warnLogAuthUnavailable(ctx context.Context, providers []string
+ 				continue
+ 			}
+ 		}
+-		if model != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
++		if model != "" && !eligibility.allowUnregisteredModel && !m.authSupportsRouteModel(registryRef, candidate, model) {
+ 			continue
+ 		}
+ 		totalCandidates++
+diff --git a/sdk/cliproxy/auth/fleet_failover_repro_test.go b/sdk/cliproxy/auth/fleet_failover_repro_test.go
+new file mode 100644
+index 0000000..c16b2c6
+--- /dev/null
++++ b/sdk/cliproxy/auth/fleet_failover_repro_test.go
+@@ -0,0 +1,96 @@
++package auth
++
++import (
++	"context"
++	"errors"
++	"net/http"
++	"testing"
++	"time"
++
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
++)
++
++type fleetReproExecutor struct{ failing map[string]bool }
++
++func (e fleetReproExecutor) Identifier() string { return "codex" }
++func (e fleetReproExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
++	if e.failing[auth.ID] {
++		return cliproxyexecutor.Response{}, &retryAfterStatusError{status: http.StatusTooManyRequests, message: `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro","resets_in_seconds":188286}}`, retryAfter: 188286 * time.Second}
++	}
++	return cliproxyexecutor.Response{Payload: []byte("ok:" + auth.ID)}, nil
++}
++func (e fleetReproExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
++	return nil, nil
++}
++func (e fleetReproExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) { return auth, nil }
++func (e fleetReproExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
++	return cliproxyexecutor.Response{}, nil
++}
++func (e fleetReproExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
++	return nil, nil
++}
++
++func fleetReproModels() []*registry.ModelInfo {
++	ids := []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra", "codex-auto-review", "gpt-5.4"}
++	out := make([]*registry.ModelInfo, 0, len(ids))
++	for _, id := range ids {
++		out = append(out, &registry.ModelInfo{ID: id})
++	}
++	return out
++}
++
++func TestFleetRepro_SecondCodexAccountUsedAfterPrimaryQuota(t *testing.T) {
++	for _, providerRoute := range []bool{false, true} {
++		t.Run(map[bool]string{false: "no-route", true: "provider-route"}[providerRoute], func(t *testing.T) {
++			ctx := context.Background()
++			manager := NewManager(nil, &FillFirstSelector{}, nil)
++			manager.SetRetryConfig(0, 0, 0)
++			manager.RegisterExecutor(fleetReproExecutor{failing: map[string]bool{"pro": true}})
++			reg := registry.GetGlobalRegistry()
++			for _, id := range []string{"pro", "prolite"} {
++				reg.RegisterClient(id, "codex", fleetReproModels())
++			}
++			t.Cleanup(func() {
++				reg.UnregisterClient("pro")
++				reg.UnregisterClient("prolite")
++			})
++			pro := &Auth{ID: "pro", Provider: "codex", Attributes: map[string]string{"priority": "100", "plan_type": "pro"}}
++			prolite := &Auth{ID: "prolite", Provider: "codex", Attributes: map[string]string{"priority": "0", "plan_type": "prolite"}}
++			for _, a := range []*Auth{pro, prolite} {
++				if _, err := manager.Register(ctx, a); err != nil {
++					t.Fatal(err)
++				}
++				manager.RefreshSchedulerEntry(a.ID)
++			}
++			opts := cliproxyexecutor.Options{Metadata: map[string]any{}}
++			if providerRoute {
++				opts.Metadata[cliproxyexecutor.ProviderRouteMetadataKey] = true
++			}
++			first, err := manager.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-6-astra"}, opts)
++			if err != nil {
++				t.Fatalf("first execute: %v", err)
++			}
++			if string(first.Payload) != "ok:prolite" {
++				t.Fatalf("first payload = %q", first.Payload)
++			}
++			cooled, _ := manager.GetByID("pro")
++			if _, _, next := isAuthBlockedForModel(cooled, "gpt-6-astra", time.Now()); next.After(time.Now().Add(5*time.Minute + time.Second)) {
++				t.Fatalf("pro cooldown ends at %s, want at most five minutes", next)
++			}
++			for _, model := range []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-luna", "codex-auto-review"} {
++				resp, err := manager.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: model}, opts)
++				var cd *modelCooldownError
++				if errors.As(err, &cd) {
++					t.Fatalf("model %s: got model_cooldown %v (resetIn=%s)", model, err, cd.resetIn.Round(time.Second))
++				}
++				if err != nil {
++					t.Fatalf("model %s: %v", model, err)
++				}
++				if string(resp.Payload) != "ok:prolite" {
++					t.Fatalf("model %s payload = %q", model, resp.Payload)
++				}
++			}
++		})
++	}
++}
+diff --git a/sdk/cliproxy/auth/fleet_quota_probe.go b/sdk/cliproxy/auth/fleet_quota_probe.go
+new file mode 100644
+index 0000000..f372094
+--- /dev/null
++++ b/sdk/cliproxy/auth/fleet_quota_probe.go
+@@ -0,0 +1,127 @@
++package auth
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"strings"
++	"time"
++
++	log "github.com/sirupsen/logrus"
++	"github.com/tidwall/gjson"
++)
++
++const fleetQuotaProbeInterval = time.Minute
++
++// runFleetQuotaProbe re-checks quota-cooled OAuth credentials against the
++// provider's usage endpoint so a banked or early reset clears the cooldown
++// without waiting for the reset hint from the original 429.
++func (m *Manager) runFleetQuotaProbe(ctx context.Context) {
++	ticker := time.NewTicker(fleetQuotaProbeInterval)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case <-ticker.C:
++			m.fleetQuotaProbeOnce(ctx)
++		}
++	}
++}
++
++func (m *Manager) fleetQuotaProbeOnce(ctx context.Context) {
++	now := time.Now()
++	for _, auth := range m.List() {
++		if ctx.Err() != nil {
++			return
++		}
++		if auth.AuthKind() != AuthKindOAuth || !fleetQuotaCooled(auth, now) || !m.fleetQuotaReset(ctx, auth) {
++			continue
++		}
++		if _, _, err := m.ResetQuota(ctx, auth.ID); err != nil {
++			log.WithError(err).Warnf("fleet quota probe: reset failed for %s", auth.ID)
++			continue
++		}
++		log.Infof("fleet quota probe: %s reports quota available again, cooldown cleared for %s", auth.Provider, auth.ID)
++	}
++}
++
++func fleetQuotaCooled(auth *Auth, now time.Time) bool {
++	states := []QuotaState{auth.Quota}
++	for _, state := range auth.ModelStates {
++		if state != nil {
++			states = append(states, state.Quota)
++		}
++	}
++	for _, q := range states {
++		if q.Exceeded && q.NextRecoverAt.After(now) && (q.Reason == "quota" || q.Reason == "credential_quota") {
++			return true
++		}
++	}
++	return false
++}
++
++// fleetQuotaReset reports true only when the provider's usage endpoint answers
++// and reports no limit reached.
++func (m *Manager) fleetQuotaReset(ctx context.Context, auth *Auth) bool {
++	var url string
++	headers := make(http.Header)
++	headers.Set("Accept", "application/json")
++	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
++	case "codex":
++		url = "https://chatgpt.com/backend-api/wham/usage"
++		headers.Set("User-Agent", "codex_cli_rs/0.153.4")
++		headers.Set("Originator", "codex_cli_rs")
++		if accountID, _ := auth.Metadata["account_id"].(string); strings.TrimSpace(accountID) != "" {
++			headers.Set("Chatgpt-Account-Id", accountID)
++		}
++	case "claude":
++		url = "https://api.anthropic.com/api/oauth/usage"
++		headers.Set("User-Agent", "claude-cli/2.1.258 (external, cli)")
++		headers.Set("Anthropic-Beta", "oauth-2025-04-20")
++	default:
++		return false
++	}
++	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
++	defer cancel()
++	req, err := m.NewHttpRequest(ctx, auth, http.MethodGet, url, nil, headers)
++	if err != nil {
++		return false
++	}
++	resp, err := m.HttpRequest(ctx, auth, req)
++	if err != nil {
++		return false
++	}
++	defer func() { _ = resp.Body.Close() }()
++	body, err := io.ReadAll(resp.Body)
++	if err != nil || resp.StatusCode != http.StatusOK {
++		return false
++	}
++	return fleetUsageAvailable(auth.Provider, body)
++}
++
++func fleetUsageAvailable(provider string, body []byte) bool {
++	root := gjson.ParseBytes(body)
++	switch strings.ToLower(strings.TrimSpace(provider)) {
++	case "codex":
++		main := root.Get("rate_limit")
++		if !main.Exists() || main.Get("limit_reached").Bool() {
++			return false
++		}
++		for _, extra := range root.Get("additional_rate_limits").Array() {
++			if extra.Get("rate_limit.limit_reached").Bool() {
++				return false
++			}
++		}
++		return true
++	case "claude":
++		limits := root.Get("limits").Array()
++		for _, limit := range limits {
++			if limit.Get("percent").Float() >= 100 {
++				return false
++			}
++		}
++		return len(limits) > 0
++	}
++	return false
++}
+diff --git a/sdk/cliproxy/auth/fleet_quota_probe_test.go b/sdk/cliproxy/auth/fleet_quota_probe_test.go
+new file mode 100644
+index 0000000..672cbf8
+--- /dev/null
++++ b/sdk/cliproxy/auth/fleet_quota_probe_test.go
+@@ -0,0 +1,25 @@
++package auth
++
++import "testing"
++
++func TestFleetUsageAvailable(t *testing.T) {
++	cases := []struct {
++		provider string
++		body     string
++		want     bool
++	}{
++		{"codex", `{"rate_limit":{"limit_reached":false,"primary_window":{"used_percent":0}},"additional_rate_limits":[{"rate_limit":{"limit_reached":false}}]}`, true},
++		{"codex", `{"rate_limit":{"limit_reached":true,"primary_window":{"used_percent":100}}}`, false},
++		{"codex", `{"rate_limit":{"limit_reached":false},"additional_rate_limits":[{"rate_limit":{"limit_reached":true}}]}`, false},
++		{"codex", `{"error":"unauthorized"}`, false},
++		{"claude", `{"limits":[{"kind":"session","percent":17},{"kind":"weekly_all","percent":11}]}`, true},
++		{"claude", `{"limits":[{"kind":"session","percent":17},{"kind":"weekly_all","percent":100}]}`, false},
++		{"claude", `{}`, false},
++		{"gemini", `{}`, false},
++	}
++	for _, c := range cases {
++		if got := fleetUsageAvailable(c.provider, []byte(c.body)); got != c.want {
++			t.Errorf("%s %s: got %v want %v", c.provider, c.body, got, c.want)
++		}
++	}
++}
+diff --git a/sdk/cliproxy/executor/types.go b/sdk/cliproxy/executor/types.go
+index a1a648f..89213f4 100644
+--- a/sdk/cliproxy/executor/types.go
++++ b/sdk/cliproxy/executor/types.go
+@@ -21,6 +21,8 @@ const DisallowFreeAuthMetadataKey = "disallow_free_auth"
+ // AuthSelectionModelMetadataKey overrides the model used only for auth selection.
+ const AuthSelectionModelMetadataKey = "auth_selection_model"
+ 
++const ProviderRouteMetadataKey = "provider_route"
++
+ // ReasoningEffortMetadataKey stores the client-requested reasoning effort for usage logs.
+ const ReasoningEffortMetadataKey = "reasoning_effort"
+ 

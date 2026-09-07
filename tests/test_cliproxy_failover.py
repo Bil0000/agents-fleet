@@ -2,6 +2,7 @@
 import http.client
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -17,6 +18,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
+ROOT = Path(__file__).parents[1].resolve()
+
+
 class UpstreamHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -30,13 +34,15 @@ class UpstreamHandler(BaseHTTPRequestHandler):
         self.server.paths.append(self.path)
         request = json.loads(body)
         texts = []
-        for message in request["messages"]:
+        for message in request.get("messages", []):
             content = message["content"]
             if isinstance(content, str):
                 texts.append(content)
             else:
                 texts.extend(part["text"] for part in content if part.get("type") == "text")
-        turn = next((text for text in texts if text.startswith(("turn-", "claude-", "bounded-"))), texts[-1])
+        if not texts and isinstance(request.get("input"), str):
+            texts.append(request["input"])
+        turn = next((text for text in texts if text.startswith(("turn-", "claude-", "bounded-"))), texts[-1] if texts else "request")
         if self.server.mode == "sequence" and len(self.server.calls) == 2:
             payload = b'{"error":{"message":"quota reached","type":"rate_limit_error","code":"rate_limit_exceeded"}}'
             self.send_response(429)
@@ -78,6 +84,19 @@ class UpstreamHandler(BaseHTTPRequestHandler):
                 "stop_sequence": None,
                 "usage": {"input_tokens": 1, "output_tokens": 1},
             }).encode()
+        elif urllib.parse.urlsplit(self.path).path.endswith("/responses"):
+            response = {
+                "id": f"accepted-{turn}",
+                "object": "response",
+                "status": "completed",
+                "model": request["model"],
+                "output": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            }
+            if request.get("stream"):
+                payload = f'data: {json.dumps({"type": "response.completed", "response": response})}\n\ndata: [DONE]\n\n'.encode()
+            else:
+                payload = json.dumps(response).encode()
         else:
             payload = json.dumps(
                 {
@@ -87,7 +106,7 @@ class UpstreamHandler(BaseHTTPRequestHandler):
                 }
             ).encode()
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "text/event-stream" if request.get("stream") else "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -103,23 +122,30 @@ def free_port():
 
 def installed_binary():
     configured = os.environ.get("FLEET_CLIPROXYAPI")
-    managed = Path.home() / ".local/share/fleet/cliproxyapi/7.2.149/cli-proxy-api"
+    state = Path.home() / ".local/state/fleet/cliproxyapi.json"
+    try:
+        managed_version = json.loads(state.read_text())["version"]
+    except (OSError, KeyError, json.JSONDecodeError):
+        managed_version = "7.2.149"
+    managed = Path.home() / f".local/share/fleet/cliproxyapi/{managed_version}/cli-proxy-api"
     candidates = (configured, managed, shutil.which("cliproxyapi"), "/opt/homebrew/bin/cliproxyapi", "/usr/local/bin/cliproxyapi")
     for candidate in candidates:
         if not candidate or not Path(candidate).is_file():
             continue
         version = subprocess.run([candidate, "-h"], capture_output=True, text=True)
-        if "CLIProxyAPI Version: 7.2.149" in version.stdout + version.stderr:
-            return candidate
+        match = re.search(r"CLIProxyAPI Version: ([0-9]+\.[0-9]+\.[0-9]+)", version.stdout + version.stderr)
+        if match and tuple(map(int, match.group(1).split("."))) >= (7, 2, 149):
+            return candidate, match.group(1)
     return None
 
 
 class CLIProxyFailoverTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.binary = installed_binary()
-        if cls.binary is None:
-            raise unittest.SkipTest("CLIProxyAPI 7.2.149 is not installed")
+        installed = installed_binary()
+        if installed is None:
+            raise unittest.SkipTest("CLIProxyAPI 7.2.149 or newer is not installed")
+        cls.binary, cls.version = installed
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -135,7 +161,7 @@ class CLIProxyFailoverTest(unittest.TestCase):
         self.proxy = None
         self.start_proxy(["account-a", "account-b"])
 
-    def start_proxy(self, accounts, protocol="openai"):
+    def start_proxy(self, accounts, protocol="openai", plugin=None):
         self.proxy_port = free_port()
         auth = self.base / "auth"
         auth.mkdir(exist_ok=True)
@@ -150,6 +176,12 @@ class CLIProxyFailoverTest(unittest.TestCase):
                 + "      - name: fake-model\n"
                 + "        alias: fake-model\n"
                 for index, account in enumerate(accounts)
+            )
+        elif protocol == "codex":
+            provider = "codex-api-key:\n" + "".join(
+                f"  - api-key: {account}\n"
+                f'    base-url: "http://127.0.0.1:{self.upstream.server_port}/v1"\n'
+                for account in accounts
             )
         else:
             provider = (
@@ -178,6 +210,12 @@ class CLIProxyFailoverTest(unittest.TestCase):
             "codex:\n  stream-bootstrap-buffering: true\n"
             "remote-management:\n  allow-remote: false\n  secret-key: test-management-key\n"
             f"{provider}"
+            + (
+                "plugins:\n  enabled: true\n"
+                f'  dir: "{plugin.parent}"\n'
+                "  configs:\n    fleet-provider-router:\n      enabled: true\n      priority: 100\n"
+                if plugin else ""
+            )
         )
         self.proxy = subprocess.Popen(
             [self.binary, "-config", str(config)],
@@ -252,9 +290,9 @@ class CLIProxyFailoverTest(unittest.TestCase):
         )
         return urllib.request.urlopen(request, timeout=5)
 
-    def claude_request(self, turn):
+    def claude_request(self, turn, model="fake-model"):
         body = json.dumps({
-            "model": "fake-model",
+            "model": model,
             "max_tokens": 32,
             "messages": [{"role": "user", "content": turn}],
             "metadata": {"user_id": "same-claude-thread-123"},
@@ -271,13 +309,69 @@ class CLIProxyFailoverTest(unittest.TestCase):
         )
         return urllib.request.urlopen(request, timeout=5)
 
+    def provider_request(self, model):
+        body = json.dumps({"model": model, "input": "future-model", "stream": False}).encode()
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.proxy_port}/v1/responses",
+            data=body,
+            headers={"Authorization": "Bearer client-key", "Content-Type": "application/json"},
+        )
+        return urllib.request.urlopen(request, timeout=5)
+
+    def test_future_codex_model_is_routed_without_a_fleet_model_entry(self):
+        source = ROOT / "lib/fleet_provider_router.c"
+        self.assertTrue(source.is_file())
+        plugin = self.base / "fleet-provider-router.dylib"
+        subprocess.run(["cc", "-dynamiclib", "-O2", str(source), "-o", str(plugin)], check=True)
+        self.stop_proxy()
+        self.upstream.calls.clear()
+        self.upstream.mode = "normal"
+        self.start_proxy(["account-a"], protocol="codex", plugin=plugin)
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.proxy_port}/v0/management/plugins",
+            headers={"Authorization": "Bearer test-management-key"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            plugins = json.load(response)
+        self.assertIn("fleet-provider-router", json.dumps(plugins), plugins)
+        if not plugins["plugins"][0]["registered"]:
+            self.proxy.terminate()
+            output = self.proxy.communicate(timeout=5)[0]
+            self.proxy = None
+            self.fail(output)
+
+        try:
+            with self.provider_request("provider-owned-future-model") as response:
+                self.assertEqual(response.status, 200)
+        except urllib.error.HTTPError as error:
+            self.fail(error.read().decode())
+
+        self.assertEqual(json.loads(self.upstream.calls[0][1])["model"], "provider-owned-future-model")
+
+    def test_future_claude_model_is_routed_without_a_fleet_model_entry(self):
+        source = ROOT / "lib/fleet_provider_router.c"
+        plugin = self.base / "fleet-provider-router.dylib"
+        subprocess.run(["cc", "-dynamiclib", "-O2", str(source), "-o", str(plugin)], check=True)
+        self.stop_proxy()
+        self.upstream.calls.clear()
+        self.upstream.mode = "normal"
+        self.start_proxy(["account-a"], protocol="claude", plugin=plugin)
+
+        try:
+            with self.claude_request("claude-future", "provider-owned-future-model") as response:
+                self.assertEqual(response.status, 200)
+        except urllib.error.HTTPError as error:
+            self.fail(error.read().decode())
+
+        self.assertEqual(json.loads(self.upstream.calls[0][1])["model"], "provider-owned-future-model")
+
     def test_management_response_identifies_exact_proxy_version(self):
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.proxy_port}/v0/management/config",
             headers={"Authorization": "Bearer test-management-key"},
         )
         with urllib.request.urlopen(request, timeout=5) as response:
-            self.assertEqual(response.headers.get("X-CPA-VERSION"), "7.2.149")
+            self.assertEqual(response.headers.get("X-CPA-VERSION"), self.version)
             self.assertEqual(json.load(response)["api-keys"], ["client-key"])
 
     def test_same_thread_returns_to_account_a_after_account_a_recovers(self):

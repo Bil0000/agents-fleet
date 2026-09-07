@@ -418,7 +418,7 @@ class FleetAccountsTest(unittest.TestCase):
             {"time": "19:30-19:40", "success": 1, "failed": 0},
         ]
         self.write_state(codex={
-            "accounts": {"codex-primary.json": "pro", "codex-fallback.json": "p2"},
+            "accounts": {"codex-primary.json": "20x", "codex-fallback.json": "5x"},
             "primary": "codex-primary.json",
             "auto": True,
         })
@@ -427,9 +427,9 @@ class FleetAccountsTest(unittest.TestCase):
         listed = self.run_fleet("list", "codex")
 
         self.assertEqual(current.returncode, 0, current.stderr)
-        self.assertRegex(current.stdout, r"codex\s+p2\s+fallback\s+19:30-19:40")
-        self.assertIn("p2", listed.stdout)
-        self.assertRegex(listed.stdout, r"p2\s+fallback\s+limits only\s+yes")
+        self.assertRegex(current.stdout, r"codex\s+5x\s+fallback\s+19:30-19:40")
+        self.assertIn("5x", listed.stdout)
+        self.assertRegex(listed.stdout, r"5x\s+fallback\s+limits only\s+yes")
 
     def test_current_reports_no_request_without_guessing_from_the_primary(self):
         self.add_account("claude", "primary", priority=100)
@@ -469,8 +469,9 @@ class FleetAccountsTest(unittest.TestCase):
         self.assertFalse(self.management.server.accounts["codex-new.json"]["disabled"])
         value = tomllib.loads(config.read_text())
         self.assertEqual(value["model"], "gpt-5")
-        self.assertEqual(value["model_provider"], "fleet_cliproxyapi")
-        self.assertEqual(value["model_providers"]["fleet_cliproxyapi"]["base_url"], self.management.url + "/v1")
+        self.assertNotIn("model_provider", value)
+        self.assertNotIn("fleet_cliproxyapi", value.get("model_providers", {}))
+        self.assertEqual(value["openai_base_url"], self.management.url + "/v1")
         self.assertTrue((self.home / ".local/state/fleet/client-routing.json").exists())
         policy = json.loads(self.state.read_text())["providers"]["codex"]
         self.assertEqual(policy["accounts"], {"codex-new.json": "new"})
@@ -543,17 +544,17 @@ class FleetAccountsTest(unittest.TestCase):
 
     def test_add_refreshes_the_same_account_without_a_duplicate(self):
         credential = self.add_account("codex", "same", priority=100, contents=b"old oauth bytes")
-        self.write_state(codex={"accounts": {"codex-same.json": "pro"}, "primary": "codex-same.json", "auto": True})
+        self.write_state(codex={"accounts": {"codex-same.json": "20x"}, "primary": "codex-same.json", "auto": True})
         self.fake_login("codex", "codex-same.json")
 
         result = self.run_fleet("add", "codex")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Refreshed codex account pro", result.stdout)
+        self.assertIn("Refreshed codex account 20x", result.stdout)
         self.assertEqual(credential.read_bytes(), b"opaque oauth bytes")
         self.assertEqual(list(self.management.server.accounts), ["codex-same.json"])
         policy = json.loads(self.state.read_text())["providers"]["codex"]
-        self.assertEqual(policy, {"accounts": {"codex-same.json": "pro"}, "primary": "codex-same.json", "auto": True})
+        self.assertEqual(policy, {"accounts": {"codex-same.json": "20x"}, "primary": "codex-same.json", "auto": True})
 
     def test_add_refresh_can_rename_the_same_account(self):
         self.add_account("claude", "same", disabled=True, contents=b"old oauth bytes")
@@ -640,7 +641,7 @@ class FleetAccountsTest(unittest.TestCase):
         credential = self.add_account("codex", name.removeprefix("codex-").removesuffix(".json"), priority=100, contents=json.dumps(old).encode())
         self.management.server.accounts[name]["email"] = "work@example.com"
         self.management.server.accounts[name]["id_token"] = decode_jwt(old["tokens"]["id_token"])
-        self.write_state(codex={"accounts": {name: "pro"}, "primary": name, "auto": True})
+        self.write_state(codex={"accounts": {name: "20x"}, "primary": name, "auto": True})
         refreshed = self.codex_native_auth(access="new-access")
         native = self.native_client(
             f"home = Path(os.environ['FLEET_ACCOUNT_HOME'])\n"
@@ -654,7 +655,7 @@ class FleetAccountsTest(unittest.TestCase):
         self.assertEqual(json.loads(credential.read_text())["access_token"], "new-access")
         self.assertEqual(list(self.management.server.accounts), [name])
         policy = json.loads(self.state.read_text())["providers"]["codex"]
-        self.assertEqual(policy, {"accounts": {name: "pro"}, "primary": name, "auto": True})
+        self.assertEqual(policy, {"accounts": {name: "20x"}, "primary": name, "auto": True})
 
     def test_failed_native_login_does_not_change_fleet(self):
         native = self.native_client(exit_code=7)
@@ -676,7 +677,7 @@ class FleetAccountsTest(unittest.TestCase):
         self.add_account("codex", "primary", priority=0, contents=b"primary credential")
         self.management.server.accounts[name]["email"] = "work@example.com"
         self.management.server.accounts[name]["id_token"] = decode_jwt(native_auth["tokens"]["id_token"])
-        self.write_state(codex={"accounts": {name: "pro", primary: "main"}, "primary": primary, "auto": True})
+        self.write_state(codex={"accounts": {name: "20x", primary: "main"}, "primary": primary, "auto": True})
         native = self.native_client("Path(os.environ['FLEET_ACCOUNT_HOME'], '.codex/auth.json').unlink()")
 
         result = self.run_fleet("native-auth", "codex", str(native), "logout")
@@ -712,9 +713,9 @@ class FleetAccountsTest(unittest.TestCase):
         self.add_account("codex", "backup")
         self.add_account("codex", "primary")
         self.write_state(
-            claude={"accounts": {"claude-admin.json": "account@example.com"}, "primary": "claude-admin.json", "auto": False},
+            claude={"accounts": {"claude-admin.json": "admin@sampleapp.com"}, "primary": "claude-admin.json", "auto": False},
             codex={
-                "accounts": {"codex-backup.json": "p2", "codex-primary.json": "pro"},
+                "accounts": {"codex-backup.json": "5x", "codex-primary.json": "20x"},
                 "primary": "codex-primary.json",
                 "auto": True,
             },
@@ -726,9 +727,9 @@ class FleetAccountsTest(unittest.TestCase):
         self.assertEqual(
             result.stdout,
             "PROVIDER  ACCOUNT              ROLE      AUTO         CURRENT\n"
-            "claude    account@example.com  primary   off          -\n"
-            "codex     pro                  primary   limits only  -\n"
-            "codex     p2                   fallback  limits only  -\n",
+            "claude    admin@sampleapp.com  primary   off          -\n"
+            "codex     20x                  primary   limits only  -\n"
+            "codex     5x                   fallback  limits only  -\n",
         )
 
         codex = self.run_fleet("list", "codex")
@@ -753,21 +754,21 @@ class FleetAccountsTest(unittest.TestCase):
         fallback = self.add_account("codex", "fallback", priority=0, contents=b"fallback oauth")
         self.write_state(
             codex={
-                "accounts": {"codex-primary.json": "pro", "codex-fallback.json": "p2"},
+                "accounts": {"codex-primary.json": "20x", "codex-fallback.json": "5x"},
                 "primary": "codex-primary.json",
                 "auto": True,
             }
         )
 
-        result = self.run_fleet("logout", "codex", "p2")
+        result = self.run_fleet("logout", "codex", "5x")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "Removed codex account p2.\n")
+        self.assertEqual(result.stdout, "Removed codex account 5x.\n")
         self.assertTrue(primary.exists())
         self.assertFalse(fallback.exists())
         self.assertEqual(list(self.management.server.accounts), ["codex-primary.json"])
         policy = json.loads(self.state.read_text())["providers"]["codex"]
-        self.assertEqual(policy, {"accounts": {"codex-primary.json": "pro"}, "primary": "codex-primary.json", "auto": True})
+        self.assertEqual(policy, {"accounts": {"codex-primary.json": "20x"}, "primary": "codex-primary.json", "auto": True})
 
     def test_remove_primary_promotes_and_enables_a_fallback(self):
         primary = self.add_account("claude", "primary", priority=100, contents=b"primary oauth")
@@ -1346,7 +1347,9 @@ class FleetAccountsTest(unittest.TestCase):
         self.assertEqual(self.management.server.accounts["codex-existing.json"]["priority"], 100)
         value = tomllib.loads(config.read_text())
         self.assertEqual(value["model"], "gpt-5")
-        self.assertEqual(value["model_provider"], "fleet_cliproxyapi")
+        self.assertNotIn("model_provider", value)
+        self.assertNotIn("fleet_cliproxyapi", value.get("model_providers", {}))
+        self.assertEqual(value["openai_base_url"], self.management.url + "/v1")
         self.assertTrue((self.home / ".local/state/fleet/client-routing.json").exists())
         self.assertEqual(stat.S_IMODE(credential.stat().st_mode), 0o600)
         policy = json.loads(self.state.read_text())["providers"]["codex"]
@@ -1576,6 +1579,39 @@ class FleetAccountsTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("requires CLIProxyAPI 7.2.149", result.stderr)
                 self.assertFalse(self.management.server.history)
+
+    def test_management_accepts_newer_proxy_version(self):
+        self.management.server.version_header = "7.2.151"
+
+        result = self.run_fleet("list")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_newer_setup_state_is_accepted_by_runtime(self):
+        path = ACCOUNTS.setup_state_path(self.home)
+        path.write_text('{"version":"7.2.151"}\n')
+        path.chmod(0o600)
+        management_key = self.home / ".local/state/fleet/cliproxyapi-management-key"
+        management_key.write_text("test-management-key\n")
+        management_key.chmod(0o600)
+        config = self.home / ".config/fleet/cliproxyapi.yaml"
+        config.parent.mkdir(parents=True)
+        contents = ACCOUNTS.setup_config(self.auth, "test-client-key", "test-management-key")
+        platform_name = "darwin" if sys.platform == "darwin" else "linux"
+        paths = ACCOUNTS.setup_paths(self.home, platform_name, "7.2.151")
+        config.write_bytes(contents.replace(b"api-keys:\n", ACCOUNTS.setup_plugin_config(paths) + b"api-keys:\n"))
+        config.chmod(0o600)
+        self.management.server.version_header = "7.2.151"
+
+        with self.assertRaises(ACCOUNTS.fleet.FleetError):
+            ACCOUNTS.load_setup_state(self.home)
+
+        self.assertEqual(
+            ACCOUNTS.load_setup_state(self.home, allow_newer=True), {"version": "7.2.151"}
+        )
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            _client, _config, entries = ACCOUNTS.runtime_for_mutation(self.home)
+        self.assertEqual(entries, [])
 
     def test_management_does_not_follow_redirect_or_forward_key(self):
         received = []

@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 
 
 MAX_ERROR_BODY = 64 * 1024
-MAX_RETRY_DELAY = 31 * 24 * 60 * 60
+MAX_RETRY_DELAY = 5 * 60
 HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -66,10 +66,11 @@ class RetryBridgeServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, address, handler, upstream_port, child=None, policy_path=None):
+    def __init__(self, address, handler, upstream_port, child=None, policy_path=None, client_key=None):
         self.upstream_port = upstream_port
         self.child = child
         self.policy_path = policy_path or Path.home() / ".local/state/fleet/account-routing.json"
+        self.client_key = client_key
         super().__init__(address, handler)
 
     def routing_mode(self, provider):
@@ -119,18 +120,22 @@ class RetryBridgeHandler(BaseHTTPRequestHandler):
             raise ValueError
         return body
 
-    def upstream_headers(self, body):
+    def upstream_headers(self, body, path):
         upgrade = self.headers.get("Upgrade")
         blocked = HOP_HEADERS | {
             value.strip().lower()
             for value in self.headers.get("Connection", "").split(",")
             if value.strip()
         }
+        if self.server.client_key and path.startswith("/v1/"):
+            blocked.add("authorization")
         headers = {
             name: value
             for name, value in self.headers.items()
             if name.lower() not in blocked and name.lower() not in {"content-length", "host"}
         }
+        if self.server.client_key and path.startswith("/v1/"):
+            headers["Authorization"] = f"Bearer {self.server.client_key}"
         if upgrade:
             headers["Connection"] = "Upgrade"
             headers["Upgrade"] = upgrade
@@ -171,7 +176,7 @@ class RetryBridgeHandler(BaseHTTPRequestHandler):
             buffered = b""
             while True:
                 connection = http.client.HTTPConnection("127.0.0.1", self.server.upstream_port, timeout=30)
-                connection.request(self.command, path, body=body, headers=self.upstream_headers(body))
+                connection.request(self.command, path, body=body, headers=self.upstream_headers(body, target.path))
                 response = connection.getresponse()
                 if connection.sock is not None:
                     connection.sock.settimeout(None)
@@ -309,7 +314,10 @@ def main(arguments):
     signal.signal(signal.SIGTERM, stop)
     try:
         wait_for_upstream(child)
-        server = RetryBridgeServer(("127.0.0.1", 8317), RetryBridgeHandler, 8318, child)
+        client_key = (Path.home() / ".local/state/fleet/cliproxyapi-client-key").read_text().strip()
+        if not client_key or not client_key.isprintable():
+            raise SystemExit("CLIProxyAPI client key is invalid.")
+        server = RetryBridgeServer(("127.0.0.1", 8317), RetryBridgeHandler, 8318, child, client_key=client_key)
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
         pass
