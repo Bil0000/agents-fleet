@@ -118,6 +118,10 @@ PY
     python=$(find_python)
     exec "$python" -B -I "$root/lib/fleet_accounts.py" "$root" "${@:2}"
     ;;
+  host|onboard)
+    python=$(find_python)
+    exec "$python" -B -I "$root/lib/fleet_onboard.py" "$root" "$@"
+    ;;
   status|update|scan|adopt)
     python=$(find_python)
     exec "$python" -B -I "$root/lib/fleet_discovery.py" "$root" "$@"
@@ -127,7 +131,7 @@ PY
     exec "$python" -B -I "$root/lib/fleet_apply.py" "$root" "$@"
     ;;
   *)
-    echo "Usage: fleet check | fleet apply | fleet status | fleet scan | fleet adopt ... | fleet update | fleet rollback | fleet enable-updates | fleet disable-updates | fleet auth ... | fleet mcp ... | fleet memory ... | fleet account ..." >&2
+    echo "Usage: fleet check | fleet apply | fleet status | fleet scan | fleet adopt ... | fleet host add ... | fleet onboard ... | fleet update | fleet rollback | fleet enable-updates | fleet disable-updates | fleet auth ... | fleet mcp ... | fleet memory ... | fleet account ..." >&2
     exit 2
     ;;
 esac
