@@ -29,6 +29,45 @@ class Missing:
 
 
 class FleetApplyTest(unittest.TestCase):
+    def test_codex_agent_limit_preserves_roles_and_is_idempotent(self):
+        settings = {"agents": {"max_concurrent_threads_per_session": 64}}
+        for current in ('', '[agents]\nmax_concurrent_threads_per_session = 3\n', '[agents]\nmax_concurrent_threads_per_session = 64\n'):
+            with self.subTest(current=current):
+                current += '[agents.worker]\ndescription = "keep"\n'
+                self.assertEqual(tomllib.loads(fleet.render_codex(current, {}, {}, {})), tomllib.loads(current))
+                rendered = fleet.render_codex(current, settings, {}, {})
+                self.assertEqual(tomllib.loads(rendered), {"agents": {
+                    "max_concurrent_threads_per_session": 64,
+                    "worker": {"description": "keep"},
+                }})
+                self.assertEqual(fleet.render_codex(rendered, settings, {}, {}), rendered)
+
+
+    def test_codex_agent_limit_validation(self):
+        path = self.repo / "settings/codex.toml"
+        for value in ('true', '0', '-1', '1.5', '"64"'):
+            with self.subTest(value=value):
+                path.write_text('[agents]\nmax_concurrent_threads_per_session = ' + value + '\n')
+                with self.assertRaisesRegex(fleet.FleetError, "Invalid managed Codex agents"):
+                    fleet.check_repository(self.repo)
+
+
+    def test_context_and_shared_hooks_preserve_host_settings(self):
+        current = '[features]\ncontext_management = false\ncustom = true\n'
+        settings = {"features": {"context_management": True}}
+        rendered = fleet.render_codex(current, settings, {}, {})
+        self.assertEqual(tomllib.loads(rendered)["features"], {"context_management": True, "custom": True})
+        self.assertEqual(fleet.render_codex(rendered, settings, {}, {}), rendered)
+        common = {"SessionStart": [{"hooks": [{"type": "command", "command": "shared"}]}]}
+        overlay = {"SessionStart": [{"hooks": [{"type": "command", "command": "host"}]}]}
+        (self.repo / "settings/codex-hooks.json").write_text(json.dumps({"hooks": common}))
+        (self.repo / "hosts/test-linux/codex-hooks.json").write_text(json.dumps({"hooks": overlay}))
+        (self.repo / "settings/claude.json").write_text(json.dumps({"hooks": common}))
+        (self.repo / "hosts/test-linux/claude.json").write_text(json.dumps({"hooks": overlay}))
+        expected = {"SessionStart": common["SessionStart"] + overlay["SessionStart"]}
+        self.assertEqual(fleet.load_codex_hooks(self.repo, "test-linux"), {"hooks": expected})
+        self.assertEqual(fleet.load_settings(self.repo, "test-linux")[1]["hooks"], expected)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.home = Path(self.temporary.name) / "home"

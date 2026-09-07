@@ -39,7 +39,8 @@ SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 PLUGIN_ID = re.compile(r"^[a-z0-9][a-z0-9-]*@[a-z0-9][a-z0-9-]*$")
 GITHUB_SOURCE = re.compile(r"^(?:https://github\.com/)?([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?$")
 CODEX_SCALARS = ("personality", "web_search", "service_tier")
-CODEX_FEATURES = ("multi_agent", "memories", "chronicle")
+CODEX_FEATURES = ("multi_agent", "memories", "chronicle", "context_management")
+CODEX_AGENTS = ("max_concurrent_threads_per_session",)
 CODEX_REMOVED_FEATURES = ("plugin_hooks", "js_repl")
 CODEX_HOOK_EVENTS = {
     "PermissionRequest", "PostCompact", "PostToolUse", "PreCompact", "PreToolUse",
@@ -186,7 +187,7 @@ def check_repository(root):
                     if set(data) != {"id", "os", "role"} or data["id"] != path.parent.name or data["os"] not in {"macos", "linux"} or not isinstance(data["role"], str) or not data["role"].strip():
                         fail(f"Invalid host manifest: {relative}")
                 if path.name == "codex.toml" and (path.parent == root / "settings" or path.parent.parent == root / "hosts"):
-                    allowed = set(CODEX_SCALARS) | {"features"}
+                    allowed = set(CODEX_SCALARS) | {"features", "agents"}
                     if not isinstance(data, dict) or set(data) - allowed:
                         fail(f"Invalid managed Codex settings: {relative}")
                     if any(key in data and not isinstance(data[key], str) for key in CODEX_SCALARS):
@@ -194,6 +195,9 @@ def check_repository(root):
                     features = data.get("features", {})
                     if not isinstance(features, dict) or set(features) - set(CODEX_FEATURES) or any(type(value) is not bool for value in features.values()):
                         fail(f"Invalid managed Codex features: {relative}")
+                    agents = data.get("agents", {})
+                    if not isinstance(agents, dict) or set(agents) - set(CODEX_AGENTS) or any(type(value) is not int or value < 1 for value in agents.values()):
+                        fail(f"Invalid managed Codex agents: {relative}")
             if path.name == "claude.json" and (path.parent == root / "settings" or path.parent.parent == root / "hosts"):
                 data = json.loads(path.read_text())
                 allowed = CLAUDE_LEAVES | set(CLAUDE_NESTED)
@@ -824,6 +828,13 @@ def merged_mapping(common, overlay):
     return result
 
 
+def merged_hooks(common, overlay):
+    result = deepcopy(common)
+    for event, groups in overlay.items():
+        result.setdefault(event, []).extend(deepcopy(groups))
+    return result
+
+
 def validate_plugin_manifest(value, relative, *, allow_local=False):
     if not isinstance(value, dict) or set(value) != {"codex", "claude"}:
         fail(f"Invalid plugin manifest: {relative}")
@@ -1038,13 +1049,30 @@ def load_settings(root, host):
     claude = json.loads((root / "settings" / "claude.json").read_text())
     host_claude = root / "hosts" / host / "claude.json"
     if host_claude.exists():
-        claude = merged_mapping(claude, json.loads(host_claude.read_text()))
+        overlay = json.loads(host_claude.read_text())
+        common_hooks = claude.get("hooks", {})
+        host_hooks = overlay.get("hooks", {})
+        claude = merged_mapping(claude, overlay)
+        if common_hooks or host_hooks:
+            claude["hooks"] = merged_hooks(common_hooks, host_hooks)
     return codex, claude
+
+
+def load_codex_hooks(root, host):
+    common = root / "settings" / "codex-hooks.json"
+    overlay = root / "hosts" / host / "codex-hooks.json"
+    if not common.exists() and not overlay.exists():
+        return None
+    common_hooks = json.loads(common.read_text())["hooks"] if common.exists() else {}
+    host_hooks = json.loads(overlay.read_text())["hooks"] if overlay.exists() else {}
+    return {"hooks": merged_hooks(common_hooks, host_hooks)}
 
 
 def toml_value(value):
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
     if isinstance(value, str):
         return json.dumps(value, ensure_ascii=False)
     fail("Unsupported managed TOML value.")
@@ -1077,6 +1105,7 @@ def strip_codex_managed(text, managed_servers, settings):
         if match and (
             (not section and match.group(1) in settings)
             or (section == ("features",) and match.group(1) in settings.get("features", {}))
+            or (section == ("agents",) and match.group(1) in settings.get("agents", {}))
         ):
             continue
         output.append(line)
@@ -1094,6 +1123,12 @@ def codex_unmanaged(data, managed_servers, settings):
             features.pop(key, None)
         if not features:
             value.pop("features", None)
+    agents = value.get("agents")
+    if isinstance(agents, dict):
+        for key in settings.get("agents", {}):
+            agents.pop(key, None)
+        if not agents:
+            value.pop("agents", None)
     servers = value.get("mcp_servers")
     if isinstance(servers, dict):
         for name in managed_servers:
@@ -1118,16 +1153,18 @@ def render_codex(current, settings, servers, source_blocks):
             lines.pop(first_table - 1)
             first_table -= 1
         lines[first_table:first_table] = scalars + ([""] if first_table < len(lines) else [])
-    features = settings.get("features", {})
-    if features:
-        feature_lines = [f"{key} = {toml_value(features[key])}" for key in CODEX_FEATURES if key in features]
-        header = next((index for index, line in enumerate(lines) if re.match(r"^\s*\[features\]\s*(?:#.*)?$", line)), None)
+    for section, keys in (("features", CODEX_FEATURES), ("agents", CODEX_AGENTS)):
+        values = settings.get(section, {})
+        if not values:
+            continue
+        setting_lines = [f"{key} = {toml_value(values[key])}" for key in keys if key in values]
+        header = next((index for index, line in enumerate(lines) if re.match(rf"^\s*\[{section}\]\s*(?:#.*)?$", line)), None)
         if header is None:
             if lines and lines[-1].strip():
                 lines.append("")
-            lines.extend(["[features]", *feature_lines])
+            lines.extend([f"[{section}]", *setting_lines])
         else:
-            lines[header + 1:header + 1] = feature_lines
+            lines[header + 1:header + 1] = setting_lines
     chunks = ["\n".join(lines).rstrip()] if lines else []
     for name in sorted(servers):
         chunks.append(source_blocks[name].rstrip())
@@ -1360,9 +1397,9 @@ def build_plan(root, home, host, temporary, credential_reader, *, sha=None, arch
             for client in (".codex", ".claude"):
                 relative = Path(client) / "hooks" / hook.name
                 operations.append(path_operation(home, relative, link=os.path.relpath(source, (home / relative).parent)))
-    codex_hooks = source_root / "hosts" / host / "codex-hooks.json"
-    if codex_hooks.exists():
-        operations.append(path_operation(home, ".codex/hooks.json", data=codex_hooks.read_bytes(), mode=0o600))
+    codex_hooks = load_codex_hooks(source_root, host)
+    if codex_hooks is not None:
+        operations.append(path_operation(home, ".codex/hooks.json", data=(json.dumps(codex_hooks, indent=2) + "\n").encode(), mode=0o600))
     skill_sources = {}
     for directory in (source_root / "skills", source_root / "hosts" / host / "skills"):
         if not directory.exists():
