@@ -30,11 +30,19 @@ class FleetMemoryError(RuntimeError):
     pass
 
 
+VULNERABLE_WORKER = b"e.memorySessionId&&(this.dbManager.getSessionStore().updateMemorySessionId(e.sessionDbId,null),e.memorySessionId=null)"
+HARDENED_WORKER = b"e.memorySessionId&&(e.memorySessionId=null)"
+STALE_WORKER_HEALTH_VERSION = b'QZ="13.23.1"'
+PINNED_WORKER_HEALTH_VERSION = b'QZ="13.24.0"'
+WORKER_VERSION_ALIASES = {"13.24.0": {"13.23.1"}}
+MEMORY_GATEWAY_URL = "http://127.0.0.1:8317"
+
+
 @dataclass(frozen=True)
 class MemoryConfig:
     version: str
     server_host: str
-    client_host: str
+    client_hosts: tuple[str, ...]
     ssh_target: str
     worker_host: str
     worker_port: int
@@ -50,6 +58,13 @@ def load_config(root):
         )
     try:
         values = tomllib.loads(path.read_text())
+        client_host = values.pop("client_host", None)
+        client_hosts = values.pop("client_hosts", None)
+        if (client_host is None) == (client_hosts is None) or (
+            client_hosts is not None and not isinstance(client_hosts, list)
+        ):
+            raise TypeError
+        values["client_hosts"] = (client_host,) if client_host is not None else tuple(client_hosts)
         config = MemoryConfig(**values)
     except (OSError, UnicodeError, tomllib.TOMLDecodeError, TypeError) as error:
         raise FleetMemoryError("Invalid Fleet memory config.") from error
@@ -58,7 +73,14 @@ def load_config(root):
     host = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
     target = re.compile(r"[A-Za-z0-9._-]+@[A-Za-z0-9.-]+")
     version = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
-    if not all(isinstance(value, str) and host.fullmatch(value) for value in (config.server_host, config.client_host)):
+    if (
+        not isinstance(config.server_host, str)
+        or not host.fullmatch(config.server_host)
+        or not config.client_hosts
+        or not all(isinstance(value, str) and host.fullmatch(value) for value in config.client_hosts)
+        or len(config.client_hosts) != len(set(config.client_hosts))
+        or config.server_host in config.client_hosts
+    ):
         raise FleetMemoryError("Invalid Fleet memory host.")
     if not isinstance(config.ssh_target, str) or not target.fullmatch(config.ssh_target):
         raise FleetMemoryError("Invalid Fleet memory SSH target.")
@@ -165,7 +187,36 @@ def resolve_plugin(home, version):
     raise FleetMemoryError(f"Claude-mem {version} pinned worker is not installed.")
 
 
-def configure_client(home, config):
+def harden_plugin(home, config):
+    script = resolve_plugin(home, config.version)
+    contents = safe_regular(script).read_bytes()
+    memory_ok = contents.count(HARDENED_WORKER) == 1 and VULNERABLE_WORKER not in contents
+    version_ok = contents.count(PINNED_WORKER_HEALTH_VERSION) == 1 and STALE_WORKER_HEALTH_VERSION not in contents
+    if memory_ok and version_ok:
+        return
+    if not memory_ok and (contents.count(VULNERABLE_WORKER) != 1 or HARDENED_WORKER in contents):
+        raise FleetMemoryError("Claude-mem pinned worker does not match the reviewed bundle.")
+    if not version_ok and (contents.count(STALE_WORKER_HEALTH_VERSION) != 1 or PINNED_WORKER_HEALTH_VERSION in contents):
+        raise FleetMemoryError("Claude-mem pinned worker does not match the reviewed bundle.")
+    contents = contents.replace(VULNERABLE_WORKER, HARDENED_WORKER)
+    contents = contents.replace(STALE_WORKER_HEALTH_VERSION, PINNED_WORKER_HEALTH_VERSION)
+    atomic_bytes(script, contents, stat.S_IMODE(os.stat(script).st_mode))
+
+
+def plugin_hardened(home, config):
+    try:
+        contents = safe_regular(resolve_plugin(home, config.version)).read_bytes()
+    except (FleetMemoryError, OSError):
+        return False
+    return (
+        contents.count(HARDENED_WORKER) == 1
+        and VULNERABLE_WORKER not in contents
+        and contents.count(PINNED_WORKER_HEALTH_VERSION) == 1
+        and STALE_WORKER_HEALTH_VERSION not in contents
+    )
+
+
+def configure_client(home, config, auth_method="subscription"):
     home = Path(home)
     settings_path = home / ".claude-mem/settings.json"
     settings = read_json(settings_path) if settings_path.exists() else {}
@@ -174,6 +225,8 @@ def configure_client(home, config):
             "CLAUDE_MEM_RUNTIME": "worker",
             "CLAUDE_MEM_WORKER_HOST": config.worker_host,
             "CLAUDE_MEM_WORKER_PORT": str(config.worker_port),
+            "CLAUDE_MEM_PROVIDER": "claude",
+            "CLAUDE_MEM_CLAUDE_AUTH_METHOD": auth_method,
         }
     )
     atomic_json(settings_path, settings, 0o600)
@@ -309,6 +362,47 @@ def require_success(result, action):
         raise FleetMemoryError(f"Could not {action} Fleet memory.")
 
 
+def memory_role(config, host, platform):
+    if host == config.server_host and platform == "linux":
+        return "server"
+    if host in config.client_hosts and platform in {"darwin", "linux"}:
+        return "client"
+    raise FleetMemoryError("Fleet memory host role does not match this platform.")
+
+
+def render_linux_client_service():
+    return (
+        "[Unit]\n"
+        "Description=Connect to shared Fleet Claude-mem worker\n"
+        "After=network.target\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "ExecStart=%h/.local/bin/fleet memory proxy\n"
+        "Restart=on-failure\n"
+        "RestartSec=5\n\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    ).encode()
+
+
+def old_server_active(root, home, native_runner):
+    directory = Path(home) / ".config/systemd/user"
+    paths = [directory / name for name in LINUX_UNITS]
+    captured = capture_files(paths)
+    if all(value is None for value in captured.values()):
+        return False
+    sources = linux_sources(root)
+    if any(captured[path] is None or captured[path][0] != sources[path.name] for path in paths):
+        raise FleetMemoryError("Existing Fleet memory server units do not match this release.")
+    active = []
+    for unit in ("fleet-memory.service", "fleet-memory-backup.timer"):
+        result = run_native(["/usr/bin/systemctl", "--user", "is-active", unit], home, "linux", native_runner)
+        active.append(result.returncode == 0 and result.stdout.strip() == "active")
+    if any(active) and not all(active):
+        raise FleetMemoryError("Existing Fleet memory server units have mixed state.")
+    return all(active)
+
+
 def enable_memory(root, home, host, *, platform_name=None, uid=None, native_runner=None):
     root = Path(root)
     home = Path(home)
@@ -316,26 +410,59 @@ def enable_memory(root, home, host, *, platform_name=None, uid=None, native_runn
     platform = ("darwin" if sys.platform == "darwin" else "linux") if platform_name is None else platform_name
     if platform not in {"darwin", "linux"}:
         raise FleetMemoryError("Fleet memory supports only macOS and Linux.")
-    if (host, platform) not in {(config.client_host, "darwin"), (config.server_host, "linux")}:
-        raise FleetMemoryError("Fleet memory host role does not match this platform.")
-    resolve_plugin(home, config.version)
+    role = memory_role(config, host, platform)
+    harden_plugin(home, config)
     settings = home / ".claude-mem/settings.json"
     marketplaces = home / ".claude/plugins/known_marketplaces.json"
-    if platform == "linux":
+    gateway = None
+    gateway_contents = None
+    if role == "server":
+        client_key = safe_regular(home / ".local/state/fleet/cliproxyapi-client-key").read_text().strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", client_key):
+            raise FleetMemoryError("Invalid Fleet memory gateway key.")
+        gateway = home / ".claude-mem/.env"
+        gateway_contents = (
+            f"ANTHROPIC_BASE_URL={MEMORY_GATEWAY_URL}\n"
+            f"ANTHROPIC_AUTH_TOKEN={client_key}\n"
+        ).encode()
         unit_directory = home / ".config/systemd/user"
         sources = linux_sources(root)
         managed = {unit_directory / name: contents for name, contents in sources.items()}
+    elif platform == "linux":
+        managed = {
+            home / ".config/systemd/user/fleet-memory-client.service": render_linux_client_service()
+        }
     else:
         managed = {home / "Library/LaunchAgents/dev.agents-fleet.memory.plist": render_macos_plist(home)}
-    previous = capture_files([settings, marketplaces, *managed])
+    previous = capture_files([settings, marketplaces, *managed, *([gateway] if gateway else [])])
+    if gateway and previous[gateway] is not None and previous[gateway][0] != gateway_contents:
+        raise FleetMemoryError(f"Fleet memory gateway is not owned by Fleet: {gateway}")
     started = False
+    old_server_was_active = False
     try:
-        configure_client(home, config)
+        if role == "client" and platform == "linux":
+            old_server_was_active = old_server_active(root, home, native_runner)
+            if old_server_was_active:
+                require_success(
+                    run_native(
+                        [
+                            "/usr/bin/systemctl", "--user", "disable", "--now",
+                            "fleet-memory-backup.timer", "fleet-memory.service",
+                        ],
+                        home,
+                        platform,
+                        native_runner,
+                    ),
+                    "stop old server",
+                )
+        configure_client(home, config, "gateway" if gateway else "subscription")
+        if gateway:
+            atomic_bytes(gateway, gateway_contents, 0o600)
         for path, contents in managed.items():
             if previous[path] is not None and previous[path][0] != contents:
                 raise FleetMemoryError(f"Fleet memory target is not owned by Fleet: {path}")
             atomic_bytes(path, contents, 0o644)
-        if platform == "linux":
+        if role == "server":
             require_success(run_native(["/usr/bin/systemctl", "--user", "daemon-reload"], home, platform, native_runner), "reload")
             require_success(
                 run_native(["/usr/bin/systemctl", "--user", "enable", "--now", "fleet-memory.service"], home, platform, native_runner),
@@ -350,6 +477,16 @@ def enable_memory(root, home, host, *, platform_name=None, uid=None, native_runn
                 result = run_native(["/usr/bin/systemctl", "--user", "is-active", unit], home, platform, native_runner)
                 if result.returncode or result.stdout.strip() != "active":
                     raise FleetMemoryError(f"Fleet memory unit is not active: {unit}")
+        elif platform == "linux":
+            require_success(run_native(["/usr/bin/systemctl", "--user", "daemon-reload"], home, platform, native_runner), "reload")
+            require_success(
+                run_native(["/usr/bin/systemctl", "--user", "enable", "--now", "fleet-memory-client.service"], home, platform, native_runner),
+                "enable guard",
+            )
+            started = True
+            result = run_native(["/usr/bin/systemctl", "--user", "is-active", "fleet-memory-client.service"], home, platform, native_runner)
+            if result.returncode or result.stdout.strip() != "active":
+                raise FleetMemoryError("Fleet memory unit is not active: fleet-memory-client.service")
         else:
             logs = home / ".local/state/fleet/logs"
             logs.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -362,9 +499,17 @@ def enable_memory(root, home, host, *, platform_name=None, uid=None, native_runn
             )
             started = True
     except BaseException:
-        if platform == "linux" and started:
+        if role == "server" and started:
             run_native(
                 ["/usr/bin/systemctl", "--user", "disable", "--now", "fleet-memory-backup.timer", "fleet-memory.service"],
+                home,
+                platform,
+                native_runner,
+            )
+            run_native(["/usr/bin/systemctl", "--user", "daemon-reload"], home, platform, native_runner)
+        elif platform == "linux" and started:
+            run_native(
+                ["/usr/bin/systemctl", "--user", "disable", "--now", "fleet-memory-client.service"],
                 home,
                 platform,
                 native_runner,
@@ -373,6 +518,9 @@ def enable_memory(root, home, host, *, platform_name=None, uid=None, native_runn
         elif platform == "darwin" and started:
             run_native(["/bin/launchctl", "bootout", f"gui/{uid}/{MAC_LABEL}"], home, platform, native_runner)
         restore_files(previous)
+        if old_server_was_active:
+            run_native(["/usr/bin/systemctl", "--user", "enable", "--now", "fleet-memory.service"], home, platform, native_runner)
+            run_native(["/usr/bin/systemctl", "--user", "enable", "--now", "fleet-memory-backup.timer"], home, platform, native_runner)
         raise
 
 
@@ -398,6 +546,7 @@ def resolve_bun(home):
 def run_worker(home, config, *, executor=os.execve):
     home = Path(home)
     bun = resolve_bun(home)
+    harden_plugin(home, config)
     script = resolve_plugin(home, config.version)
     paths = (
         home / ".local/bin",
@@ -415,6 +564,8 @@ def run_worker(home, config, *, executor=os.execve):
         "CLAUDE_MEM_RUNTIME": "worker",
         "CLAUDE_MEM_WORKER_HOST": config.worker_host,
         "CLAUDE_MEM_WORKER_PORT": str(config.worker_port),
+        "CLAUDE_MEM_PROVIDER": "claude",
+        "CLAUDE_MEM_CLAUDE_AUTH_METHOD": "gateway",
     }
     executable = str(bun)
     executor(executable, [executable, str(script), "--daemon"], environment)
@@ -531,17 +682,24 @@ def port_is_bound(port):
 
 
 def pinned_plugin_ok(home, config):
-    try:
-        resolve_plugin(home, config.version)
+    return plugin_hardened(home, config)
+
+
+def observer_ok(home):
+    path = Path(home) / ".claude-mem/observer-health.json"
+    if not path.exists():
         return True
+    try:
+        failures = read_json(path).get("consecutiveFailures")
     except FleetMemoryError:
         return False
+    return type(failures) is int and failures == 0
 
 
 def server_database_status(home):
     try:
         database_report = db.check_database(Path(home) / ".claude-mem/claude-mem.db")
-        database_ok = not database_report.foreign_key_errors and database_report.schema_version == 49
+        database_ok = not database_report.foreign_key_errors and database_report.schema_version == 50
         queue_ok = database_report.counts["pending"] == 0 and database_report.counts["processing"] == 0
         return database_ok, queue_ok
     except (KeyError, db.FleetMemoryDatabaseError):
@@ -552,19 +710,26 @@ def server_status(home, config, plugin_ok, worker_ok):
     service = run_native(["/usr/bin/systemctl", "--user", "is-active", "fleet-memory.service"], home, "linux")
     service_ok = service.returncode == 0 and service.stdout.strip() == "active"
     database_ok, queue_ok = server_database_status(home)
+    observer_healthy = observer_ok(home)
     backup = latest_backup(home)
     backup_ok = backup is not None and stat.S_IMODE(os.stat(backup).st_mode) == 0o600
     lines = [
         f"service: {'active' if service_ok else 'error'}",
         f"database: {'ok' if database_ok else 'error'}",
         f"queue: {'empty' if queue_ok else 'error'}",
+        f"observer: {'ok' if observer_healthy else 'error'}",
         f"backup: {backup.name if backup_ok else 'error'}",
     ]
-    return lines, all((plugin_ok, worker_ok, service_ok, database_ok, queue_ok, backup_ok))
+    return lines, all((plugin_ok, worker_ok, service_ok, database_ok, queue_ok, observer_healthy, backup_ok))
 
 
-def client_status(home, config, plugin_ok, worker_ok):
-    service = run_native(["/bin/launchctl", "print", f"gui/{os.getuid()}/{MAC_LABEL}"], home, "darwin")
+def client_status(home, config, plugin_ok, worker_ok, platform):
+    command = (
+        ["/bin/launchctl", "print", f"gui/{os.getuid()}/{MAC_LABEL}"]
+        if platform == "darwin"
+        else ["/usr/bin/systemctl", "--user", "is-active", "fleet-memory-client.service"]
+    )
+    service = run_native(command, home, platform)
     service_ok = service.returncode == 0
     guard_ok = port_is_bound(config.worker_port)
     lines = [
@@ -579,19 +744,17 @@ def status_report(root, home, host):
     home = Path(home)
     config = load_config(root)
     platform = "darwin" if sys.platform == "darwin" else "linux"
-    roles = {(config.client_host, "darwin"): "client", (config.server_host, "linux"): "server"}
-    role = roles.get((host, platform))
-    if role is None:
-        raise FleetMemoryError("Fleet memory host role does not match this platform.")
+    role = memory_role(config, host, platform)
     plugin_ok = pinned_plugin_ok(home, config)
     health_payload = worker_health(config.worker_port)
-    worker_ok = isinstance(health_payload, dict) and health_payload.get("version") == config.version
+    reported_version = health_payload.get("version") if isinstance(health_payload, dict) else None
+    worker_ok = reported_version == config.version or reported_version in WORKER_VERSION_ALIASES.get(config.version, set())
     lines = [f"role: {role}", f"pinned: {config.version}", f"plugin: {'ok' if plugin_ok else 'error'}"]
-    lines.append(f"worker: {config.version if worker_ok else 'error'}")
+    lines.append(f"worker: {reported_version if worker_ok else 'error'}")
     role_lines, ok = (
         server_status(home, config, plugin_ok, worker_ok)
         if role == "server"
-        else client_status(home, config, plugin_ok, worker_ok)
+        else client_status(home, config, plugin_ok, worker_ok, platform)
     )
     return lines + role_lines, ok
 
@@ -608,9 +771,8 @@ def disable_memory(root, home, host, *, platform_name=None, uid=None, native_run
     home = Path(home)
     config = load_config(root)
     platform = ("darwin" if sys.platform == "darwin" else "linux") if platform_name is None else platform_name
-    if (host, platform) not in {(config.client_host, "darwin"), (config.server_host, "linux")}:
-        raise FleetMemoryError("Fleet memory host role does not match this platform.")
-    if platform == "linux":
+    role = memory_role(config, host, platform)
+    if role == "server":
         require_success(
             run_native(
                 [
@@ -625,18 +787,30 @@ def disable_memory(root, home, host, *, platform_name=None, uid=None, native_run
         )
         require_success(run_native(["/usr/bin/systemctl", "--user", "daemon-reload"], home, platform, native_runner), "reload")
         return
+    if platform == "linux":
+        require_success(
+            run_native(
+                ["/usr/bin/systemctl", "--user", "disable", "--now", "fleet-memory-client.service"],
+                home,
+                platform,
+                native_runner,
+            ),
+            "disable guard",
+        )
+        require_success(run_native(["/usr/bin/systemctl", "--user", "daemon-reload"], home, platform, native_runner), "reload")
+        return
     uid = os.getuid() if uid is None else uid
     result = run_native(["/bin/launchctl", "bootout", f"gui/{uid}/{MAC_LABEL}"], home, platform, native_runner)
     if result.returncode not in {0, 113}:
         raise FleetMemoryError("Could not disable Fleet memory guard.")
 
 
-USAGE = "Usage: fleet memory status | backup | enable | disable"
+USAGE = "Usage: fleet memory status | backup | enable | disable | harden"
 
 
 def main(argv=None):
     arguments = sys.argv[1:] if argv is None else argv
-    if len(arguments) < 2 or arguments[1] not in {"status", "backup", "enable", "disable", "proxy", "worker"}:
+    if len(arguments) < 2 or arguments[1] not in {"status", "backup", "enable", "disable", "harden", "proxy", "worker"}:
         print(USAGE, file=sys.stderr)
         return 2
     root = Path(arguments[0]).resolve()
@@ -673,6 +847,10 @@ def main(argv=None):
         return 0
     if command == "disable":
         disable_memory(root, home, host)
+        return 0
+    if command == "harden":
+        harden_plugin(home, config)
+        print("plugin: hardened")
         return 0
     if command == "backup":
         if host != config.server_host:
