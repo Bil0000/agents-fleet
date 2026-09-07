@@ -153,16 +153,16 @@ npx claude-mem repair
 
 ### Optional shared memory
 
-Use this only when the user asks for one database shared by a macOS client and a Linux server. It uses an SSH tunnel. It does not expose the database or worker to the public internet.
+Use this only when the user asks for one database shared by macOS or Linux clients and a Linux server. It uses an SSH tunnel. It does not expose the database or worker to the public internet.
 
-1. Install the same Claude-Mem version on both devices.
+1. Install Claude-Mem 13.24.0 on the server and all clients. Run `fleet account setup` on the server before enabling shared memory.
 2. Back up every existing `~/.claude-mem/claude-mem.db` with SQLite's backup API before any merge or move.
 3. Copy `memory.example.toml` to `memory.toml`.
-4. Set `server_host`, `client_host`, `ssh_target`, and the installed Claude-Mem `version`.
-5. Make sure the macOS client can use key-based SSH to the Linux server.
+4. Set `server_host`, `client_hosts`, `ssh_target`, and the installed Claude-Mem `version`.
+5. Make sure each client can use key-based SSH to the Linux server.
 6. Apply Fleet on the Linux server, then run `~/.local/bin/fleet memory enable --host SERVER_HOST`.
-7. Apply Fleet on the macOS client, then run `~/.local/bin/fleet memory enable --host CLIENT_HOST`.
-8. Run `~/.local/bin/fleet memory status --host HOST` on both devices.
+7. Apply Fleet on each client, then run `~/.local/bin/fleet memory enable --host CLIENT_HOST`.
+8. Run `~/.local/bin/fleet memory status --host HOST` on all devices.
 9. Confirm new observations written from each client appear in the server database.
 
 Do not merge old databases unless the user asks. When a merge is required, work on snapshots, verify schema compatibility and foreign keys, keep both originals, and replace nothing until the merged copy passes checks.

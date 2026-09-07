@@ -94,11 +94,53 @@ fleet account auto codex on
 fleet account current codex
 ```
 
-Auto mode defaults to `limits only`: it switches accounts only for a structured subscription-limit response before output starts. `fleet account auto codex on --when any` also switches for temporary provider errors and can spend fallback quota. Each new request tries the chosen primary first again, so Fleet returns to it after its limit resets. Fleet never replays a request after output starts because that could repeat tool work or other side effects.
+Auto mode defaults to `limits only`: it switches accounts only for a structured subscription-limit response before output starts. `fleet account auto codex on --when any` also switches for temporary provider errors and can spend fallback quota. The retry bridge caps each wait at five minutes. The bundled provider-routing patch also caps quota cooldowns and clears them from fresh provider usage data. Fleet returns to the chosen primary when it is ready. Fleet never replays a request after output starts because that could repeat tool work or other side effects.
 
 The same commands work with `claude`. Run `fleet account auto --help` to see the switching modes. `fleet account current` reports the account used by the latest successful 10-minute request bucket. Use `fleet account enroll` only to adopt credentials from an existing CLIProxyAPI setup.
 
 Fleet does not contain a model list. New models, aliases, reasoning controls, auth screens, and non-auth client commands continue to come directly from Claude and Codex.
+
+Newer Fleet-managed CLIProxyAPI builds are supported. The macOS updater source and provider-routing patch are included for existing custom builds. They are not installed by `fleet account setup`. The updater needs Go, a C compiler, and an existing Fleet provider-router setup. It checks a new build and restores the old build if activation fails.
+
+## Host setup
+
+After you create your own private repository, add a device profile:
+
+```bash
+./bin/fleet host add my-laptop --os macos --role workstation
+```
+
+Use `--os linux` for a Linux device. This adds a host manifest and the Claude-Mem plugin entry. It does not apply settings.
+
+Commit and push the new profile to your private repository, then wait for its checks to pass and its `live` branch to update. For a full setup on that device:
+
+```bash
+./bin/fleet onboard --host my-laptop --memory local
+```
+
+This checks the tools and tests, applies Fleet, sets up account routing, and enables updates. It needs both Claude and Codex, Bun, Node.js 20.12 or newer, and a working private `origin`. Use the manual setup guide if you want only one client or no account routing.
+
+## Optional Codex settings and hooks
+
+The template leaves settings empty. In your private repo, you can add these to `settings/codex.toml`:
+
+```toml
+[features]
+context_management = true
+
+[agents]
+max_concurrent_threads_per_session = 64
+```
+
+Use a Codex version that supports these settings. Fleet validates the thread limit as a positive whole number. It keeps your other agent roles and settings.
+
+Shared hooks can go in `settings/codex-hooks.json`. Fleet combines them with `hosts/HOST/codex-hooks.json`. Shared and host Claude hooks are also combined.
+
+## Shared memory
+
+Local Claude-Mem is still the default. For shared memory, copy `memory.example.toml` to `memory.toml` in your private repo. Set one Linux server and a `client_hosts` list of macOS or Linux clients. The older single `client_host` field also works. Use only one of these fields.
+
+The shared setup uses Claude-Mem 13.24.0 and checks its worker before applying the known session and health fixes. Set up Fleet account routing on the server first. Clients connect through SSH. See [the shared-memory setup steps](SETUP_WITH_AN_AGENT.md).
 
 ## Safety model
 
@@ -107,7 +149,7 @@ Fleet does not contain a model list. New models, aliases, reasoning controls, au
 - Apply and update operations create backups and restore the prior state after a failure.
 - MCP secrets stay outside Git: macOS Keychain on macOS and `systemd-creds` on Linux.
 - OAuth tokens, session history, caches, databases, and machine credentials are never template content.
-- Claude-Mem is local by default. One shared Linux memory server for a macOS client is optional.
+- Claude-Mem is local by default. One shared Linux memory server for macOS and Linux clients is optional.
 
 ## Main commands
 
