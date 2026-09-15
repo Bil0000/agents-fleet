@@ -1,219 +1,152 @@
 # Agents Fleet
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+**Keep your Claude Code and Codex setup in one private Git repository. Apply it to your Mac and Linux devices.**
 
-A blank, working source of truth for Claude Code and Codex across macOS and Linux, with optional multi-account failover.
+Fleet manages rules, settings, skills, commands, hooks, plugins, and MCP servers (tools your agents can call). Change a shared rule once. Send it to every device. Keep device-specific settings separate.
 
-Fleet keeps your own rules, settings, skills, commands, hooks, plugins, MCP servers, secrets, updates, and Claude-Mem setup consistent. This repository contains the engine and empty folders. It does not contain my own configuration.
+## When to use Fleet
+
+- **One device:** save a repeatable setup with backups and rollback.
+- **Several devices:** keep your laptop and servers in sync.
+- **Several accounts:** choose an account, with optional fallback when its limit is reached.
+- **Shared memory:** optionally use one Claude-Mem database across devices through SSH.
+
+You still work in Claude Code or Codex. Fleet manages their setup. It does not contain a model list; models and reasoning options come from the clients.
+
+This template has **blank configuration**. Add only what Fleet should manage. Keep credentials, chat history, and databases outside Git.
 
 ## Start here
 
-Do not fork this repository. [A fork of a public repository is public](https://docs.github.com/en/pull-requests/reference/forks#visibility-of-forks). Your Fleet will contain personal rules and device details.
-
-1. Click [Use this template](https://github.com/new?template_owner=Bil0000&template_name=agents-fleet&visibility=private).
-2. Create a new **private** repository under your GitHub account or organization. Leave **Include all branches** off.
-3. Clone your new repository. Its `origin` must point to your repository, not `Bil0000/agents-fleet`.
-4. Open that clone with Claude Code or Codex and paste this prompt:
+1. Click [Use this template](https://github.com/new?template_owner=Bil0000&template_name=agents-fleet&visibility=private). Create a **private** repository. Leave **Include all branches** off. **Do not fork** for personal configuration.
+2. Clone your repository. Open it with Claude Code or Codex.
+3. Paste:
 
 ```text
-Set up this Agents Fleet in the repository I own. Before writing anything, verify that git remote get-url origin does not point to Bil0000/agents-fleet. Read SETUP_WITH_AN_AGENT.md in full and continue until every required check passes. Start with one device and local Claude-Mem unless I tell you that I have more devices. Preserve my current setup. Never put secrets, OAuth state, databases, or session history in Git.
+Set up Fleet using SETUP_WITH_AN_AGENT.md. First verify that origin points to my own private repository, not Bil0000/agents-fleet. Preserve my current setup. Start with one device and local Claude-Mem. Keep secrets and session data out of Git.
 ```
 
-The agent will back up your current setup, fill only the files you choose, install Claude-Mem, push to your private repository, wait for the checks, apply Fleet, and enable updates. The full contract is in [SETUP_WITH_AN_AGENT.md](SETUP_WITH_AN_AGENT.md).
+The [setup guide](SETUP_WITH_AN_AGENT.md) covers backups, installation, checks, and adding devices. Local-only use without a remote is supported with manual apply.
 
-If you do not want a GitHub repository, run `git remote remove origin` in a local clone and use manual apply. Automatic cross-device updates need your own remote repository.
-
-## What is empty
-
-```text
-rules/                 shared, Claude-only, and Codex-only rules
-settings/              safe client settings
-skills/                shared skills
-commands/              slash commands and prompts
-hooks/                 shared hook scripts
-hosts/                 one private overlay per device
-mcp/                   matching Claude and Codex MCP manifests
-plugins.json            shared plugin manifest
-memory.example.toml     optional shared-memory example
-```
-
-All user-owned files start empty. Add only what you want Fleet to manage.
+**Needs:** macOS or Linux, Git, Bash, Python 3.11+, and Claude Code and/or Codex. Claude-Mem needs Node.js 20.12+. Automated onboarding also needs both clients and Bun. Linux MCP secrets need `systemd-creds` with non-interactive sudo access.
 
 ## How sync works
 
-1. You change your private Fleet repository and push `main`.
-2. GitHub Actions checks it on macOS and Linux.
-3. A passing commit moves to the validated `live` branch.
-4. Each device checks `live` every minute and applies it safely.
-5. Each device scans hourly for new local skills, hooks, plugins, and MCPs.
+Edit your private repo → push `main` → GitHub Actions tests macOS and Linux → passing code advances to `live` → devices with updates enabled check every minute and apply it.
 
-GitHub cannot directly enter devices behind a firewall. The one-minute poll gives the same result without opening an inbound port.
+Fleet scans hourly for local additions. Updates stop if managed files have local edits: run `fleet scan`, then save those edits in the repo or discard them with `fleet apply`.
 
-Your repository is independent from this template. Future template changes do not enter your Fleet automatically.
+Updates come from **your repo**. Public template changes need a separate [engine update](SETUP_WITH_AN_AGENT.md#10-update-the-fleet-engine).
 
-Run an update now:
+## Commands
 
-```bash
-~/.local/bin/fleet update
-```
+Before installation, replace `fleet` with `./bin/fleet` inside the clone. Apply installs `~/.local/bin/fleet`; add `~/.local/bin` to your shell's `PATH`.
 
-Inspect local additions:
+Replace uppercase names with your values. `[VALUE]` is optional. `HOST` names a device profile; `PROVIDER` is `claude` or `codex`. Quote labels with spaces.
 
-```bash
-~/.local/bin/fleet scan
-```
+### Setup and daily use
 
-## Multiple accounts
+| Command | What it does |
+| --- | --- |
+| `fleet check` | Validate config, scripts, paths, and common secret patterns before committing. |
+| `fleet host add HOST --os macos --role workstation` | Create a device profile and Claude-Mem plugin entry. Use `linux` for Linux. |
+| `fleet onboard --host HOST --memory local` | Run checks/tests, apply config, install account routing, and enable updates. Commit/push the profile and wait for `live` first. Use `shared` for configured shared memory. |
+| `fleet apply --dry-run --host HOST` | Preview managed files without applying. |
+| `fleet apply --host HOST` | Back up and apply committed config. Requires a clean checkout. |
+| `fleet status` | Show release, update service, missing secrets, discoveries, and memory health. |
+| `fleet update` | Fetch and apply your tested `live` release now. |
+| `fleet update on` / `off` | Start / stop automatic updates. |
+| `fleet scan` | Find local additions and managed-file edits. `--json` gives machine-readable output. |
+| `fleet adopt KIND NAME --shared` | Import a scanned `skill`, `hook`, `plugin`, or `mcp` for all devices. **Checks, commits, and pushes it.** Requires clean, current `main`. |
+| `fleet adopt KIND NAME --host` | Import for this device only; also commits/pushes. `--device HOST` selects its profile. |
+| `fleet rollback [BACKUP-ID]` | Restore a local backup; defaults to the latest successful one. Stop updates to keep that state. |
 
-Fleet can route any number of Claude and Codex subscriptions through one shared client home. Only the account that pays for a request changes. Threads, transcripts, memory, rules, settings, models, reasoning options, and native client behavior stay shared and provider-owned.
+`apply`, `status`, `scan`, `update`, and memory commands accept `--host HOST`; otherwise Fleet resolves the current profile. Edit managed rules/settings in the repo; `adopt` cannot import them.
 
-Set it up once on each macOS or Linux device:
+### Accounts and fallback
 
-```bash
-fleet account setup
-```
+Routing sends requests through a local proxy so Fleet can choose the account. To enable it, run `fleet account setup`, open a new terminal, then use the normal provider commands: `codex login` or `claude auth login`. Repeated login refreshes the account. Native logout removes its routed account.
 
-Fleet downloads and verifies CLIProxyAPI 7.2.149, installs a small retry bridge, and keeps both endpoints and their private keys on localhost. No separate proxy install or sudo access is needed. If Fleet finds a proxy setup that it does not own, it stops without changing it.
+Every command below starts with `fleet account`.
 
-Use this only with accounts you own and where each provider's terms and plan allow it.
+| Command | What it does |
+| --- | --- |
+| `setup` | Install the verified local CLIProxyAPI router, retry bridge, and login hooks. |
+| `setup --check` | Check router and client setup. |
+| `setup --restore-clients` | Restore client routing settings; keep accounts and proxy. |
+| `list [PROVIDER]` | Show accounts, order, fallback mode, usage, reset times, and recent use. |
+| `login PROVIDER [LABEL]` | Log in and enroll an account; optionally name it. |
+| `login PROVIDER --existing ACCOUNT` | Enroll credentials already in CLIProxyAPI. |
+| `logout PROVIDER [ACCOUNT]` | Remove an enrolled account; defaults to the primary. |
+| `rename PROVIDER ACCOUNT LABEL` | Change its display name. |
+| `use PROVIDER [ACCOUNT]` | Choose the primary account; opens a picker if omitted. |
+| `order PROVIDER` | Show saved order. |
+| `order PROVIDER PRIMARY BACKUP...` | Set manual order. Include every enrolled account once, primary first. |
+| `order PROVIDER reset` | Sort by soonest weekly reset, after login and during hourly updates. |
+| `order PROVIDER manual` | Keep current order; stop automatic sorting. |
+| `order PROVIDER rebalance` | Refresh enabled reset ordering now. Omit `PROVIDER` for both providers. |
+| `auto PROVIDER on` / `off` | Enable limit-based fallback / use only the primary. |
+| `auto PROVIDER on --when any` | Also switch on temporary provider errors; can spend fallback quota. `--when limits` selects limit-only behavior. |
+| `auto --help` | Explain fallback modes. |
 
-Open a new terminal, then use the normal provider commands to add or refresh accounts:
+For example: `fleet account use codex "Work Pro"`. Use accounts you own. Fallback happens before output starts; Fleet never replays partially delivered requests. It returns to the primary when ready.
 
-```bash
-codex login
-claude auth login
-fleet account list
-```
+### Share an account router
 
-The same native logout commands remove the matching routed account. Logging in to the same account refreshes it instead of creating a duplicate. Fleet labels can be changed at any time.
+Install Tailscale with MagicDNS and run `fleet account setup` on each device first.
 
-```bash
-fleet account rename codex ACCOUNT "Work Pro"
-fleet account use codex "Work Pro"
-fleet account auto codex on
-fleet account current codex
-```
+| Command | What it does |
+| --- | --- |
+| `fleet account hub setup` | Share this device's router through Tailscale on port 8317. |
+| `fleet account hub join HUB --ssh USER@HOST` | Use the hub's full MagicDNS name. Copy private access keys through SSH and start a local relay. |
+| `fleet account hub` | Show role and check connection. |
+| `fleet account hub leave` | Return to the local router. |
 
-Auto mode defaults to `limits only`: it switches accounts only for a structured subscription-limit response before output starts. `fleet account auto codex on --when any` also switches for temporary provider errors and can spend fallback quota. The retry bridge caps each wait at five minutes. The bundled provider-routing patch also caps quota cooldowns and clears them from fresh provider usage data. Fleet returns to the chosen primary when it is ready. Fleet never replays a request after output starts because that could repeat tool work or other side effects.
+Client endpoints stay on localhost. Hub account priority changes affect all connected devices.
 
-Set a fallback order with every enrolled account listed once, starting with the primary:
+### Secrets, tools, and memory
 
-```bash
-fleet account order codex "Work Pro" "Backup 1" "Backup 2"
-fleet account order codex
-fleet account order codex reset
-fleet account order rebalance
-fleet account order codex manual
-```
+Declare secret names in `mcp/required-secrets.txt`. Values stay in macOS Keychain or Linux `systemd-creds`. See [MCP setup](mcp/README.md).
 
-`reset` puts the account whose weekly limit resets soonest first. Fleet checks the order after login and hourly when automatic updates are on. `manual` stops these order changes. Setting an explicit order also returns to manual mode. The order stays saved when auto switching is turned off. New accounts go last; removing the primary promotes the next account.
+| Command | What it does |
+| --- | --- |
+| `fleet auth set NAME` | Prompt for and store a declared secret. |
+| `fleet auth status [NAME]` | Check one or all secrets without printing values. |
+| `fleet mcp run SERVER -- COMMAND...` | Start a declared server with its secrets. Command must match its runner manifest; clients normally call this. |
+| `fleet memory status` | Check shared-memory services and health. |
+| `fleet memory enable` | Configure and start this device's shared-memory services. |
+| `fleet memory disable` | Stop those services; retain the database and settings. |
+| `fleet memory backup` | Back up the database on the configured Linux server. |
+| `fleet memory harden` | Apply supported worker session/health fixes. Included in `enable`. |
 
-The same commands work with `claude`. Run `fleet account auto --help` to see the switching modes. `fleet account list` shows order, usage, reset times, and the accounts used in the latest successful 10-minute request bucket. `current` and `quota` are aliases for this list. Use `fleet account login codex --existing ACCOUNT` to adopt credentials from an existing CLIProxyAPI setup; `enroll` still works.
+Local Claude-Mem is the default. Memory commands need `memory.toml`: copy [memory.example.toml](memory.example.toml), then follow the [shared-memory steps](SETUP_WITH_AN_AGENT.md#optional-shared-memory).
 
-Fleet enables upstream WebSocket connections for enrolled Codex accounts. The retry bridge leaves slow responses open and sends small output chunks without delay. The bundled provider-routing patch preserves healthy accounts after connection failures and retries eligible Codex connection failures once before a response starts.
+<details>
+<summary>Aliases and internal commands</summary>
 
-Fleet does not contain a model list. New models, aliases, reasoning controls, auth screens, and non-auth client commands continue to come directly from Claude and Codex.
+These also start with `fleet`; aliases accept the same arguments.
 
-Newer Fleet-managed CLIProxyAPI builds are supported. The macOS updater source and provider-routing patch are included for existing custom builds. They are not installed by `fleet account setup`. The updater needs Go, a C compiler, and an existing Fleet provider-router setup. It checks a new build and restores the old build if activation fails.
+- `enable-updates` / `disable-updates`: `update on` / `off`.
+- `account`, `account current`, `account quota`: `account list`.
+- `account remove`: `account logout`.
+- `account enroll PROVIDER ACCOUNT`: `account login PROVIDER --existing ACCOUNT`.
+- `account add`: legacy `account login`; new logins require `FLEET_ENABLE_SUBSCRIPTION_ROUTING=1`.
+- `account rebalance [PROVIDER]`: refresh enabled reset ordering.
+- `account order --auto PROVIDER reset` / `manual`: older sorting syntax.
+- `account hub status`: `account hub`.
+- `onboard --os OS --role ROLE`: create the profile before onboarding. Both flags go together; prefer separate `host add` so you can commit first.
+- Internal: `account native-auth` wraps provider login/logout; `memory worker` runs the server worker; `memory proxy` maintains the client's SSH tunnel.
 
-## Optional shared account hub
+</details>
 
-One host can provide account routing for other devices on the same Tailscale network. Set up Fleet account routing on each device first. Tailscale must be installed and signed in, with MagicDNS enabled. On the host that will serve requests:
+## Configuration map
 
-```bash
-fleet account hub setup
-```
+| Path | Contents |
+| --- | --- |
+| `rules/`, `settings/` | Shared and client-specific instructions/settings. |
+| `skills/`, `commands/`, `hooks/` | Skills, prompts, and hook scripts. |
+| `plugins.json`, `mcp/` | Plugin and tool declarations. |
+| `hosts/HOST/` | Device-specific settings and paths. |
 
-On another device, use the hub's MagicDNS name and an SSH target for its user:
+Fleet rejects unsafe paths, symlinks, invalid config, and common secret formats. Review before committing: checks cannot detect every secret.
 
-```bash
-fleet account hub join hub.tail123abc.ts.net --ssh user@hub
-fleet account hub
-fleet account hub leave
-```
-
-Setup serves the router on port 8317 through Tailscale. Access needs the recorded Tailscale login and a hub key. Joining copies the client and management keys over SSH into private local files, then runs a local relay. The client endpoint stays on localhost. Native login commands add accounts to the hub. Local account labels and order settings remain on each device; changes to proxy account priority affect all devices using the hub.
-
-`hub` shows the role and checks the relay connection. `hub leave` restores the device's local router. The local proxy binary, settings, and credentials stay on disk while it uses the hub. The optional proxy updater skips devices that use a hub.
-
-## Host setup
-
-After you create your own private repository, add a device profile:
-
-```bash
-./bin/fleet host add my-laptop --os macos --role workstation
-```
-
-Use `--os linux` for a Linux device. This adds a host manifest and the Claude-Mem plugin entry. It does not apply settings.
-
-Commit and push the new profile to your private repository, then wait for its checks to pass and its `live` branch to update. For a full setup on that device:
-
-```bash
-./bin/fleet onboard --host my-laptop --memory local
-```
-
-This checks the tools and tests, applies Fleet, sets up account routing, and enables updates. It needs both Claude and Codex, Bun, Node.js 20.12 or newer, and a working private `origin`. Use the manual setup guide if you want only one client or no account routing.
-
-## Optional Codex settings and hooks
-
-The template leaves settings empty. In your private repo, you can add these to `settings/codex.toml`:
-
-```toml
-[features]
-context_management = true
-
-[agents]
-max_concurrent_threads_per_session = 64
-```
-
-Use a Codex version that supports these settings. Fleet validates the thread limit as a positive whole number. It keeps your other agent roles and settings.
-
-Shared hooks can go in `settings/codex-hooks.json`. Fleet combines them with `hosts/HOST/codex-hooks.json`. Shared and host Claude hooks are also combined.
-
-## Shared memory
-
-Local Claude-Mem is still the default. For shared memory, copy `memory.example.toml` to `memory.toml` in your private repo. Set one Linux server and a `client_hosts` list of macOS or Linux clients. The older single `client_host` field also works. Use only one of these fields.
-
-The shared setup uses Claude-Mem 13.24.0 and checks its worker before applying the known session and health fixes. Set up Fleet account routing on the server first. Clients connect through SSH. See [the shared-memory setup steps](SETUP_WITH_AN_AGENT.md).
-
-## Safety model
-
-- Fleet refuses dirty releases, symlinks, common secret formats, unsafe paths, and invalid manifests.
-- `fleet apply --dry-run` shows targets before a write.
-- Apply and update operations create backups and restore the prior state after a failure.
-- MCP secrets stay outside Git: macOS Keychain on macOS and `systemd-creds` on Linux.
-- OAuth tokens, session history, caches, databases, and machine credentials are never template content.
-- Claude-Mem is local by default. One shared Linux memory server for macOS and Linux clients is optional.
-
-## Main commands
-
-```bash
-./bin/fleet check
-./bin/fleet apply --dry-run --host HOST
-./bin/fleet apply --host HOST
-~/.local/bin/fleet status --host HOST
-~/.local/bin/fleet update on
-~/.local/bin/fleet update --host HOST
-~/.local/bin/fleet scan --host HOST
-~/.local/bin/fleet rollback
-~/.local/bin/fleet auth set SECRET_NAME
-~/.local/bin/fleet account setup
-~/.local/bin/fleet account list
-~/.local/bin/fleet account current
-~/.local/bin/fleet account use codex ACCOUNT
-~/.local/bin/fleet account auto codex on
-```
-
-## Requirements
-
-- macOS or Linux
-- Git
-- Bash
-- Python 3.11 or newer
-- Node.js 20.12 or newer for Claude-Mem
-- Claude Code and/or Codex
-- `systemd-creds` and passwordless `sudo -n` for Fleet-managed secrets on Linux
-
-## License
-
-[MIT](LICENSE)
+[MIT license](LICENSE)
