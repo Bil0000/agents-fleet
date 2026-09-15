@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import sys
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).parents[1]
@@ -49,6 +50,17 @@ class FleetHostAddTest(unittest.TestCase):
             '}\n',
         )
         self.assertEqual(sorted(path.name for path in host.iterdir()), ["host.toml", "plugins.json"])
+
+    def test_onboard_can_create_a_profile_before_setup(self):
+        with mock.patch.object(onboard.fleet, "source_repository", return_value=self.root), mock.patch.object(
+            onboard, "onboard_host"
+        ) as setup:
+            onboard.main([str(self.root), "onboard", "--host", "new-devbox", "--os", "linux", "--role", "devbox"])
+        self.assertEqual(onboard.read_host(self.root, "new-devbox")["os"], "linux")
+        setup.assert_called_once_with(self.root, "new-devbox", "local")
+        for option, value in (("--os", "linux"), ("--role", "devbox")):
+            with self.assertRaises(SystemExit):
+                onboard.parse_arguments(["onboard", "--host", "new-devbox", option, value])
 
     def test_add_host_refuses_to_change_existing_host(self):
         host = self.root / "hosts/existing"
@@ -130,7 +142,7 @@ class FleetOnboardTest(unittest.TestCase):
                 [fleet, "apply", "--host", "new-devbox"],
                 [fleet, "account", "setup"],
                 [fleet, "memory", "enable", "--host", "new-devbox"],
-                [fleet, "enable-updates"],
+                [fleet, "update", "on"],
                 [fleet, "update", "--host", "new-devbox"],
                 [fleet, "status", "--host", "new-devbox"],
                 [fleet, "auth", "status"],

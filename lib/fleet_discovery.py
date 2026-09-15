@@ -593,9 +593,12 @@ def main():
             items = scan(root, home, host)
         print_items(items, as_json)
         return 0
+    if command == "update" and arguments in (["on"], ["off"]):
+        (fleet.enable_updates if arguments == ["on"] else fleet.disable_updates)(root)
+        return 0
     if command == "update":
         if arguments:
-            fail("Usage: fleet update [--host HOST]")
+            fail("Usage: fleet update [on|off] [--host HOST]")
         items, drift = scan_if_due(root, home, host)
         if drift:
             fail("Local managed changes need review. Run fleet scan, then edit Fleet or run fleet apply to discard them.")

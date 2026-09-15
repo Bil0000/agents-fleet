@@ -130,12 +130,17 @@ PY
     python=$(find_python)
     exec "$python" -B -I "$root/lib/fleet_discovery.py" "$root" "$@"
     ;;
-  apply|rollback|enable-updates|disable-updates)
+  enable-updates|disable-updates)
+    python=$(find_python)
+    [ "$1" = enable-updates ] && state=on || state=off
+    exec "$python" -B -I "$root/lib/fleet_apply.py" "$root" update "$state"
+    ;;
+  apply|rollback)
     python=$(find_python)
     exec "$python" -B -I "$root/lib/fleet_apply.py" "$root" "$@"
     ;;
   *)
-    echo "Usage: fleet check | fleet apply | fleet status | fleet scan | fleet adopt ... | fleet host add ... | fleet onboard ... | fleet update | fleet rollback | fleet enable-updates | fleet disable-updates | fleet auth ... | fleet mcp ... | fleet memory ... | fleet account ..." >&2
+    echo "Usage: fleet check | fleet apply | fleet status | fleet scan | fleet adopt ... | fleet onboard ... | fleet update [on|off] | fleet rollback | fleet auth ... | fleet mcp ... | fleet memory ... | fleet account ..." >&2
     exit 2
     ;;
 esac

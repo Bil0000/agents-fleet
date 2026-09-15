@@ -127,7 +127,7 @@ def onboard_host(
         commands.append([fleet, "memory", "enable", "--host", host])
     commands.extend(
         [
-            [fleet, "enable-updates"],
+            [fleet, "update", "on"],
             [fleet, "update", "--host", host],
             [fleet, "status", "--host", host]
             if memory_mode == "shared"
@@ -151,7 +151,12 @@ def parse_arguments(arguments):
     onboard = commands.add_parser("onboard")
     onboard.add_argument("--host", required=True)
     onboard.add_argument("--memory", choices=("local", "shared"), default="local")
-    return parser.parse_args(arguments)
+    onboard.add_argument("--os", choices=("macos", "linux"))
+    onboard.add_argument("--role")
+    parsed = parser.parse_args(arguments)
+    if parsed.command == "onboard" and (parsed.os is None) != (parsed.role is None):
+        parser.error("--os and --role go together")
+    return parsed
 
 
 def main(argv=None):
@@ -161,10 +166,11 @@ def main(argv=None):
     root = Path(arguments[0]).resolve()
     arguments = parse_arguments(arguments[1:])
     root = fleet.source_repository(root, Path(pwd.getpwuid(os.getuid()).pw_dir))
-    if arguments.command == "host":
+    if arguments.command == "host" or arguments.os is not None:
         add_host(root, arguments.host, arguments.os, arguments.role)
         print(f"created: hosts/{arguments.host}")
-        return 0
+        if arguments.command == "host":
+            return 0
     onboard_host(root, arguments.host, arguments.memory)
     print(f"onboarded: {arguments.host}")
     if arguments.memory == "local":

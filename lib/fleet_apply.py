@@ -2173,20 +2173,13 @@ def main():
         if arguments:
             fail("Usage: fleet status [--host HOST]")
         return status(root, host=host)
-    if command == "update":
-        if arguments:
-            fail("Usage: fleet update [--host HOST]")
+    if command == "update" and not arguments:
         update(root, host=host)
         return 0
-    if command == "enable-updates":
-        if host is not None or arguments:
-            fail("Usage: fleet enable-updates")
-        enable_updates(root)
-        return 0
-    if command == "disable-updates":
-        if host is not None or arguments:
-            fail("Usage: fleet disable-updates")
-        disable_updates(root)
+    if command == "update":
+        if host is not None or arguments not in (["on"], ["off"]):
+            fail("Usage: fleet update on|off")
+        (enable_updates if arguments == ["on"] else disable_updates)(root)
         return 0
     if command == "rollback":
         if len(arguments) > 1:
