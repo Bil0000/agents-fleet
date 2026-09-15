@@ -52,7 +52,9 @@ class UpstreamHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
-        if self.server.mode == "all-quota":
+        if self.server.mode == "all-quota" or (
+            self.server.mode == "ordered" and self.server.calls[-1][0].removeprefix("Bearer ") in self.server.exhausted
+        ):
             payload = b'{"error":{"message":"quota reached","type":"rate_limit_error","code":"rate_limit_exceeded"}}'
             self.send_response(429)
             self.send_header("Content-Type", "application/json")
@@ -161,7 +163,7 @@ class CLIProxyFailoverTest(unittest.TestCase):
         self.proxy = None
         self.start_proxy(["account-a", "account-b"])
 
-    def start_proxy(self, accounts, protocol="openai", plugin=None):
+    def start_proxy(self, accounts, protocol="openai", plugin=None, priorities=None):
         self.proxy_port = free_port()
         auth = self.base / "auth"
         auth.mkdir(exist_ok=True)
@@ -169,7 +171,7 @@ class CLIProxyFailoverTest(unittest.TestCase):
         if protocol == "claude":
             provider = "claude-api-key:\n" + "".join(
                 f"  - api-key: {account}\n"
-                f"    priority: {100 if index == 0 else 0}\n"
+                f"    priority: {priorities[index] if priorities else 100 if index == 0 else 0}\n"
                 + ("    disable-cooling: true\n" if index == 0 else "")
                 + f'    base-url: "http://127.0.0.1:{self.upstream.server_port}"\n'
                 + "    models:\n"
@@ -180,8 +182,11 @@ class CLIProxyFailoverTest(unittest.TestCase):
         elif protocol == "codex":
             provider = "codex-api-key:\n" + "".join(
                 f"  - api-key: {account}\n"
-                f'    base-url: "http://127.0.0.1:{self.upstream.server_port}/v1"\n'
-                for account in accounts
+                f"    priority: {priorities[index] if priorities else 100 if index == 0 else 0}\n"
+                + ("    disable-cooling: true\n" if index == 0 else "")
+                + f'    base-url: "http://127.0.0.1:{self.upstream.server_port}/v1"\n'
+                + "    models:\n      - name: gpt-5.4\n        alias: gpt-5.4\n"
+                for index, account in enumerate(accounts)
             )
         else:
             provider = (
@@ -318,11 +323,33 @@ class CLIProxyFailoverTest(unittest.TestCase):
         )
         return urllib.request.urlopen(request, timeout=5)
 
+    def test_three_accounts_follow_priority_order_and_return_to_primary(self):
+        for provider in ("claude", "codex"):
+            with self.subTest(provider=provider):
+                self.stop_proxy()
+                self.upstream.calls.clear()
+                self.upstream.mode = "ordered"
+                self.upstream.exhausted = {"z-main", "m-next"}
+                self.start_proxy(["z-main", "a-last", "m-next"], protocol=provider, priorities=[3, 1, 2])
+                request = self.claude_request if provider == "claude" else self.provider_request
+                model = "fake-model" if provider == "claude" else "gpt-5.4"
+                with request(model) as response:
+                    self.assertEqual(response.status, 200)
+                    response.read()
+                self.assertEqual([call[0].removeprefix("Bearer ") for call in self.upstream.calls], ["z-main", "m-next", "a-last"])
+                self.upstream.calls.clear()
+                self.upstream.exhausted.remove("z-main")
+                with request(model) as response:
+                    self.assertEqual(response.status, 200)
+                    response.read()
+                self.assertEqual([call[0].removeprefix("Bearer ") for call in self.upstream.calls], ["z-main"])
+
     def test_future_codex_model_is_routed_without_a_fleet_model_entry(self):
         source = ROOT / "lib/fleet_provider_router.c"
         self.assertTrue(source.is_file())
-        plugin = self.base / "fleet-provider-router.dylib"
-        subprocess.run(["cc", "-dynamiclib", "-O2", str(source), "-o", str(plugin)], check=True)
+        plugin = self.base / ("fleet-provider-router.dylib" if sys.platform == "darwin" else "fleet-provider-router.so")
+        flags = ["-dynamiclib"] if sys.platform == "darwin" else ["-shared", "-fPIC"]
+        subprocess.run(["cc", *flags, "-O2", str(source), "-o", str(plugin)], check=True)
         self.stop_proxy()
         self.upstream.calls.clear()
         self.upstream.mode = "normal"
@@ -350,8 +377,9 @@ class CLIProxyFailoverTest(unittest.TestCase):
 
     def test_future_claude_model_is_routed_without_a_fleet_model_entry(self):
         source = ROOT / "lib/fleet_provider_router.c"
-        plugin = self.base / "fleet-provider-router.dylib"
-        subprocess.run(["cc", "-dynamiclib", "-O2", str(source), "-o", str(plugin)], check=True)
+        plugin = self.base / ("fleet-provider-router.dylib" if sys.platform == "darwin" else "fleet-provider-router.so")
+        flags = ["-dynamiclib"] if sys.platform == "darwin" else ["-shared", "-fPIC"]
+        subprocess.run(["cc", *flags, "-O2", str(source), "-o", str(plugin)], check=True)
         self.stop_proxy()
         self.upstream.calls.clear()
         self.upstream.mode = "normal"

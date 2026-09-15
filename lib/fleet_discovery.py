@@ -288,6 +288,23 @@ def scan(root, home, host, plugin_provider=None):
     return discoveries
 
 
+def rebalance_if_due(root, home):
+    marker = fleet.safe_target(home, ".local/state/fleet/rebalanced-at")
+    try:
+        if time.time() - float(marker.read_text()) < SCAN_INTERVAL:
+            return
+    except (OSError, ValueError):
+        pass
+    if not (home / ".local/state/fleet/accounts.json").exists():
+        return
+    result = subprocess.run([str(root / "bin/fleet"), "account", "order", "rebalance"], capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "HOME": str(home), "LANG": "C"})
+    if result.returncode:
+        print(result.stderr.strip(), file=sys.stderr)
+    elif result.stdout.strip() and "already balanced" not in result.stdout:
+        print(result.stdout.strip())
+    fleet.atomic_write(home, marker, str(time.time()).encode(), 0o600)
+
+
 def scan_if_due(root, home, host, plugin_provider=None):
     state = load_state(home)
     stale_drift = state is not None and any(item["kind"] == "drift" for item in state["discoveries"])
@@ -583,6 +600,7 @@ def main():
         if drift:
             fail("Local managed changes need review. Run fleet scan, then edit Fleet or run fleet apply to discard them.")
         fleet.update(root, home, host=host)
+        rebalance_if_due(root, home)
         return 0
     if command == "status":
         if arguments:

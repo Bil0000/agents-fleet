@@ -60,6 +60,26 @@ class FleetClientLaunchersTest(unittest.TestCase):
             [f"fleet:account native-auth claude {self.native / 'claude'} auth logout"],
         )
 
+    def test_native_auth_preserves_the_callers_runtime_path(self):
+        (self.shims / "fleet").unlink()
+        (self.shims / "fleet").symlink_to(ROOT / "bin" / "fleet")
+        runtime = self.native / "fleet-test-runtime"
+        runtime.write_text('#!/bin/sh\nprintf "%s\\n" "$PATH" >> "$CALLS"\nexit 17\n')
+        runtime.chmod(0o755)
+        self.environment["HOME"] = self.temporary.name
+        self.environment["FLEET_ACCOUNT_HOME"] = self.temporary.name
+        for client, arguments in (
+            ("codex", ("login",)),
+            ("codex", ("logout",)),
+            ("claude", ("auth", "login")),
+            ("claude", ("auth", "logout")),
+        ):
+            with self.subTest(client=client, arguments=arguments):
+                (self.native / client).write_text("#!/usr/bin/env fleet-test-runtime\n")
+                result = self.run_launcher("fleet-" + client, *arguments)
+                self.assertEqual(result.returncode, 17, result.stderr)
+        self.assertEqual(self.calls(), [self.environment["PATH"]] * 4)
+
     def test_status_and_non_auth_commands_stay_native(self):
         self.assertEqual(self.run_launcher("codex", "login", "status").returncode, 0)
         self.assertEqual(self.run_launcher("codex", "exec", "hello").returncode, 0)

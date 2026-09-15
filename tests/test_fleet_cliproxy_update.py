@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import sys
 from pathlib import Path
+from unittest import mock
 
 
 SOURCE = Path(__file__).parents[1] / "lib/fleet_cliproxy_update.py"
@@ -36,6 +37,16 @@ class CLIProxyUpdateTest(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_spoke_skips_release_lookup_and_activation(self):
+        (self.state.parent / "hub.json").write_text(json.dumps({"role": "spoke"}))
+        with mock.patch.object(UPDATE.Path, "home", return_value=self.home), mock.patch.object(
+            UPDATE, "latest_release"
+        ) as release, mock.patch.object(UPDATE, "activate") as activate:
+            UPDATE.main([])
+        release.assert_not_called()
+        activate.assert_not_called()
+        self.assertEqual(self.config.read_text(), "plugins: /cliproxyapi/7.2.149/plugins\n")
 
     def test_release_version_order(self):
         self.assertTrue(UPDATE.is_newer("7.2.151", "7.2.149"))

@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -29,6 +30,7 @@ class UpstreamHandler(BaseHTTPRequestHandler):
     finish_stream = None
     truncate = False
     authorizations = []
+    header_delay = 0
 
     def log_message(self, *_args):
         pass
@@ -46,11 +48,13 @@ class UpstreamHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         type(self).authorizations = self.headers.get_all("Authorization", [])
+        type(self).seen = list(self.headers.keys())
         self.rfile.read(int(self.headers.get("Content-Length", "0")))
         self.respond()
 
     def respond(self):
         type(self).calls += 1
+        time.sleep(type(self).header_delay)
         if type(self).responses:
             response = type(self).responses.pop(0)
             type(self).status, type(self).body, type(self).headers = response
@@ -85,6 +89,7 @@ class RetryBridgeTest(unittest.TestCase):
         UpstreamHandler.finish_stream = None
         UpstreamHandler.truncate = False
         UpstreamHandler.authorizations = []
+        UpstreamHandler.header_delay = 0
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
         self.upstream_thread = threading.Thread(target=self.upstream.serve_forever, daemon=True)
         self.upstream_thread.start()
@@ -125,6 +130,47 @@ class RetryBridgeTest(unittest.TestCase):
 
                 self.assertEqual(status, 200)
                 self.assertEqual(UpstreamHandler.authorizations, ["Bearer router-key"])
+
+    def test_streaming_client_socket_sends_small_chunks_without_delay(self):
+        options = []
+        setup = BRIDGE.RetryBridgeHandler.setup
+
+        def capture_setup(handler):
+            setup(handler)
+            options.append(handler.connection.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
+
+        with patch.object(BRIDGE.RetryBridgeHandler, "setup", capture_setup):
+            self.assertEqual(self.request()[0], 200)
+
+        self.assertEqual(len(options), 1)
+        self.assertTrue(options[0])
+
+    def test_connection_burst_can_wait_for_the_accept_loop(self):
+        server = BRIDGE.RetryBridgeServer(
+            ("127.0.0.1", 0), BRIDGE.RetryBridgeHandler, self.upstream.server_port
+        )
+        connections = []
+        try:
+            for _ in range(16):
+                connections.append(socket.create_connection(server.server_address, timeout=0.2))
+        finally:
+            for connection in connections:
+                connection.close()
+            server.server_close()
+
+    def test_slow_first_response_is_not_limited_by_connection_timeout(self):
+        UpstreamHandler.header_delay = 0.2
+        connection_type = http.client.HTTPConnection
+
+        def short_connection_timeout(host, port, **options):
+            if port == self.upstream.server_port:
+                options["timeout"] = 0.05
+            return connection_type(host, port, **options)
+
+        with patch.object(BRIDGE.http.client, "HTTPConnection", short_connection_timeout):
+            status, _headers, body = self.request()
+
+        self.assertEqual((status, body), (200, b"ok"))
 
     def test_structured_codex_quota_retries_before_output(self):
         bodies = (
@@ -289,6 +335,56 @@ class RetryBridgeTest(unittest.TestCase):
                     action()
 
                 self.assertEqual(error.exception.code, 1)
+
+    def test_hub_denies_tailnet_requests_without_owner_and_matching_key(self):
+        self.bridge.client_key = "router-key"
+        self.bridge.management_key = "mgmt-key"
+        self.bridge.hub_login = "owner@example.com"
+        cases = (
+            ({"Tailscale-User-Login": "owner@example.com", "Authorization": "Bearer router-key"}, "/v1/responses", 200),
+            ({"Tailscale-User-Login": "owner@example.com", "Authorization": "Bearer other"}, "/v1/responses", 403),
+            ({"Tailscale-User-Login": "guest@example.com", "Authorization": "Bearer router-key"}, "/v1/responses", 403),
+            ({"X-Forwarded-For": "100.1.2.3", "Authorization": "Bearer router-key"}, "/v1/responses", 403),
+            ({"Tailscale-User-Login": "owner@example.com", "Authorization": "Bearer mgmt-key"}, "/v0/management/auth-files", 200),
+            ({"Tailscale-User-Login": "owner@example.com", "Authorization": "Bearer router-key"}, "/v0/management/auth-files", 403),
+            ({"Authorization": "Bearer anything"}, "/v1/responses", 200),
+        )
+        for headers, path, expected in cases:
+            with self.subTest(headers=headers, path=path):
+                UpstreamHandler.authorizations = []
+                status, _headers, _body = self.request(path=path, headers=headers)
+                self.assertEqual(status, expected)
+        self.bridge.hub_login = None
+        status, _headers, _body = self.request(headers={"Tailscale-User-Login": "owner@example.com", "Authorization": "Bearer router-key"})
+        self.assertEqual(status, 403)
+
+    def test_hub_strips_tailscale_and_forwarded_headers_before_the_router(self):
+        self.bridge.client_key = "router-key"
+        self.bridge.hub_login = "owner@example.com"
+        UpstreamHandler.seen = None
+        status, _headers, _body = self.request(headers={"Tailscale-User-Login": "owner@example.com", "X-Forwarded-For": "100.1.2.3", "Authorization": "Bearer router-key"})
+        self.assertEqual(status, 200)
+        self.assertFalse({name.lower() for name in UpstreamHandler.seen} & {"x-forwarded-for", "tailscale-user-login"})
+
+    def test_relay_forwards_without_local_quota_retries(self):
+        relay = BRIDGE.RetryBridgeServer(("127.0.0.1", 0), BRIDGE.RetryBridgeHandler, self.upstream.server_port, client_key="hub-key", relay=True)
+        thread = threading.Thread(target=relay.serve_forever, daemon=True)
+        thread.start()
+        try:
+            UpstreamHandler.status = 429
+            UpstreamHandler.body = b'{"error":{"type":"usage_limit_reached","resets_in_seconds":1}}'
+            UpstreamHandler.headers = {"Content-Type": "application/json"}
+            connection = http.client.HTTPConnection("127.0.0.1", relay.server_port, timeout=3)
+            connection.request("POST", "/v1/responses", body=b"{}", headers={"Authorization": "Bearer native"})
+            response = connection.getresponse()
+            self.assertEqual(response.status, 429)
+            self.assertEqual(UpstreamHandler.calls, 1)
+            self.assertEqual(UpstreamHandler.authorizations, ["Bearer hub-key"])
+            connection.close()
+        finally:
+            relay.shutdown()
+            relay.server_close()
+            thread.join()
 
 
 if __name__ == "__main__":

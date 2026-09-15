@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import base64
+import datetime
 import importlib.util
 import hashlib
 import json
@@ -73,6 +74,53 @@ def client_routing_state_path(home):
 
 def account_routing_path(home):
     return fleet.safe_target(home, ".local/state/fleet/account-routing.json")
+
+
+def hub_state_path(home):
+    return fleet.safe_target(home, ".local/state/fleet/hub.json")
+
+
+def load_hub_state(home):
+    path = hub_state_path(home)
+    if not os.path.lexists(path):
+        return None
+    if not regular_private_file(path, 0o600):
+        raise fleet.FleetError("Invalid Fleet hub state.")
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise fleet.FleetError("Invalid Fleet hub state.") from None
+    if (
+        not isinstance(value, dict)
+        or value.get("version") != 1
+        or value.get("role") not in {"hub", "spoke"}
+        or not isinstance(value.get("login"), str)
+        or not valid_hub_url(value.get("url"))
+    ):
+        raise fleet.FleetError("Invalid Fleet hub state.")
+    return value
+
+
+def valid_hub_url(value):
+    if not isinstance(value, str):
+        return False
+    parsed = urllib.parse.urlsplit(value)
+    return (
+        parsed.scheme == "http"
+        and parsed.hostname is not None
+        and parsed.hostname.endswith(".ts.net")
+        and parsed.port == 8317
+        and not (parsed.path or parsed.query or parsed.fragment or parsed.username or parsed.password)
+    )
+
+
+def hub_state_bytes(role, login, url):
+    return (json.dumps({"login": login, "role": role, "url": url, "version": 1}, indent=2, sort_keys=True) + "\n").encode()
+
+
+def is_spoke(home):
+    hub = load_hub_state(home)
+    return hub is not None and hub["role"] == "spoke"
 
 
 def default_account_routing():
@@ -205,6 +253,9 @@ def setup_paths(home, platform_name, version=SETUP_VERSION):
         "config": fleet.safe_target(home, ".config/fleet/cliproxyapi.yaml"),
         "client_key": fleet.safe_target(home, ".local/state/fleet/cliproxyapi-client-key"),
         "management_key": fleet.safe_target(home, ".local/state/fleet/cliproxyapi-management-key"),
+        "hub_client_key": fleet.safe_target(home, ".local/state/fleet/hub-client-key"),
+        "hub_management_key": fleet.safe_target(home, ".local/state/fleet/hub-management-key"),
+        "hub": hub_state_path(home),
         "state": setup_state_path(home),
         "policy": account_routing_path(home),
         "auth": fleet.safe_target(home, ".cli-proxy-api"),
@@ -276,25 +327,30 @@ def valid_setup_config(paths, client_key, management_key):
     return count == 1 and normalized in {expected, with_plugin}
 
 
-def setup_service(home, platform_name, version=SETUP_VERSION):
+def setup_service(home, platform_name, version=SETUP_VERSION, hub_url=None):
     bridge = f"%h/.local/share/fleet/cliproxyapi/{version}/fleet-retry-bridge"
     binary = f"%h/.local/share/fleet/cliproxyapi/{version}/cli-proxy-api"
     config = "%h/.config/fleet/cliproxyapi.yaml"
+    arguments = f"--relay {hub_url}" if hub_url else f"{binary} {config}"
     if platform_name == "linux":
         return (
             "[Unit]\nDescription=Fleet CLIProxyAPI\n\n[Service]\n"
-            f"ExecStart={bridge} {binary} {config}\n"
+            f"ExecStart={bridge} {arguments}\n"
             "Restart=on-failure\n\n[Install]\nWantedBy=default.target\n"
         ).encode()
     logs = fleet.safe_target(home, ".local/state/fleet/logs")
+    program = [str(fleet.safe_target(home, f".local/share/fleet/cliproxyapi/{version}/fleet-retry-bridge"))]
+    if hub_url:
+        program += ["--relay", hub_url]
+    else:
+        program += [
+            str(fleet.safe_target(home, f".local/share/fleet/cliproxyapi/{version}/cli-proxy-api")),
+            str(fleet.safe_target(home, ".config/fleet/cliproxyapi.yaml")),
+        ]
     return plistlib.dumps(
         {
             "Label": "com.fleet.cliproxyapi",
-            "ProgramArguments": [
-                str(fleet.safe_target(home, f".local/share/fleet/cliproxyapi/{version}/fleet-retry-bridge")),
-                str(fleet.safe_target(home, f".local/share/fleet/cliproxyapi/{version}/cli-proxy-api")),
-                str(fleet.safe_target(home, ".config/fleet/cliproxyapi.yaml")),
-            ],
+            "ProgramArguments": program,
             "RunAtLoad": True,
             "KeepAlive": True,
             "StandardOutPath": str(logs / "cliproxyapi.log"),
@@ -631,10 +687,11 @@ def repair_managed_setup(home, platform_name, machine, paths, downloader, native
     client_key = managed_key(paths, "client_key")
     management_key = managed_key(paths, "management_key")
     routing = load_account_routing(home, allow_missing=True)
+    hub = load_hub_state(home)
     expected = {
         paths["bridge"]: (setup_bridge(), 0o700),
         paths["config"]: (setup_config(paths["auth"], client_key, management_key, routing), 0o600),
-        paths["service"]: (setup_service(home, platform_name), 0o600),
+        paths["service"]: (setup_service(home, platform_name, hub_url=hub["url"] if hub and hub["role"] == "spoke" else None), 0o600),
         paths["state"]: ((json.dumps({"version": SETUP_VERSION}, sort_keys=True) + "\n").encode(), 0o600),
         paths["policy"]: (account_routing_bytes(routing), 0o600),
     }
@@ -1354,8 +1411,11 @@ def verify_managed_config(paths):
 
 def managed_runtime_config(paths, config):
     client_key, _ = verify_managed_config(paths)
+    spoke = os.path.lexists(paths["hub"]) and load_hub_state(paths["hub"].parents[3])["role"] == "spoke"
+    if spoke:
+        client_key = managed_key(paths, "hub_client_key")
     config.setdefault("host", "127.0.0.1")
-    if config.setdefault("auth-dir", str(paths["auth"])) != str(paths["auth"]):
+    if config.setdefault("auth-dir", str(paths["auth"])) != str(paths["auth"]) and not spoke:
         raise fleet.FleetError("CLIProxyAPI auth directory does not match Fleet setup.")
     config.setdefault("remote-management", {"allow-remote": False})
     if isinstance(config.get("routing"), dict):
@@ -1387,7 +1447,9 @@ def check_setup(home, *, platform_name=None, machine=None, native_runner=None, p
             plugin = paths["binary"].parent / f"plugins/fleet-provider-router{suffix}"
             if not regular_private_file(plugin, 0o700) or setup_plugin_config(paths) not in paths["config"].read_bytes():
                 raise fleet.FleetError("CLIProxyAPI provider router does not match Fleet setup.")
-        if not regular_private_file(paths["service"], 0o600) or paths["service"].read_bytes() != setup_service(home, platform_name, setup["version"]):
+        hub = load_hub_state(home)
+        hub_url = hub["url"] if hub and hub["role"] == "spoke" else None
+        if not regular_private_file(paths["service"], 0o600) or paths["service"].read_bytes() != setup_service(home, platform_name, setup["version"], hub_url):
             raise fleet.FleetError("CLIProxyAPI user service does not match Fleet setup.")
         verify_setup_binary(home, paths["binary"], setup["version"])
         if not valid_setup_bridge(paths["bridge"]):
@@ -1397,7 +1459,9 @@ def check_setup(home, *, platform_name=None, machine=None, native_runner=None, p
         if shell is not None and not check_shell_hook(home, shell):
             raise fleet.FleetError("Fleet native auth shell hook is missing. Run fleet account setup.")
         (probe_setup if probe is None else probe)(home)
-        state = verify_account_files(home)
+        state = load_state(home) if hub_url else verify_account_files(home)
+        if hub is not None:
+            print(f"Fleet hub: {hub['role']} for {hub['url']} ({hub['login']}).")
         routing_state = load_client_routing_state(home)
         for provider in PROVIDERS:
             accounts = state["providers"][provider]["accounts"]
@@ -1452,7 +1516,9 @@ def valid_state(state):
         return False
     for provider in PROVIDERS:
         policy = state["providers"][provider]
-        if not isinstance(policy, dict) or set(policy) != {"accounts", "primary", "auto"}:
+        if not isinstance(policy, dict) or set(policy) - {"order", "rebalance"} != {"accounts", "primary", "auto"}:
+            return False
+        if "rebalance" in policy and (policy["rebalance"] != "reset" or "order" not in policy):
             return False
         accounts = policy["accounts"]
         if not isinstance(accounts, dict) or any(
@@ -1467,6 +1533,16 @@ def valid_state(state):
             return False
         if policy["auto"] is not None and type(policy["auto"]) is not bool:
             return False
+        if "order" in policy:
+            order = policy["order"]
+            if (
+                not isinstance(order, list)
+                or any(not isinstance(name, str) for name in order)
+                or len(order) != len(accounts)
+                or set(order) != set(accounts)
+                or (order[0] if order else None) != policy["primary"]
+            ):
+                return False
     return True
 
 
@@ -1555,7 +1631,8 @@ class ManagementClient:
         if not self.key:
             try:
                 platform_name = "darwin" if sys.platform == "darwin" else "linux"
-                self.key = managed_key(setup_paths(account_home() if home is None else Path(home), platform_name), "management_key")
+                paths = setup_paths(account_home() if home is None else Path(home), platform_name)
+                self.key = managed_key(paths, "hub_management_key" if is_spoke(paths["hub"].parents[3]) else "management_key")
             except fleet.FleetError as error:
                 if os.path.lexists(setup_paths(account_home() if home is None else Path(home), platform_name)["management_key"]):
                     raise error
@@ -1617,6 +1694,21 @@ class ManagementClient:
     def priority(self, account, value):
         self.request("PATCH", "auth-files/fields", {"name": account["name"], "priority": value})
 
+    def websockets(self, account, value):
+        self.request("PATCH", "auth-files/fields", {"name": account["name"], "websockets": value})
+
+    def api_call(self, account, url, headers):
+        result = self.request("POST", "api-call", {"authIndex": account["auth_index"], "method": "GET", "url": url, "header": headers})
+        body = result.get("body")
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except (UnicodeError, json.JSONDecodeError):
+                body = None
+        if result.get("status_code") != 200 or not isinstance(body, dict):
+            raise fleet.FleetError(f"Provider usage lookup failed for {account['name']}.")
+        return body
+
     def disabled(self, account, value):
         body = {"name": account["name"], "disabled": value}
         if isinstance(account.get("auth_index"), str) and account["auth_index"]:
@@ -1645,7 +1737,11 @@ def accounts_for(entries, provider):
 
 
 def enrolled_accounts(policy, entries):
-    return [entry for entry in entries if entry["name"] in policy["accounts"]]
+    enrolled = [entry for entry in entries if entry["name"] in policy["accounts"]]
+    if "order" in policy:
+        rank = {name: index for index, name in enumerate(policy["order"])}
+        enrolled.sort(key=lambda entry: rank[entry["name"]])
+    return enrolled
 
 
 def require_enrolled_provider(policy, provider, entries):
@@ -1724,8 +1820,16 @@ def list_accounts(home, provider=None):
     if provider is not None and provider not in PROVIDERS:
         raise fleet.FleetError("Account provider must be claude or codex.")
     state = load_state(home)
-    entries = ManagementClient().accounts()
+    client = ManagementClient()
+    entries = client.accounts()
     routing = load_account_routing(home, allow_missing=True)
+    ranks = {name: rank for policy in state["providers"].values() for rank, name in enumerate(policy.get("order", []), 1)}
+    entries.sort(key=lambda entry: (
+        PROVIDERS.index(entry["provider"]),
+        ranks.get(entry["name"], float("inf")),
+        entry["name"] != state["providers"][entry["provider"]]["primary"],
+        account_label(state, entry).casefold(),
+    ))
     current = {
         entry["name"]
         for selected_provider in PROVIDERS
@@ -1737,46 +1841,25 @@ def list_accounts(home, provider=None):
             continue
         policy = state["providers"][entry["provider"]]
         if policy["primary"] is None:
-            role = "unconfigured"
+            order = "—"
         else:
-            role = "primary" if policy["primary"] == entry["name"] else "fallback"
+            role = "Main" if policy["primary"] == entry["name"] else "Fallback"
+            order = f"{ranks.get(entry['name'], '—')} · {role}"
         auto = "unconfigured" if policy["auto"] is None else (
-            ("limits only" if routing["providers"][entry["provider"]] == "limits" else "limits + temporary errors")
+            ("limits" if routing["providers"][entry["provider"]] == "limits" else "limits+errors")
             if policy["auto"] else "off"
         )
-        rows.append((entry["provider"], account_label(state, entry), role, auto, "yes" if entry["name"] in current else "-"))
-    rows.sort(key=lambda row: (PROVIDERS.index(row[0]), row[2] != "primary", row[1].casefold()))
-    table = [("PROVIDER", "ACCOUNT", "ROLE", "AUTO", "CURRENT"), *rows]
+        if policy.get("rebalance") == "reset":
+            auto += " · reset order"
+        try:
+            cells = {label: f"{used:.0f}% · {format_reset(reset)}" for label, used, reset in account_usage(client, entry)}
+        except fleet.FleetError:
+            cells = {}
+        rows.append((entry["provider"], account_label(state, entry), order, auto, cells.get("5-hour", "—"), cells.get("weekly", "—"), "✓" if entry["name"] in current else "—"))
+    table = [("PROVIDER", "ACCOUNT", "ORDER", "AUTO", "5H USED · RESET", "WEEK USED · RESET", "CURRENT"), *rows]
     widths = [max(len(row[index]) for row in table) for index in range(len(table[0]) - 1)]
     for row in table:
         print("  ".join(value.ljust(widths[index]) if index < len(widths) else value for index, value in enumerate(row)))
-
-
-def current_accounts(home, provider=None):
-    if provider is not None and provider not in PROVIDERS:
-        raise fleet.FleetError("Account provider must be claude or codex.")
-    state = load_state(home)
-    entries = ManagementClient().accounts()
-    providers = (provider,) if provider else PROVIDERS
-    rows = []
-    missing = []
-    for selected_provider in providers:
-        policy = state["providers"][selected_provider]
-        current = latest_successful_accounts(accounts_for(entries, selected_provider))
-        for entry, period in current:
-            role = "primary" if policy["primary"] == entry["name"] else "fallback"
-            rows.append((selected_provider, account_label(state, entry), role, period))
-        if not current:
-            primary = next((entry for entry in entries if entry["name"] == policy["primary"]), None)
-            next_account = account_label(state, primary) if primary else "not configured"
-            missing.append((selected_provider, next_account))
-    if rows:
-        table = [("PROVIDER", "ACCOUNT", "ROLE", "LAST SUCCESS"), *rows]
-        widths = [max(len(row[index]) for row in table) for index in range(len(table[0]) - 1)]
-        for row in table:
-            print("  ".join(value.ljust(widths[index]) if index < len(widths) else value for index, value in enumerate(row)))
-    for selected_provider, next_account in missing:
-        print(f"No successful request recorded for {selected_provider.title()}. Next request: {next_account}.")
 
 
 def safe_auth_dir(home, config):
@@ -1806,6 +1889,8 @@ def safe_auth_dir(home, config):
 
 
 def secure_credentials(home, config, entries):
+    if is_spoke(home):
+        return
     directory = safe_auth_dir(home, config)
     try:
         directory.chmod(0o700)
@@ -1916,9 +2001,14 @@ def verify_operations(client, operations, message="CLIProxyAPI account update po
             raise fleet.FleetError(message)
 
 
-def priority_operations(entries, primary):
-    ordered = sorted(entries, key=lambda entry: entry["name"] != primary)
-    return [("priority", entry, 100 if entry["name"] == primary else 0, entry.get("priority")) for entry in ordered]
+def priority_operations(entries, primary, order=None):
+    priorities = {name: len(order) - index for index, name in enumerate(order)} if order is not None else {primary: 100}
+    ordered = sorted(entries, key=lambda entry: -priorities.get(entry["name"], 0))
+    return [("priority", entry, priorities.get(entry["name"], 0), entry.get("priority")) for entry in ordered] + websocket_operations(entries)
+
+
+def websocket_operations(entries):
+    return [("websockets", entry, True, entry.get("websockets")) for entry in entries if entry["provider"] == "codex"]
 
 
 def resolve_account(state, provider, entries, wanted):
@@ -1944,14 +2034,16 @@ def runtime_for_mutation(home):
         paths = setup_paths(home, platform_name)
         client_key = managed_key(paths, "client_key")
     require_safe_failover_config(config, client_key)
-    safe_auth_dir(home, config)
+    if not is_spoke(home):
+        safe_auth_dir(home, config)
     entries = client.accounts()
     return client, config, entries
 
 
-def use_account(home, provider, wanted):
+def use_account(home, provider, wanted, *, order=None, keep_rebalance=False):
     if provider not in PROVIDERS:
         raise fleet.FleetError("Account provider must be claude or codex.")
+    state_before = client_config_snapshot(state_path(home))
     state = load_state(home)
     client, config, all_entries = runtime_for_mutation(home)
     policy = state["providers"][provider]
@@ -1961,15 +2053,26 @@ def use_account(home, provider, wanted):
         selected = resolve_account(state, provider, entries, wanted)
     except fleet.FleetError:
         raise fleet.FleetError("Account is not enrolled. Run fleet account enroll first.") from None
+    if order is not None:
+        names = [resolve_account(state, provider, entries, name)["name"] for name in order]
+        if len(names) != len(policy["accounts"]) or set(names) != set(policy["accounts"]):
+            raise fleet.FleetError("Include every enrolled account exactly once, starting with the primary.")
+        policy["order"] = names
+        if not keep_rebalance:
+            policy.pop("rebalance", None)
+    elif "order" in policy:
+        policy["order"] = [selected["name"], *[name for name in policy["order"] if name != selected["name"]]]
     policy["primary"] = selected["name"]
     if policy["auto"] is None:
         policy["auto"] = False
     operations = [("disabled", selected, False, selected["disabled"])]
-    operations.extend(priority_operations(entries, selected["name"]))
+    operations.extend(priority_operations(entries, selected["name"], policy.get("order")))
     if policy["auto"] is False:
         operations.extend(("disabled", entry, True, entry["disabled"]) for entry in entries if entry["name"] != selected["name"])
     secure_credentials(home, config, entries)
-    apply_transaction(client, operations, lambda: write_state(home, state))
+    apply_transaction(client, operations, lambda: write_state_transaction(home, state, state_before))
+    if order is not None:
+        show_account_order(home, provider)
     if policy["auto"]:
         print(f"Primary {provider.title()} account: {account_label(state, selected)}. Auto switching is on; each new request tries it first.")
     else:
@@ -1999,6 +2102,17 @@ def pick_account(home, provider):
     use_account(home, provider, account["name"])
 
 
+def show_account_order(home, provider):
+    if provider not in PROVIDERS:
+        raise fleet.FleetError("Account provider must be claude or codex.")
+    policy = load_state(home)["providers"][provider]
+    if not policy.get("order"):
+        print(f"No fixed {provider} account order. Set one with fleet account order {provider} <primary> <fallback> ...")
+    else:
+        suffix = " (auto: soonest reset first)" if policy.get("rebalance") == "reset" else ""
+        print(f"{provider.title()} account order: " + " -> ".join(policy["accounts"][name] for name in policy["order"]) + suffix)
+
+
 def auto_account(home, provider, enabled, mode=None):
     if provider not in PROVIDERS:
         raise fleet.FleetError("Account provider must be claude or codex.")
@@ -2017,10 +2131,10 @@ def auto_account(home, provider, enabled, mode=None):
         operations = []
         for entry in sorted(entries, key=lambda item: item["name"] != primary["name"]):
             operations.append(("disabled", entry, False, entry["disabled"]))
-            operations.append(("priority", entry, 100 if entry["name"] == primary["name"] else 0, entry.get("priority")))
+        operations.extend(priority_operations(entries, primary["name"], policy.get("order")))
     else:
         operations = [("disabled", primary, False, primary["disabled"])]
-        operations.extend(priority_operations(entries, primary["name"]))
+        operations.extend(priority_operations(entries, primary["name"], policy.get("order")))
         operations.extend(("disabled", entry, True, entry["disabled"]) for entry in entries if entry["name"] != primary["name"])
     secure_credentials(home, config, entries)
     policy["auto"] = enabled
@@ -2054,6 +2168,267 @@ def auto_account(home, provider, enabled, mode=None):
         print(message)
     else:
         print(f"{provider.title()} auto switching: {status}; only the primary account is available.")
+
+
+USAGE_URLS = {
+    "claude": ("https://api.anthropic.com/api/oauth/usage", {"Authorization": "Bearer $TOKEN$", "anthropic-beta": "oauth-2025-04-20"}),
+    "codex": ("https://chatgpt.com/backend-api/wham/usage", {"Authorization": "Bearer $TOKEN$"}),
+}
+
+
+def account_usage(client, entry):
+    url, headers = USAGE_URLS[entry["provider"]]
+    body = client.api_call(entry, url, headers)
+    windows = []
+    if entry["provider"] == "codex":
+        limit = body.get("rate_limit") if isinstance(body.get("rate_limit"), dict) else {}
+        for label, key in (("weekly", "primary_window"), ("5-hour", "secondary_window")):
+            window = limit.get(key)
+            if isinstance(window, dict) and type(window.get("reset_at")) in {int, float} and type(window.get("used_percent")) in {int, float}:
+                windows.append((label, float(window["used_percent"]), float(window["reset_at"])))
+    else:
+        for label, key in (("5-hour", "five_hour"), ("weekly", "seven_day")):
+            window = body.get(key)
+            if not isinstance(window, dict) or type(window.get("utilization")) not in {int, float} or not isinstance(window.get("resets_at"), str):
+                continue
+            try:
+                reset = datetime.datetime.fromisoformat(window["resets_at"]).timestamp()
+            except ValueError:
+                continue
+            windows.append((label, float(window["utilization"]), reset))
+    if not windows:
+        raise fleet.FleetError(f"Provider usage has no limit windows for {entry['name']}.")
+    return windows
+
+
+def reset_order(entries, usage):
+    def soonest(entry):
+        windows = usage[entry["name"]]
+        return ([window for window in windows if window[0] == "weekly"] or windows)[0][2], entry["name"]
+
+    return [entry["name"] for entry in sorted(entries, key=soonest)]
+
+
+def rebalance_provider(home, provider):
+    state = load_state(home)
+    policy = state["providers"][provider]
+    if policy.get("rebalance") != "reset" or len(policy["accounts"]) < 2:
+        return False
+    client = ManagementClient()
+    entries = enrolled_accounts(policy, accounts_for(client.accounts(), provider))
+    if {entry["name"] for entry in entries} != set(policy["accounts"]):
+        raise fleet.FleetError(f"Enrolled {provider} accounts changed; run fleet account list.")
+    usage = {entry["name"]: account_usage(client, entry) for entry in entries}
+    order = reset_order(entries, usage)
+    if order == policy["order"]:
+        return False
+    use_account(home, provider, order[0], order=order, keep_rebalance=True)
+    print(f"{provider.title()} order rebalanced by soonest reset: " + " -> ".join(policy["accounts"][name] for name in order))
+    return True
+
+
+def rebalance(home, provider=None):
+    changed = False
+    for selected in (provider,) if provider else PROVIDERS:
+        if selected not in PROVIDERS:
+            raise fleet.FleetError("Account provider must be claude or codex.")
+        with fleet.operation_lock(home):
+            changed = rebalance_provider(home, selected) or changed
+    if not changed:
+        print("Account order is already balanced.")
+
+
+def set_rebalance(home, provider, enabled):
+    if provider not in PROVIDERS:
+        raise fleet.FleetError("Account provider must be claude or codex.")
+    with fleet.operation_lock(home):
+        state = load_state(home)
+        policy = state["providers"][provider]
+        if enabled:
+            if len(policy["accounts"]) < 2:
+                raise fleet.FleetError(f"Reset ordering needs at least two enrolled {provider} accounts.")
+            if "order" not in policy:
+                policy["order"] = [policy["primary"], *sorted(name for name in policy["accounts"] if name != policy["primary"])]
+            policy["rebalance"] = "reset"
+        else:
+            policy.pop("rebalance", None)
+        write_state(home, state)
+    if enabled:
+        print(f"{provider.title()} order now follows the soonest limit reset. Fleet rebalances after each login and every hour.")
+        rebalance(home, provider)
+    else:
+        print(f"{provider.title()} order is manual again. Set it with fleet account order {provider} <primary> <fallback> ...")
+
+
+def format_reset(seconds):
+    remaining = max(0, int(seconds - time.time()))
+    if remaining >= 86400:
+        return f"{remaining // 86400}d {remaining % 86400 // 3600}h"
+    if remaining >= 3600:
+        return f"{remaining // 3600}h {remaining % 3600 // 60}m"
+    return f"{remaining // 60}m"
+
+
+def tailscale_binary():
+    for candidate in ("/usr/bin/tailscale", "/usr/local/bin/tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale"):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    raise fleet.FleetError("Tailscale is not installed. Install it and log in first.")
+
+
+def tailscale_identity():
+    try:
+        result = subprocess.run([tailscale_binary(), "status", "--json"], capture_output=True, text=True, timeout=15)
+        status = json.loads(result.stdout)
+        name = status["Self"]["DNSName"].rstrip(".")
+        login = status["User"][str(status["Self"]["UserID"])]["LoginName"]
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError):
+        raise fleet.FleetError("Tailscale is not running or not logged in.") from None
+    if not name.endswith(".ts.net") or not login:
+        raise fleet.FleetError("Tailscale MagicDNS is required for the Fleet hub.")
+    return name, login
+
+
+def tailscale_serve(enabled):
+    binary = tailscale_binary()
+    command = [binary, "serve", "--bg", "--http=8317", "http://127.0.0.1:8317"] if enabled else [binary, "serve", "--http=8317", "off"]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        raise fleet.FleetError("Tailscale serve could not be configured.") from None
+    if result.returncode and not (not enabled and "does not exist" in result.stderr):
+        raise fleet.FleetError("Tailscale serve could not be configured.")
+
+
+def hub_setup(home):
+    platform_name = "darwin" if sys.platform == "darwin" else "linux"
+    paths = setup_paths(home, platform_name, managed_setup_version(home))
+    verify_managed_config(paths)
+    if is_spoke(home):
+        raise fleet.FleetError("This host is a spoke. Run fleet account hub leave first.")
+    name, login = tailscale_identity()
+    url = f"http://{name}:8317"
+    snapshot = artifact_snapshot(paths["hub"])
+    replacement = (hub_state_bytes("hub", login, url), 0o600)
+    replace_snapshot(home, paths["hub"], snapshot, replacement, artifact_snapshot, "Fleet hub state changed during setup.")
+    try:
+        if snapshot != replacement:
+            restart_proxy_service(home, platform_name, paths["service"])
+            wait_for_proxy(home)
+        tailscale_serve(True)
+    except BaseException as error:
+        try:
+            replace_snapshot(home, paths["hub"], artifact_snapshot(paths["hub"]), snapshot, artifact_snapshot, "Fleet hub state changed during restore.")
+            restart_proxy_service(home, platform_name, paths["service"])
+        except BaseException:
+            raise fleet.FleetError(f"{error} Hub restore also failed.") from None
+        raise
+    print(f"Fleet hub is serving {url} to {login} on your tailnet.")
+    print("On another device run:")
+    print(f"  fleet account hub join {name} --ssh <user>@{name.split('.')[0]}")
+
+
+def read_remote_keys(target):
+    command = ["/usr/bin/ssh", "-o", "BatchMode=yes", target, "cat ~/.local/state/fleet/cliproxyapi-client-key ~/.local/state/fleet/cliproxyapi-management-key"]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        raise fleet.FleetError("Could not read the hub keys over SSH.") from None
+    lines = result.stdout.splitlines()
+    if result.returncode or len(lines) != 2 or any(not line or not line.isprintable() or line != line.strip() for line in lines):
+        raise fleet.FleetError("Could not read the hub keys over SSH.")
+    return lines[0], lines[1]
+
+
+def hub_join(home, hub_name, ssh_target):
+    platform_name = "darwin" if sys.platform == "darwin" else "linux"
+    url = f"http://{hub_name}:8317"
+    if not valid_hub_url(url):
+        raise fleet.FleetError("Hub name must be a tailnet MagicDNS name like hub.tail123abc.ts.net.")
+    paths = setup_paths(home, platform_name, managed_setup_version(home))
+    verify_managed_config(paths)
+    hub = load_hub_state(home)
+    if hub is not None and hub["role"] == "hub":
+        raise fleet.FleetError("This host is the hub. It cannot join itself.")
+    _name, login = tailscale_identity()
+    client_key, management_key = read_remote_keys(ssh_target)
+    snapshots = {path: artifact_snapshot(path) for path in (paths["hub"], paths["hub_client_key"], paths["hub_management_key"], paths["service"])}
+    expected = {
+        paths["hub_client_key"]: ((client_key + "\n").encode(), 0o600),
+        paths["hub_management_key"]: ((management_key + "\n").encode(), 0o600),
+        paths["hub"]: (hub_state_bytes("spoke", login, url), 0o600),
+        paths["service"]: (setup_service(home, platform_name, managed_setup_version(home), url), 0o600),
+    }
+    written = {}
+    try:
+        for path, replacement in expected.items():
+            replace_snapshot(home, path, snapshots[path], replacement, artifact_snapshot, "Fleet hub file changed during join.")
+            written[path] = artifact_snapshot(path)
+        restart_proxy_service(home, platform_name, paths["service"])
+        wait_for_proxy(home)
+    except BaseException as error:
+        try:
+            restore_artifacts(home, snapshots, written)
+            restart_proxy_service(home, platform_name, paths["service"])
+        except BaseException:
+            raise fleet.FleetError(f"{error} Hub join restore also failed.") from None
+        raise
+    print(f"This host now routes Claude and Codex through the Fleet hub at {url}.")
+    print("Logins still work here: codex login and claude auth login add the account to the hub.")
+
+
+def hub_leave(home):
+    platform_name = "darwin" if sys.platform == "darwin" else "linux"
+    hub = load_hub_state(home)
+    if hub is None:
+        raise fleet.FleetError("This host is not part of a Fleet hub.")
+    paths = setup_paths(home, platform_name, managed_setup_version(home))
+    if hub["role"] == "hub":
+        tailscale_serve(False)
+        replace_snapshot(home, paths["hub"], artifact_snapshot(paths["hub"]), None, artifact_snapshot, "Fleet hub state changed during leave.")
+        restart_proxy_service(home, platform_name, paths["service"])
+        wait_for_proxy(home)
+        print("Fleet hub is off. Other devices must run fleet account hub leave.")
+        return
+    snapshots = {path: artifact_snapshot(path) for path in (paths["hub"], paths["hub_client_key"], paths["hub_management_key"], paths["service"])}
+    expected = {
+        paths["service"]: (setup_service(home, platform_name, managed_setup_version(home)), 0o600),
+        paths["hub"]: None,
+        paths["hub_client_key"]: None,
+        paths["hub_management_key"]: None,
+    }
+    written = {}
+    try:
+        for path, replacement in expected.items():
+            replace_snapshot(home, path, snapshots[path], replacement, artifact_snapshot, "Fleet hub file changed during leave.")
+            written[path] = artifact_snapshot(path)
+        restart_proxy_service(home, platform_name, paths["service"])
+        wait_for_proxy(home)
+    except BaseException as error:
+        try:
+            restore_artifacts(home, snapshots, written)
+            restart_proxy_service(home, platform_name, paths["service"])
+        except BaseException:
+            raise fleet.FleetError(f"{error} Hub leave restore also failed.") from None
+        raise
+    print("This host uses its own local CLIProxyAPI again.")
+
+
+def hub_status(home):
+    hub = load_hub_state(home)
+    if hub is None:
+        print("hub: none (this host uses its own local CLIProxyAPI)")
+        return
+    print(f"hub: {hub['role']}\nurl: {hub['url']}\nowner: {hub['login']}")
+    if hub["role"] == "spoke":
+        paths = setup_paths(home, "darwin" if sys.platform == "darwin" else "linux", managed_setup_version(home))
+        client_key = managed_key(paths, "hub_client_key")
+        started = time.monotonic()
+        try:
+            probe_inference_endpoint("http://127.0.0.1:8317", client_key)
+            print(f"reach: ok ({(time.monotonic() - started) * 1000:.0f} ms through the local relay)")
+        except fleet.FleetError:
+            print("reach: FAILED (hub offline or tailnet down; run fleet account hub leave to use the local proxy)")
 
 
 def config_path(home):
@@ -2295,6 +2670,8 @@ def account_identity(entry, provider):
 def save_login(home, provider, label, state_before, state, client, config, after, entry, new_login):
     policy = state["providers"][provider]
     policy["accounts"][entry["name"]] = label or account_label(state, entry)
+    if "order" in policy and entry["name"] not in policy["order"]:
+        policy["order"].append(entry["name"])
     require_enrolled_provider(policy, provider, after)
     entries = enrolled_accounts(policy, accounts_for(after, provider))
     if not new_login:
@@ -2302,13 +2679,16 @@ def save_login(home, provider, label, state_before, state, client, config, after
     elif policy["primary"] is None:
         policy["primary"] = entry["name"]
         policy["auto"] = False
-        operations = priority_operations(entries, entry["name"])
-        operations.append(("disabled", entry, False, True))
+        operations = [("disabled", entry, False, True)]
         operations.extend(("disabled", account, True, account["disabled"]) for account in entries if account["name"] != entry["name"])
     elif policy["auto"] is True:
         operations = [("disabled", entry, False, True)]
     else:
         operations = []
+    if new_login and ("order" in policy or policy["primary"] == entry["name"]):
+        operations.extend(priority_operations(entries, policy["primary"], policy.get("order")))
+    else:
+        operations.extend(websocket_operations([entry]))
     secure_credentials(home, config, [entry])
     if new_login:
         apply_transaction(
@@ -2333,6 +2713,8 @@ def add_account(home, provider, label=None, *, consent=False):
         raise fleet.FleetError("Account label must be one printable line of 1 to 80 characters.")
     if not consent and os.environ.get("FLEET_ENABLE_SUBSCRIPTION_ROUTING") != "1":
         raise fleet.FleetError("Subscription OAuth account add is off. For private use, set FLEET_ENABLE_SUBSCRIPTION_ROUTING=1.")
+    if is_spoke(home):
+        raise fleet.FleetError("This host uses a Fleet hub. Log in with the native codex login or claude auth login command.")
     state_before = client_config_snapshot(state_path(home))
     state = load_state(home)
     if client_config_snapshot(state_path(home)) != state_before:
@@ -2413,6 +2795,10 @@ def sync_native_account(home, provider):
     auto = "on" if policy["auto"] is True else "off"
     action = "Added" if existing is None else "Refreshed"
     print(f"{action} {provider} account {policy['accounts'][name]} from native login. Auto switching is {auto}.")
+    try:
+        rebalance_provider(home, provider)
+    except fleet.FleetError as error:
+        print(f"Reset ordering was not refreshed: {error}", file=sys.stderr)
 
 
 def run_native_auth(home, provider, binary, arguments):
@@ -2434,8 +2820,10 @@ def run_native_auth(home, provider, binary, arguments):
     command = [str(path), *arguments]
     if provider == "claude":
         command[1:1] = ["--setting-sources", ""]
+    environment = dict(os.environ)
+    environment["PATH"] = environment.pop("FLEET_NATIVE_PATH", environment.get("PATH", os.defpath))
     try:
-        result = subprocess.run(command)
+        result = subprocess.run(command, env=environment)
     except OSError:
         raise fleet.FleetError(f"Could not start native {provider}.") from None
     if result.returncode:
@@ -2475,12 +2863,16 @@ def remove_account(home, provider, wanted=None):
     remaining = [entry for entry in entries if entry["name"] != selected["name"]]
     was_primary = policy["primary"] == selected["name"]
     del policy["accounts"][selected["name"]]
+    if "order" in policy:
+        policy["order"].remove(selected["name"])
+    if was_primary and policy.get("order") and not any(entry["name"] == policy["order"][0] for entry in remaining):
+        raise fleet.FleetError("The next ordered account is no longer available; restore it before removing the primary.")
     operations = []
     if was_primary:
         if remaining:
             policy["primary"] = remaining[0]["name"]
             operations = [("disabled", remaining[0], False, remaining[0]["disabled"])]
-            operations.extend(priority_operations(remaining, policy["primary"]))
+            operations.extend(priority_operations(remaining, policy["primary"], policy.get("order")))
             if policy["auto"] is False:
                 operations.extend(
                     ("disabled", entry, True, entry["disabled"])
@@ -2490,6 +2882,8 @@ def remove_account(home, provider, wanted=None):
         else:
             policy["primary"] = None
             policy["auto"] = None
+    if not was_primary and "order" in policy:
+        operations.extend(priority_operations(remaining, policy["primary"], policy["order"]))
     secure_credentials(home, config, entries)
 
     def save_and_delete():
@@ -2519,6 +2913,8 @@ def enroll_account(home, provider, wanted):
     selected = resolve_account(state, provider, entries, wanted)
     policy = state["providers"][provider]
     policy["accounts"][selected["name"]] = account_label(state, selected)
+    if "order" in policy and selected["name"] not in policy["order"]:
+        policy["order"].append(selected["name"])
     if policy["primary"] is None:
         policy["primary"] = selected["name"]
     secure_credentials(home, config, [selected])
@@ -2526,7 +2922,7 @@ def enroll_account(home, provider, wanted):
         policy["auto"] = False
         primary = live_primary(policy, entries, provider)
         operations = [("disabled", primary, False, primary["disabled"])]
-        operations.extend(priority_operations(entries, primary["name"]))
+        operations.extend(priority_operations(entries, primary["name"], policy.get("order")))
         operations.extend(("disabled", entry, True, entry["disabled"]) for entry in entries if entry["name"] != primary["name"])
         secure_credentials(home, config, entries)
         apply_transaction(
@@ -2559,88 +2955,132 @@ def rename_account(home, provider, wanted, label):
     print(f"Renamed {provider} account to {label}.")
 
 
+USAGE = """Usage: fleet account <command>
+
+  list [claude|codex]                    accounts, order, auto, usage, and reset
+  use <p> [account]                      pick the primary account
+  order <p> [accounts... | reset | manual | rebalance]
+  auto <p> on|off [--when limits|any]    quota failover
+  login <p> [label] | logout <p> [account] | rename <p> <account> <label>
+  login <p> --existing <account>         enroll a credential already in CLIProxyAPI
+  setup [--check | --restore-clients]    local CLIProxyAPI router
+  hub [setup | join <name> --ssh <target> | leave]   shared router"""
+
+
 def main(arguments):
     home = account_home()
     try:
-        if arguments == ["setup"]:
+        command = arguments[0] if arguments else "list"
+        rest = arguments[1:]
+        if command == "native-auth" and len(rest) >= 3:
+            run_native_auth(home, rest[0], rest[1], rest[2:])
+            return
+        if command == "hub":
+            if rest == ["setup"]:
+                with fleet.operation_lock(home):
+                    hub_setup(home)
+            elif len(rest) == 4 and rest[0] == "join" and rest[2] == "--ssh":
+                with fleet.operation_lock(home):
+                    hub_join(home, rest[1], rest[3])
+            elif rest == ["leave"]:
+                with fleet.operation_lock(home):
+                    hub_leave(home)
+            elif rest in ([], ["status"]):
+                hub_status(home)
+            else:
+                raise fleet.FleetError(USAGE)
+            return
+        if command == "setup":
             shell = os.environ.get("SHELL") or ("/bin/zsh" if sys.platform == "darwin" else "/bin/bash")
-            shell_startup_snapshot(shell_startup_path(home, shell))
-            with fleet.operation_lock(home):
-                setup_proxy(home)
-                install_shell_hook(home, shell)
-                for provider in load_client_routing_state(home)["providers"]:
-                    configure_provider_routing(home, provider, "http://127.0.0.1:8317")
-            if not check_setup(home, shell=shell):
-                raise SystemExit(1)
+            if rest == []:
+                shell_startup_snapshot(shell_startup_path(home, shell))
+                with fleet.operation_lock(home):
+                    setup_proxy(home)
+                    install_shell_hook(home, shell)
+                    for provider in load_client_routing_state(home)["providers"]:
+                        configure_provider_routing(home, provider, "http://127.0.0.1:8317")
+                if not check_setup(home, shell=shell):
+                    raise SystemExit(1)
+                return
+            if rest == ["--check"]:
+                raise SystemExit(0 if check_setup(home, shell=shell) else 1)
+            if rest == ["--restore-clients"]:
+                with fleet.operation_lock(home):
+                    restore_client_routing(home)
+                print("Fleet client routing restored. Accounts, auth, sessions, and the proxy setup were not changed.")
+                return
+            raise fleet.FleetError(USAGE)
+        if command in {"list", "quota", "current"} and len(rest) <= 1:
+            list_accounts(home, rest[0] if rest else None)
             return
-        if arguments == ["setup", "--check"]:
-            shell = os.environ.get("SHELL") or ("/bin/zsh" if sys.platform == "darwin" else "/bin/bash")
-            raise SystemExit(0 if check_setup(home, shell=shell) else 1)
-        if arguments == ["setup", "--restore-clients"]:
-            with fleet.operation_lock(home):
-                restore_client_routing(home)
-            print("Fleet client routing restored. Accounts, auth, sessions, and the proxy setup were not changed.")
-            return
-        if not arguments or arguments[0] == "list" and len(arguments) <= 2:
-            list_accounts(home, arguments[1] if len(arguments) == 2 else None)
-            return
-        if arguments and arguments[0] == "current" and len(arguments) <= 2:
-            current_accounts(home, arguments[1] if len(arguments) == 2 else None)
-            return
-        if arguments == ["auto", "--help"]:
+        if command == "auto" and rest == ["--help"]:
             print("Usage: fleet account auto <claude|codex> <on|off> [--when <limits|any>]\n\n--when limits  Switch only when subscription limits are reached (default).\n--when any     Also switch on temporary provider errors; this can spend fallback quota.")
             return
-        if arguments[0] == "native-auth" and len(arguments) >= 4:
-            run_native_auth(home, arguments[1], arguments[2], arguments[3:])
-            return
-        if arguments[0] in {"add", "login"} and 2 <= len(arguments) <= 3:
+        if command in {"login", "add"} and len(rest) == 3 and rest[1] == "--existing":
             with fleet.operation_lock(home):
-                add_account(
-                    home,
-                    arguments[1],
-                    arguments[2] if len(arguments) == 3 else None,
-                    consent=arguments[0] == "login",
-                )
+                enroll_account(home, rest[0], rest[2])
             return
-        if arguments[0] in {"remove", "logout"} and 2 <= len(arguments) <= 3:
+        if command == "enroll" and len(rest) == 2:
             with fleet.operation_lock(home):
-                remove_account(home, arguments[1], arguments[2] if len(arguments) == 3 else None)
+                enroll_account(home, rest[0], rest[1])
             return
-        if arguments[0] == "enroll" and len(arguments) == 3:
+        if command in {"login", "add"} and 1 <= len(rest) <= 2:
             with fleet.operation_lock(home):
-                enroll_account(home, arguments[1], arguments[2])
+                add_account(home, rest[0], rest[1] if len(rest) == 2 else None, consent=command == "login")
             return
-        if arguments[0] == "rename" and len(arguments) == 4:
+        if command in {"logout", "remove"} and 1 <= len(rest) <= 2:
             with fleet.operation_lock(home):
-                rename_account(home, arguments[1], arguments[2], arguments[3])
+                remove_account(home, rest[0], rest[1] if len(rest) == 2 else None)
             return
-        if arguments[0] == "use" and len(arguments) == 3:
+        if command == "rename" and len(rest) == 3:
             with fleet.operation_lock(home):
-                use_account(home, arguments[1], arguments[2])
+                rename_account(home, rest[0], rest[1], rest[2])
             return
-        if arguments[0] == "use" and len(arguments) == 2:
+        if command == "use" and len(rest) == 2:
             with fleet.operation_lock(home):
-                pick_account(home, arguments[1])
+                use_account(home, rest[0], rest[1])
             return
-        if len(arguments) >= 3 and arguments[0] == "auto" and arguments[2] == "on":
-            if arguments[3:] == []:
+        if command == "use" and len(rest) == 1:
+            with fleet.operation_lock(home):
+                pick_account(home, rest[0])
+            return
+        if command == "rebalance" and len(rest) <= 1:
+            rebalance(home, rest[0] if rest else None)
+            return
+        if command == "order" and rest[:1] == ["--auto"] and len(rest) == 3 and rest[2] in {"reset", "manual"}:
+            set_rebalance(home, rest[1], rest[2] == "reset")
+            return
+        if command == "order" and rest == ["rebalance"]:
+            rebalance(home)
+            return
+        if command == "order" and len(rest) == 1:
+            show_account_order(home, rest[0])
+            return
+        if command == "order" and len(rest) == 2 and rest[1] == "rebalance":
+            rebalance(home, rest[0])
+            return
+        if command == "order" and len(rest) == 2 and rest[1] in {"reset", "manual"}:
+            set_rebalance(home, rest[0], rest[1] == "reset")
+            return
+        if command == "order" and len(rest) >= 2:
+            with fleet.operation_lock(home):
+                use_account(home, rest[0], rest[1], order=rest[1:])
+            return
+        if command == "auto" and len(rest) >= 2 and rest[1] == "on":
+            if rest[2:] == []:
                 mode = "limits"
-            elif len(arguments[3:]) == 2 and arguments[3] == "--when" and arguments[4] in ROUTING_MODES:
-                mode = arguments[4]
+            elif len(rest[2:]) == 2 and rest[2] == "--when" and rest[3] in ROUTING_MODES:
+                mode = rest[3]
             else:
                 raise fleet.FleetError("Valid --when options: limits, any.")
             with fleet.operation_lock(home):
-                auto_account(home, arguments[1], True, mode)
+                auto_account(home, rest[0], True, mode)
             return
-        if len(arguments) == 3 and arguments[0] == "auto" and arguments[2] == "off":
+        if command == "auto" and len(rest) == 2 and rest[1] == "off":
             with fleet.operation_lock(home):
-                auto_account(home, arguments[1], False)
+                auto_account(home, rest[0], False)
             return
-        raise fleet.FleetError(
-            "Usage: fleet account setup [--check|--restore-clients] | fleet account list | fleet account remove <claude|codex> [account] | fleet account enroll <claude|codex> <account> | "
-            "fleet account current [claude|codex] | fleet account rename <claude|codex> <account> <label> | fleet account use <claude|codex> [account] | "
-            "fleet account auto <claude|codex> <on|off> [--when <limits|any>]"
-        )
+        raise fleet.FleetError(USAGE)
     except fleet.FleetError as error:
         print(error, file=sys.stderr)
         raise SystemExit(2)

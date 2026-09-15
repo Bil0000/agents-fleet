@@ -1,5 +1,6 @@
 #!/bin/bash
 set -eu
+native_path=$PATH
 PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin
 export PATH
 
@@ -116,6 +117,9 @@ PY
     ;;
   account)
     python=$(find_python)
+    if [ "${2:-}" = native-auth ]; then
+      export FLEET_NATIVE_PATH="$native_path"
+    fi
     exec "$python" -B -I "$root/lib/fleet_accounts.py" "$root" "${@:2}"
     ;;
   host|onboard)

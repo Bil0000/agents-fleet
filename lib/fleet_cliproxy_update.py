@@ -213,6 +213,10 @@ def main(arguments):
         return
     if arguments:
         raise SystemExit("Usage: fleet_cliproxy_update.py [--install]")
+    hub = home / ".local/state/fleet/hub.json"
+    if hub.exists() and json.loads(hub.read_text()).get("role") == "spoke":
+        print("CLIProxyAPI updates are skipped while this host uses a Fleet hub.")
+        return
     state = home / ".local/state/fleet/cliproxyapi.json"
     current = json.loads(state.read_text()).get("version", "")
     version_parts(current)

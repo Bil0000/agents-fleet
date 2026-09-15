@@ -9,6 +9,7 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).parents[1]).resolve()
@@ -66,6 +67,23 @@ class FleetDiscoveryTest(unittest.TestCase):
     def adopt(self, kind, name, scope):
         request = discovery.AdoptionRequest(self.repo, self.home, "test-mac", kind, name, scope)
         return discovery.adopt(request)
+
+    def test_rebalance_runs_hourly_only_after_accounts_are_configured(self):
+        marker = self.home / ".local/state/fleet/rebalanced-at"
+        with mock.patch.object(discovery.time, "time", return_value=10000) as now, mock.patch.object(
+            discovery.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")
+        ) as command:
+            discovery.rebalance_if_due(self.repo, self.home)
+            command.assert_not_called()
+            marker.parent.mkdir(parents=True)
+            (marker.parent / "accounts.json").write_text("{}")
+            discovery.rebalance_if_due(self.repo, self.home)
+            self.assertEqual(command.call_args.args[0], [str(self.repo / "bin/fleet"), "account", "order", "rebalance"])
+            discovery.rebalance_if_due(self.repo, self.home)
+            self.assertEqual(command.call_count, 1)
+            now.return_value += discovery.SCAN_INTERVAL
+            discovery.rebalance_if_due(self.repo, self.home)
+            self.assertEqual(command.call_count, 2)
 
     def test_scan_baselines_existing_items_and_never_records_contents(self):
         skill = self.home / ".agents/skills/already-here"

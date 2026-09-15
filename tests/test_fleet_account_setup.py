@@ -76,6 +76,20 @@ class FleetAccountSetupTest(unittest.TestCase):
         hashed = "$2a$10$" + "A" * 53
         paths["config"].write_bytes(contents.replace(json.dumps(secret).encode(), json.dumps(hashed).encode()))
 
+    def test_hub_setup_and_leave_only_publish_the_router(self):
+        ACCOUNTS.setup_proxy(self.home, **self.linux_setup_args())
+        with mock.patch.object(ACCOUNTS.sys, "platform", "linux"), mock.patch.object(
+            ACCOUNTS, "tailscale_identity", return_value=("hub.tail123abc.ts.net", "owner@example.com")
+        ), mock.patch.object(ACCOUNTS, "restart_proxy_service"), mock.patch.object(
+            ACCOUNTS, "wait_for_proxy"
+        ), mock.patch.object(ACCOUNTS, "tailscale_serve") as serve:
+            ACCOUNTS.hub_setup(self.home)
+            self.assertEqual(ACCOUNTS.load_hub_state(self.home)["role"], "hub")
+            serve.assert_called_once_with(True)
+            ACCOUNTS.hub_leave(self.home)
+            self.assertIsNone(ACCOUNTS.load_hub_state(self.home))
+            self.assertEqual(serve.call_args_list, [mock.call(True), mock.call(False)])
+
     def test_setup_check_reports_missing_without_writing(self):
         before = sorted(path.relative_to(self.home) for path in self.home.rglob("*"))
 

@@ -9,12 +9,14 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tomllib
 import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -112,11 +114,12 @@ class ManagementHandler(BaseHTTPRequestHandler):
             if self.server.ignore_at == self.server.mutation_count:
                 self.response(200, {"status": "ok"})
                 return
-            if request["priority"] is None:
-                account.pop("priority", None)
+            field = "websockets" if "websockets" in request else "priority"
+            if request[field] is None:
+                account.pop(field, None)
             else:
-                account["priority"] = request["priority"]
-            self.server.history.append((self.path, account["name"], request["priority"]))
+                account[field] = request[field]
+            self.server.history.append((self.path, account["name"], request[field]))
             self.response(200, {"status": "ok"})
             return
         self.response(404, {"error": "not found"})
@@ -182,6 +185,16 @@ class ManagementHandler(BaseHTTPRequestHandler):
                 entry["id_token"] = decode_jwt(credential["id_token"])
             self.server.accounts[name] = entry
             self.response(200, {"status": "ok"})
+            return
+        if parsed.path == "/v0/management/api-call":
+            size = int(self.headers.get("Content-Length", "0"))
+            request = json.loads(self.rfile.read(size))
+            body = getattr(self.server, "usage", {}).get(request.get("authIndex"))
+            self.server.history.append((parsed.path, request.get("authIndex"), request.get("url")))
+            if body is None:
+                self.response(200, {"status_code": 401, "body": {"detail": "Unauthorized"}})
+            else:
+                self.response(200, {"status_code": 200, "body": json.dumps(body)})
             return
         if self.path != "/test/add":
             self.response(404, {"error": "not found"})
@@ -399,8 +412,8 @@ class FleetAccountsTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             result.stdout,
-            "PROVIDER  ACCOUNT  ROLE          AUTO          CURRENT\n"
-            "claude    work     unconfigured  unconfigured  -\n",
+            "PROVIDER  ACCOUNT  ORDER  AUTO          5H USED · RESET  WEEK USED · RESET  CURRENT\n"
+            "claude    work     —      unconfigured  —                —                  —\n",
         )
         self.assertFalse(self.state.exists())
         self.assertEqual(stat.S_IMODE(self.auth.stat().st_mode), 0o755)
@@ -423,23 +436,11 @@ class FleetAccountsTest(unittest.TestCase):
             "auto": True,
         })
 
-        current = self.run_fleet("current", "codex")
         listed = self.run_fleet("list", "codex")
 
-        self.assertEqual(current.returncode, 0, current.stderr)
-        self.assertRegex(current.stdout, r"codex\s+5x\s+fallback\s+19:30-19:40")
-        self.assertIn("5x", listed.stdout)
-        self.assertRegex(listed.stdout, r"5x\s+fallback\s+limits only\s+yes")
-
-    def test_current_reports_no_request_without_guessing_from_the_primary(self):
-        self.add_account("claude", "primary", priority=100)
-        self.write_state(claude={"accounts": {"claude-primary.json": "main"}, "primary": "claude-primary.json", "auto": False})
-
-        result = self.run_fleet("current", "claude")
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("No successful request recorded", result.stdout)
-        self.assertIn("Next request: main", result.stdout)
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertRegex(listed.stdout, r"5x\s+— · Fallback\s+limits\s+—\s+—\s+✓")
+        self.assertRegex(listed.stdout, r"20x\s+— · Main\s+limits\s+—\s+—\s+—")
 
     def test_add_uses_exact_binary_and_management_api_without_parsing_oauth_file(self):
         self.fake_login("claude", "claude-new.json")
@@ -726,10 +727,10 @@ class FleetAccountsTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             result.stdout,
-            "PROVIDER  ACCOUNT              ROLE      AUTO         CURRENT\n"
-            "claude    admin@sampleapp.com  primary   off          -\n"
-            "codex     20x                  primary   limits only  -\n"
-            "codex     5x                   fallback  limits only  -\n",
+            "PROVIDER  ACCOUNT              ORDER         AUTO    5H USED · RESET  WEEK USED · RESET  CURRENT\n"
+            "claude    admin@sampleapp.com  — · Main      off     —                —                  —\n"
+            "codex     20x                  — · Main      limits  —                —                  —\n"
+            "codex     5x                   — · Fallback  limits  —                —                  —\n",
         )
 
         codex = self.run_fleet("list", "codex")
@@ -737,6 +738,30 @@ class FleetAccountsTest(unittest.TestCase):
         self.assertEqual(codex.returncode, 0, codex.stderr)
         self.assertNotIn("claude", codex.stdout)
         self.assertIn("codex", codex.stdout)
+
+    def test_list_shows_numeric_saved_order_and_current_account_for_both_providers(self):
+        policies = {}
+        for provider in ("claude", "codex"):
+            labels = [f"account-{index:02}" for index in range(12, 0, -1)]
+            names = [f"{provider}-{label}.json" for label in labels]
+            for label in reversed(labels):
+                self.add_account(provider, label, priority=0)
+            policies[provider] = {"accounts": dict(zip(names, labels)), "primary": names[0], "auto": provider == "codex", "order": names}
+            self.management.server.accounts[names[1]]["recent_requests"] = [{"time": "19:30-19:40", "success": 1}]
+        self.write_state(**policies)
+        before = self.state.read_bytes()
+        result = self.run_fleet("list")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = result.stdout.splitlines()[1:]
+        self.assertEqual(len(rows), 24)
+        for index, provider in enumerate(("claude", "codex")):
+            for rank, row in enumerate(rows[index * 12:(index + 1) * 12], 1):
+                role = "Main" if rank == 1 else "Fallback"
+                auto = "off" if provider == "claude" else "limits"
+                current = "✓" if rank == 2 else "—"
+                self.assertRegex(row, rf"^{provider}\s+account-{13-rank:02}\s+{rank} · {role}\s+{auto}\s+—\s+—\s+{current}$")
+        self.assertEqual(self.state.read_bytes(), before)
+        self.assertFalse([entry for entry in self.management.server.history if not entry[0].endswith("api-call")])
 
     def test_rename_changes_only_the_saved_account_label(self):
         self.add_account("codex", "work", disabled=True, contents=b"opaque codex token")
@@ -861,6 +886,126 @@ class FleetAccountsTest(unittest.TestCase):
         saved = json.loads(self.state.read_text())["providers"]["claude"]
         self.assertEqual(saved["primary"], "claude-second.json")
 
+    def test_order_sets_and_keeps_the_full_account_sequence_for_both_providers(self):
+        for provider in ("claude", "codex"):
+            with self.subTest(provider=provider):
+                names = [f"{provider}-{name}.json" for name in ("main", "last", "next")]
+                for name in ("main", "last", "next"):
+                    self.add_account(provider, name, priority=100 if name == "main" else 0)
+                self.write_state(**{provider: {"accounts": dict(zip(names, ("Main", "Last", "Next"))), "primary": names[0], "auto": False}})
+                before = self.state.read_bytes()
+                shown = self.run_fleet("order", provider)
+                self.assertEqual(shown.returncode, 0, shown.stderr)
+                self.assertIn("No fixed", shown.stdout)
+                self.assertEqual(self.state.read_bytes(), before)
+
+                result = self.run_fleet("order", provider, "Next", "Main", "Last")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                expected = [names[2], names[0], names[1]]
+                for arguments in ((), ("auto", provider, "on"), ("auto", provider, "off"), ("auto", provider, "on")):
+                    if arguments:
+                        result = self.run_fleet(*arguments)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                    policy = json.loads(self.state.read_text())["providers"][provider]
+                    self.assertEqual(policy["order"], expected)
+                    self.assertEqual(policy["primary"], expected[0])
+                    for index, name in enumerate(expected):
+                        account = self.management.server.accounts[name]
+                        self.assertEqual(account["priority"], len(expected) - index)
+                        self.assertEqual(account["disabled"], not policy["auto"] and index != 0)
+                result = self.run_fleet("use", provider, "Last")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                result = self.run_fleet("rename", provider, "Next", "Backup")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                shown = self.run_fleet("order", provider)
+                self.assertEqual(shown.returncode, 0, shown.stderr)
+                self.assertIn("Last -> Backup -> Main", shown.stdout)
+                self.assertEqual(json.loads(self.state.read_text())["providers"][provider]["order"], [names[1], names[2], names[0]])
+
+    def test_order_rejects_missing_duplicate_unknown_and_cross_provider_accounts(self):
+        self.add_account("codex", "first", priority=100)
+        self.add_account("codex", "second", priority=0)
+        self.add_account("claude", "other", priority=100)
+        self.write_state(codex={"accounts": {"codex-first.json": "First", "codex-second.json": "Second"}, "primary": "codex-first.json", "auto": True})
+        before = self.state.read_bytes()
+        for arguments in (("First",), ("First", "codex-first.json"), ("First", "unknown"), ("First", "claude-other.json")):
+            with self.subTest(arguments=arguments):
+                result = self.run_fleet("order", "codex", *arguments)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(self.state.read_bytes(), before)
+                self.assertFalse(self.management.server.history)
+
+    def test_order_does_not_remove_primary_when_next_account_is_missing(self):
+        self.add_account("codex", "first", priority=2)
+        self.write_state(codex={"accounts": {"codex-first.json": "First", "codex-second.json": "Second"}, "primary": "codex-first.json", "auto": True, "order": ["codex-first.json", "codex-second.json"]})
+        before = self.state.read_bytes()
+        result = self.run_fleet("remove", "codex", "First")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("no longer available", result.stderr)
+        self.assertEqual(self.state.read_bytes(), before)
+        self.assertFalse(self.management.server.history)
+
+    def test_order_rolls_back_when_proxy_or_state_save_fails(self):
+        self.add_account("codex", "first", priority=100)
+        self.add_account("codex", "second", disabled=True, priority=0)
+        self.write_state(codex={"accounts": {"codex-first.json": "First", "codex-second.json": "Second"}, "primary": "codex-first.json", "auto": False})
+        before = self.state.read_bytes()
+        accounts = json.loads(json.dumps(self.management.server.accounts))
+        self.management.server.fail_at = 2
+        result = self.run_fleet("order", "codex", "Second", "First")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(self.state.read_bytes(), before)
+        self.assertEqual(self.management.server.accounts, accounts)
+        with mock.patch.dict(os.environ, self.environment), mock.patch.object(ACCOUNTS, "write_state_transaction", side_effect=ACCOUNTS.fleet.FleetError("save failed")):
+            with self.assertRaisesRegex(ACCOUNTS.fleet.FleetError, "save failed"):
+                ACCOUNTS.use_account(self.home, "codex", "Second", order=["Second", "First"])
+        self.assertEqual(self.state.read_bytes(), before)
+        self.assertEqual(self.management.server.accounts, accounts)
+
+    def test_order_survives_login_refresh_enrollment_and_removal(self):
+        for provider in ("claude", "codex"):
+            with self.subTest(provider=provider):
+                for name in ("first", "second"):
+                    self.add_account(provider, name, priority=100 if name == "first" else 0)
+                first, second, new = [f"{provider}-{name}.json" for name in ("first", "second", "new")]
+                self.write_state(**{provider: {"accounts": {first: "First", second: "Second"}, "primary": first, "auto": True}})
+                result = self.run_fleet("order", provider, "Second", "First")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.fake_login(provider, new)
+                for _ in range(2):
+                    result = self.run_fleet("add", provider, "New")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(self.state.read_text())["providers"][provider]["order"], [second, first, new])
+                    self.assertEqual([self.management.server.accounts[name]["priority"] for name in (second, first, new)], [3, 2, 1])
+                self.add_account(provider, "enrolled", disabled=True, priority=0)
+                result = self.run_fleet("login", provider, "--existing", "enrolled")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(self.state.read_text())["providers"][provider]["order"], [second, first, new, f"{provider}-enrolled.json"])
+                for name in (new, second, first, f"{provider}-enrolled.json"):
+                    result = self.run_fleet("remove", provider, name)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    policy = json.loads(self.state.read_text())["providers"][provider]
+                    self.assertNotIn(name, policy["order"])
+                    self.assertEqual(policy["primary"], policy["order"][0] if policy["order"] else None)
+                    for index, remaining in enumerate(policy["order"]):
+                        self.assertEqual(self.management.server.accounts[remaining]["priority"], len(policy["order"]) - index)
+                result = self.run_fleet("add", provider, "New")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                policy = json.loads(self.state.read_text())["providers"][provider]
+                self.assertEqual(policy["order"], [new])
+                self.assertEqual(policy["primary"], new)
+                self.assertFalse(policy["auto"])
+
+    def test_order_state_requires_each_account_once_with_primary_first(self):
+        self.write_state(codex={"accounts": {"codex-first.json": "First", "codex-second.json": "Second"}, "primary": "codex-first.json", "auto": True})
+        state = json.loads(self.state.read_text())
+        for order in (None, "bad", [], ["codex-first.json"], ["codex-first.json"] * 2, ["codex-first.json", {}], ["codex-second.json", "codex-first.json"]):
+            with self.subTest(order=order):
+                state["providers"]["codex"]["order"] = order
+                self.assertFalse(ACCOUNTS.valid_state(state))
+        state["providers"]["codex"]["order"] = ["codex-first.json", "codex-second.json"]
+        self.assertTrue(ACCOUNTS.valid_state(state))
+
     def test_codex_use_changes_primary_and_disables_others_when_auto_is_off(self):
         first = self.add_account("codex", "first", priority=100)
         second = self.add_account("codex", "second", priority=0)
@@ -882,6 +1027,7 @@ class FleetAccountsTest(unittest.TestCase):
 
     def test_codex_use_allows_a_routing_no_op_and_persists_auto_off(self):
         self.add_account("codex", "first", disabled=False, priority=100)
+        self.management.server.accounts["codex-first.json"]["websockets"] = True
         self.write_state(codex={"accounts": {"codex-first.json": "first"}, "primary": "codex-first.json"})
 
         result = self.run_fleet("use", "codex", "first")
@@ -1317,7 +1463,7 @@ class FleetAccountsTest(unittest.TestCase):
         credential.chmod(0o644)
         other.chmod(0o644)
 
-        result = self.run_fleet("enroll", "claude", "existing")
+        result = self.run_fleet("login", "claude", "--existing", "existing")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(credential.read_bytes(), b"not json or readable oauth data")
@@ -1339,7 +1485,7 @@ class FleetAccountsTest(unittest.TestCase):
         config = self.home / ".codex/config.toml"
         config.parent.mkdir()
         config.write_text('model = "gpt-5"\n')
-        result = self.run_fleet("enroll", "codex", "existing")
+        result = self.run_fleet("login", "codex", "--existing", "existing")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Codex now uses CLIProxyAPI", result.stdout)
@@ -1380,7 +1526,7 @@ class FleetAccountsTest(unittest.TestCase):
         first = self.add_account("claude", "first", contents=b"first opaque data")
         second = self.add_account("claude", "second", contents=b"second opaque data")
 
-        result = self.run_fleet("enroll", "claude", "first")
+        result = self.run_fleet("login", "claude", "--existing", "first")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.home / ".claude/settings.json").exists())
@@ -1394,7 +1540,7 @@ class FleetAccountsTest(unittest.TestCase):
         credential = self.add_account("claude", "existing", disabled=True, priority=7)
         self.management.server.reject_models = True
 
-        result = self.run_fleet("enroll", "claude", "existing")
+        result = self.run_fleet("login", "claude", "--existing", "existing")
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("smoke check failed", result.stderr)
@@ -1639,6 +1785,136 @@ class FleetAccountsTest(unittest.TestCase):
             target.server_close()
             target_thread.join()
         self.assertEqual(received, [])
+
+    def test_codex_accounts_get_upstream_websockets_on_every_routing_change(self):
+        self.add_account("codex", "first", priority=100)
+        self.add_account("codex", "second", disabled=True, priority=0)
+        self.add_account("claude", "other", priority=100)
+        self.write_state(
+            codex={"accounts": {"codex-first.json": "first", "codex-second.json": "second"}, "primary": "codex-first.json"},
+            claude={"accounts": {"claude-other.json": "other"}, "primary": "claude-other.json", "auto": False},
+        )
+
+        result = self.run_fleet("auto", "codex", "on")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("codex-first.json", "codex-second.json"):
+            self.assertIs(self.management.server.accounts[name]["websockets"], True)
+        self.assertNotIn("websockets", self.management.server.accounts["claude-other.json"])
+        history = list(self.management.server.history)
+        result = self.run_fleet("auto", "codex", "off")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([entry for entry in self.management.server.history[len(history):] if entry[2] is True and entry[0].endswith("fields")], [])
+
+    def test_native_codex_login_enables_upstream_websockets_for_the_new_account(self):
+        native_auth = self.codex_native_auth()
+        native = self.native_client(
+            f"home = Path(os.environ['FLEET_ACCOUNT_HOME'])\n"
+            f"(home / '.codex').mkdir()\n"
+            f"(home / '.codex/auth.json').write_text({json.dumps(native_auth)!r})\n"
+        )
+        result = self.run_fleet("native-auth", "codex", str(native), "login")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        account = next(iter(self.management.server.accounts.values()))
+        self.assertIs(account["websockets"], True)
+
+    def test_reset_order_puts_the_soonest_weekly_reset_first_and_keeps_manual_override(self):
+        names = [f"codex-{stem}.json" for stem in ("early", "late", "mid")]
+        for stem, priority in (("early", 0), ("late", 100), ("mid", 0)):
+            self.add_account("codex", stem, priority=priority)
+        resets = {"codex-early.json": 1_000, "codex-late.json": 9_000, "codex-mid.json": 5_000}
+        self.management.server.usage = {
+            f"index-{name}": {"rate_limit": {"primary_window": {"used_percent": 10, "reset_at": reset}, "secondary_window": {"used_percent": 1, "reset_at": 100}}}
+            for name, reset in resets.items()
+        }
+        self.write_state(codex={"accounts": dict(zip(names, ("Early", "Late", "Mid"))), "primary": "codex-late.json", "auto": True})
+
+        result = self.run_fleet("order", "codex", "reset")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Early -> Mid -> Late", result.stdout)
+        policy = json.loads(self.state.read_text())["providers"]["codex"]
+        self.assertEqual(policy["order"], ["codex-early.json", "codex-mid.json", "codex-late.json"])
+        self.assertEqual(policy["rebalance"], "reset")
+        self.assertEqual([self.management.server.accounts[name]["priority"] for name in policy["order"]], [3, 2, 1])
+        shown = self.run_fleet("order", "codex")
+        self.assertIn("soonest reset", shown.stdout)
+
+        self.management.server.usage[f"index-codex-late.json"]["rate_limit"]["primary_window"]["reset_at"] = 10
+        again = self.run_fleet("order", "rebalance")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(json.loads(self.state.read_text())["providers"]["codex"]["order"][0], "codex-late.json")
+        noop = self.run_fleet("order", "codex", "rebalance")
+        self.assertIn("already balanced", noop.stdout)
+
+        manual = self.run_fleet("order", "codex", "Mid", "Early", "Late")
+        self.assertEqual(manual.returncode, 0, manual.stderr)
+        policy = json.loads(self.state.read_text())["providers"]["codex"]
+        self.assertNotIn("rebalance", policy)
+        self.assertEqual(policy["order"][0], "codex-mid.json")
+        off = self.run_fleet("order", "codex", "manual")
+        self.assertEqual(off.returncode, 0, off.stderr)
+
+    def test_list_shows_usage_windows_and_reset_countdown(self):
+        self.add_account("codex", "work", priority=100)
+        self.add_account("claude", "main", priority=100)
+        now = int(time.time())
+        self.management.server.usage = {
+            "index-codex-work.json": {"rate_limit": {"primary_window": {"used_percent": 42, "reset_at": now + 2 * 86400 + 3600}, "secondary_window": {"used_percent": 7, "reset_at": now + 1800}}},
+            "index-claude-main.json": {"five_hour": {"utilization": 32.0, "resets_at": "2999-01-01T00:00:00+00:00"}, "seven_day": {"utilization": 59.0, "resets_at": "2999-01-03T00:00:00+00:00"}},
+        }
+        self.write_state(
+            codex={"accounts": {"codex-work.json": "Work"}, "primary": "codex-work.json", "auto": True},
+            claude={"accounts": {"claude-main.json": "Main"}, "primary": "claude-main.json", "auto": False},
+        )
+
+        result = self.run_fleet("list")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertRegex(lines[1], r"^claude\s+Main\s+— · Main\s+off\s+32% · \d+d \d+h\s+59% · \d+d \d+h\s+—$")
+        self.assertRegex(lines[2], r"^codex\s+Work\s+— · Main\s+limits\s+7% · (29|30)m\s+42% · 2d [01]h\s+—$")
+        del self.management.server.usage["index-claude-main.json"]
+        result = self.run_fleet("list", "claude")
+        self.assertRegex(result.stdout.splitlines()[1], r"off\s+—\s+—\s+—$")
+
+    def test_state_accepts_reset_rebalance_only_with_an_order(self):
+        self.write_state(codex={"accounts": {"codex-a.json": "A", "codex-b.json": "B"}, "primary": "codex-a.json", "auto": True})
+        state = json.loads(self.state.read_text())
+        state["providers"]["codex"]["rebalance"] = "reset"
+        self.assertFalse(ACCOUNTS.valid_state(state))
+        state["providers"]["codex"]["order"] = ["codex-a.json", "codex-b.json"]
+        self.assertTrue(ACCOUNTS.valid_state(state))
+        state["providers"]["codex"]["rebalance"] = "other"
+        self.assertFalse(ACCOUNTS.valid_state(state))
+
+    def test_spoke_uses_hub_keys_and_refuses_local_proxy_logins(self):
+        self.add_account("codex", "work", priority=100)
+        self.write_state(codex={"accounts": {"codex-work.json": "Work"}, "primary": "codex-work.json", "auto": True})
+        hub_dir = self.home / ".local/state/fleet"
+        (hub_dir / "hub.json").write_text(ACCOUNTS.hub_state_bytes("spoke", "me@example.com", "http://hub.tail123abc.ts.net:8317").decode())
+        (hub_dir / "hub.json").chmod(0o600)
+        for name, value in (("hub-client-key", "test-client-key"), ("hub-management-key", "test-management-key"), ("cliproxyapi-management-key", "wrong-key")):
+            (hub_dir / name).write_text(value + "\n")
+            (hub_dir / name).chmod(0o600)
+        del self.environment["FLEET_CLIPROXY_MANAGEMENT_KEY"]
+        self.environment["FLEET_ENABLE_SUBSCRIPTION_ROUTING"] = "1"
+
+        listed = self.run_fleet("list")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertIn("Work", listed.stdout)
+        with mock.patch.dict(os.environ, self.environment):
+            output = StringIO()
+            with mock.patch("sys.stdout", output), mock.patch.object(ACCOUNTS, "managed_setup_version", return_value="7.2.149"), mock.patch.object(ACCOUNTS, "probe_inference_endpoint"):
+                ACCOUNTS.hub_status(self.home)
+        self.assertIn("hub: spoke", output.getvalue())
+        self.assertIn("reach: ok", output.getvalue())
+        added = self.run_fleet("add", "codex")
+        self.assertEqual(added.returncode, 2)
+        self.assertIn("Fleet hub", added.stderr)
+        self.assertFalse(ACCOUNTS.valid_hub_url("http://evil.example.com:8317"))
+        self.assertFalse(ACCOUNTS.valid_hub_url("https://hub.tail123abc.ts.net:8317"))
+        self.assertTrue(ACCOUNTS.valid_hub_url("http://hub.tail123abc.ts.net:8317"))
 
 
 if __name__ == "__main__":

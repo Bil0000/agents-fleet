@@ -65,9 +65,14 @@ def quota_retry_delay(path, status, headers, response_body, mode="limits"):
 class RetryBridgeServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+    request_queue_size = 128
 
-    def __init__(self, address, handler, upstream_port, child=None, policy_path=None, client_key=None):
+    def __init__(self, address, handler, upstream_port, child=None, policy_path=None, client_key=None, upstream_host="127.0.0.1", relay=False, hub_login=None, management_key=None):
         self.upstream_port = upstream_port
+        self.upstream_host = upstream_host
+        self.relay = relay
+        self.hub_login = hub_login
+        self.management_key = management_key
         self.child = child
         self.policy_path = policy_path or Path.home() / ".local/state/fleet/account-routing.json"
         self.client_key = client_key
@@ -88,6 +93,7 @@ class RetryBridgeServer(ThreadingHTTPServer):
 
 class RetryBridgeHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    disable_nagle_algorithm = True
 
     def log_message(self, *_args):
         pass
@@ -132,7 +138,7 @@ class RetryBridgeHandler(BaseHTTPRequestHandler):
         headers = {
             name: value
             for name, value in self.headers.items()
-            if name.lower() not in blocked and name.lower() not in {"content-length", "host"}
+            if name.lower() not in blocked and name.lower() not in {"content-length", "host"} and not name.lower().startswith(("x-forwarded-", "tailscale-"))
         }
         if self.server.client_key and path.startswith("/v1/"):
             headers["Authorization"] = f"Bearer {self.server.client_key}"
@@ -163,10 +169,24 @@ class RetryBridgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def remote_denied(self):
+        login = self.headers.get("Tailscale-User-Login")
+        if login is None and self.headers.get("X-Forwarded-For") is None:
+            return False
+        if self.server.hub_login is None or login != self.server.hub_login:
+            return True
+        if self.path.startswith("/v1/"):
+            return self.headers.get("Authorization") != f"Bearer {self.server.client_key}"
+        return not self.path.startswith("/v0/management/") or self.headers.get("Authorization") != f"Bearer {self.server.management_key}"
+
     def forward(self):
         connection = None
         response = None
         response_started = False
+        if self.remote_denied():
+            self.send_proxy_error(403, "Hub access requires the tailnet owner and the hub client key.")
+            self.close_connection = True
+            return
         try:
             body = self.request_body()
             target = urlsplit(self.path)
@@ -175,13 +195,13 @@ class RetryBridgeHandler(BaseHTTPRequestHandler):
                 path += "?" + target.query
             buffered = b""
             while True:
-                connection = http.client.HTTPConnection("127.0.0.1", self.server.upstream_port, timeout=30)
+                connection = http.client.HTTPConnection(self.server.upstream_host, self.server.upstream_port, timeout=30)
+                connection.connect()
+                connection.sock.settimeout(None)
                 connection.request(self.command, path, body=body, headers=self.upstream_headers(body, target.path))
                 response = connection.getresponse()
-                if connection.sock is not None:
-                    connection.sock.settimeout(None)
                 status = response.status
-                if self.command != "POST" or not (
+                if self.server.relay or self.command != "POST" or not (
                     target.path == "/v1/responses" and status == 429
                     or target.path == "/v1/messages" and status in {429, 529}
                 ):
@@ -301,9 +321,55 @@ def wait_for_upstream(child):
     raise SystemExit("CLIProxyAPI did not start.")
 
 
+def hub_login():
+    try:
+        value = json.loads((Path.home() / ".local/state/fleet/hub.json").read_text())
+        if value.get("version") == 1 and value.get("role") == "hub" and isinstance(value.get("login"), str):
+            return value["login"]
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def read_key(name):
+    key = (Path.home() / ".local/state/fleet" / name).read_text().strip()
+    if not key or not key.isprintable():
+        raise SystemExit("CLIProxyAPI client key is invalid.")
+    return key
+
+
+def relay_main(url):
+    target = urlsplit(url)
+    if target.scheme != "http" or not target.hostname or target.port is None:
+        raise SystemExit("Hub URL must be http://host:port.")
+    server = RetryBridgeServer(
+        ("127.0.0.1", 8317),
+        RetryBridgeHandler,
+        target.port,
+        client_key=read_key("hub-client-key"),
+        upstream_host=target.hostname,
+        relay=True,
+    )
+
+    def stop(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+    try:
+        server.serve_forever(poll_interval=0.25)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
 def main(arguments):
+    if len(arguments) == 2 and arguments[0] == "--relay":
+        relay_main(arguments[1])
+        return
     if len(arguments) != 2:
-        raise SystemExit("Usage: fleet-retry-bridge PROXY CONFIG")
+        raise SystemExit("Usage: fleet-retry-bridge PROXY CONFIG | fleet-retry-bridge --relay HUB_URL")
     child = subprocess.Popen([arguments[0], "-config", arguments[1]])
     server = None
 
@@ -314,10 +380,7 @@ def main(arguments):
     signal.signal(signal.SIGTERM, stop)
     try:
         wait_for_upstream(child)
-        client_key = (Path.home() / ".local/state/fleet/cliproxyapi-client-key").read_text().strip()
-        if not client_key or not client_key.isprintable():
-            raise SystemExit("CLIProxyAPI client key is invalid.")
-        server = RetryBridgeServer(("127.0.0.1", 8317), RetryBridgeHandler, 8318, child, client_key=client_key)
+        server = RetryBridgeServer(("127.0.0.1", 8317), RetryBridgeHandler, 8318, child, client_key=read_key("cliproxyapi-client-key"), hub_login=hub_login(), management_key=read_key("cliproxyapi-management-key"))
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
         pass

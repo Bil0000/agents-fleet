@@ -453,10 +453,53 @@ index e83337a..55d5b66 100644
  }
  
 diff --git a/sdk/cliproxy/auth/conductor_cooldown.go b/sdk/cliproxy/auth/conductor_cooldown.go
-index 9b8fd94..cf9f2df 100644
 --- a/sdk/cliproxy/auth/conductor_cooldown.go
 +++ b/sdk/cliproxy/auth/conductor_cooldown.go
-@@ -1553,7 +1553,7 @@ func retryAfterFromError(err error) *time.Duration {
+@@ -10,6 +10,7 @@
+ 	"sort"
+ 	"strings"
+ 	"sync/atomic"
++	"syscall"
+ 	"time"
+ 
+ 	"github.com/gorilla/websocket"
+@@ -1438,6 +1439,17 @@
+ 	return isRequestScopedResultError(err) || isConnectionLifecycleResultError(err)
+ }
+ 
++func IsRetryableConnectionError(err error) bool {
++	if err == nil || statusCodeFromError(err) != 0 || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
++		return false
++	}
++	message := strings.ToLower(strings.TrimSpace(err.Error()))
++	return errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ETIMEDOUT) ||
++		strings.HasSuffix(message, "connection reset by peer") ||
++		strings.HasSuffix(message, "broken pipe") ||
++		strings.HasSuffix(message, "i/o timeout")
++}
++
+ // isConnectionLifecycleError reports transport/session lifecycle failures that must
+ // not cool credentials: client cancellation and WebSocket close/EOF disconnects.
+ func isConnectionLifecycleError(err error) bool {
+@@ -1460,7 +1472,7 @@
+ 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+ 		return true
+ 	}
+-	return isConnectionLifecycleMessage(err.Error())
++	return IsRetryableConnectionError(err) || isConnectionLifecycleMessage(err.Error())
+ }
+ 
+ func isConnectionLifecycleResultError(err *Error) bool {
+@@ -1475,7 +1487,7 @@
+ 	if statusCodeFromResult(err) != 0 {
+ 		return false
+ 	}
+-	return isConnectionLifecycleMessage(err.Message)
++	return IsRetryableConnectionError(err) || isConnectionLifecycleMessage(err.Message)
+ }
+ 
+ func isConnectionLifecycleMessage(message string) bool {
+@@ -1553,7 +1565,7 @@
  	if retryAfter == nil {
  		return nil
  	}
@@ -895,3 +938,285 @@ index a1a648f..89213f4 100644
  // ReasoningEffortMetadataKey stores the client-requested reasoning effort for usage logs.
  const ReasoningEffortMetadataKey = "reasoning_effort"
  
+diff --git a/internal/runtime/executor/helps/utls_client.go b/internal/runtime/executor/helps/utls_client.go
+index 9508320..d6cf3f8 100644
+--- a/internal/runtime/executor/helps/utls_client.go
++++ b/internal/runtime/executor/helps/utls_client.go
+@@ -357,7 +357,26 @@ func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
+ 		return f.anthropic.RoundTrip(req)
+ 	}
+ 	if req.URL.Scheme == "https" && strings.EqualFold(req.URL.Hostname(), "chatgpt.com") {
+-		return f.chrome.RoundTrip(req)
++		resp, err := f.chrome.RoundTrip(req)
++		if resp != nil || !cliproxyauth.IsRetryableConnectionError(err) ||
++			!strings.HasPrefix(req.URL.Path, "/backend-api/codex/") ||
++			req.Body != nil && req.GetBody == nil {
++			return resp, err
++		}
++		select {
++		case <-req.Context().Done():
++			return nil, req.Context().Err()
++		case <-time.After(250 * time.Millisecond):
++		}
++		retryReq := req.Clone(req.Context())
++		if req.Body != nil {
++			body, errBody := req.GetBody()
++			if errBody != nil {
++				return nil, errBody
++			}
++			retryReq.Body = body
++		}
++		return f.chrome.RoundTrip(retryReq)
+ 	}
+ 	return f.fallback.RoundTrip(req)
+ }
+diff --git a/internal/runtime/executor/helps/utls_client_test.go b/internal/runtime/executor/helps/utls_client_test.go
+index f4492ad..2a46be9 100644
+--- a/internal/runtime/executor/helps/utls_client_test.go
++++ b/internal/runtime/executor/helps/utls_client_test.go
+@@ -16,6 +16,7 @@ import (
+ 	"strconv"
+ 	"strings"
+ 	"sync/atomic"
++	"syscall"
+ 	"testing"
+ 	"time"
+ 
+@@ -639,3 +640,97 @@ func summarizeClaudeCodeClientHelloSpec(t *testing.T, spec *tls.ClientHelloSpec)
+ 	summary.JA3MD5 = hex.EncodeToString(digest[:])
+ 	return summary
+ }
++
++func TestCodexConnectionResetRetry(t *testing.T) {
++	for _, tc := range []struct {
++		name     string
++		failure  error
++		status   int
++		repeat   bool
++		replay   bool
++		canceled bool
++		path     string
++		want     int
++	}{
++		{name: "reset", failure: syscall.ECONNRESET, replay: true, want: 2},
++		{name: "pipe", failure: syscall.EPIPE, replay: true, want: 2},
++		{name: "timeout", failure: syscall.ETIMEDOUT, replay: true, want: 2},
++		{name: "bounded", failure: syscall.ECONNRESET, repeat: true, replay: true, want: 2},
++		{name: "no replay", failure: syscall.ECONNRESET, want: 1},
++		{name: "canceled", failure: syscall.ECONNRESET, replay: true, canceled: true, want: 1},
++		{name: "other error", failure: io.EOF, replay: true, want: 1},
++		{name: "login", status: 401, replay: true, want: 1},
++		{name: "quota", status: 429, replay: true, want: 1},
++		{name: "server", status: 503, replay: true, want: 1},
++		{name: "other endpoint", failure: syscall.ECONNRESET, replay: true, path: "/other", want: 1},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			ctx, cancel := context.WithCancel(t.Context())
++			defer cancel()
++			if tc.canceled {
++				cancel()
++			}
++			path := tc.path
++			if path == "" {
++				path = "/backend-api/codex/responses"
++			}
++			req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://chatgpt.com"+path, strings.NewReader("same body"))
++			if err != nil {
++				t.Fatal(err)
++			}
++			if !tc.replay {
++				req.GetBody = nil
++			}
++			calls := 0
++			transport := &fallbackRoundTripper{chrome: utlsClientRoundTripFunc(func(r *http.Request) (*http.Response, error) {
++				calls++
++				body, err := io.ReadAll(r.Body)
++				if err != nil || string(body) != "same body" {
++					t.Fatalf("replay body=%q err=%v", body, err)
++				}
++				r.Body.Close()
++				if tc.failure != nil && (calls == 1 || tc.repeat) {
++					return nil, &net.OpError{Op: "write", Net: "tcp", Err: tc.failure}
++				}
++				status := tc.status
++				if status == 0 {
++					status = 200
++				}
++				return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader("OK"))}, nil
++			})}
++			resp, err := transport.RoundTrip(req)
++			if calls != tc.want {
++				t.Fatalf("calls=%d want=%d err=%v", calls, tc.want, err)
++			}
++			if resp != nil {
++				resp.Body.Close()
++			}
++			if tc.want == 2 && !tc.repeat && (err != nil || resp == nil || resp.StatusCode != 200) {
++				t.Fatalf("retry failed: resp=%v err=%v", resp, err)
++			}
++		})
++	}
++}
++
++func TestCodexStreamFailureIsNotReplayed(t *testing.T) {
++	calls := 0
++	reader, writer := io.Pipe()
++	writer.CloseWithError(syscall.ECONNRESET)
++	transport := &fallbackRoundTripper{chrome: utlsClientRoundTripFunc(func(req *http.Request) (*http.Response, error) {
++		calls++
++		return &http.Response{StatusCode: 200, Body: reader}, nil
++	})}
++	req, err := http.NewRequest(http.MethodGet, "https://chatgpt.com/backend-api/codex/responses", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	resp, err := transport.RoundTrip(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	_, err = io.ReadAll(resp.Body)
++	resp.Body.Close()
++	if !errors.Is(err, syscall.ECONNRESET) || calls != 1 {
++		t.Fatalf("calls=%d err=%v", calls, err)
++	}
++}
+diff --git a/sdk/cliproxy/auth/connection_lifecycle_cooldown_test.go b/sdk/cliproxy/auth/connection_lifecycle_cooldown_test.go
+index d6e7757..9c62cd1 100644
+--- a/sdk/cliproxy/auth/connection_lifecycle_cooldown_test.go
++++ b/sdk/cliproxy/auth/connection_lifecycle_cooldown_test.go
+@@ -5,8 +5,10 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"net"
+ 	"net/http"
+ 	"net/url"
++	"syscall"
+ 	"testing"
+ 	"time"
+ 
+@@ -33,6 +35,10 @@ func TestManager_MarkResult_ConnectionLifecycleDoesNotCooldown(t *testing.T) {
+ 		{name: "context deadline exceeded", err: &Error{Message: "context deadline exceeded"}},
+ 		{name: "unexpected EOF", err: &Error{Message: "unexpected EOF"}},
+ 		{name: "plain EOF", err: &Error{Message: "EOF"}},
++		{name: "reset", err: resultErrorFromError(&url.Error{Op: "Post", URL: "https://chatgpt.com/backend-api/codex/responses", Err: &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}})},
++		{name: "broken pipe", err: resultErrorFromError(fmt.Errorf("write tcp: %w", syscall.EPIPE))},
++		{name: "serialized reset", err: &Error{Message: "read tcp: connection reset by peer"}},
++		{name: "serialized broken pipe", err: &Error{Message: "write tcp: broken pipe"}},
+ 		{name: "wrapped unexpected EOF", err: &Error{Message: "read tcp 127.0.0.1:1->127.0.0.1:2: unexpected EOF"}},
+ 		{name: "typed canceled", err: resultErrorFromError(context.Canceled)},
+ 		{name: "typed deadline", err: resultErrorFromError(context.DeadlineExceeded)},
+@@ -249,6 +255,8 @@ func TestResultErrorFromError_ConnectionLifecycleDoesNotBecomeRequestScoped(t *t
+ func TestIsConnectionLifecycleError_StatusBearingErrorsStayCoolable(t *testing.T) {
+ 	cases := []error{
+ 		&statusBearingError{status: http.StatusUnauthorized, msg: "unexpected EOF"},
++		&statusBearingError{status: http.StatusUnauthorized, msg: "connection reset by peer"},
++		&statusBearingError{status: http.StatusTooManyRequests, msg: "broken pipe"},
+ 		&statusBearingError{status: http.StatusTooManyRequests, msg: "context canceled"},
+ 		&statusBearingError{status: http.StatusInternalServerError, msg: "unexpected EOF"},
+ 		&statusBearingError{status: http.StatusBadGateway, msg: "websocket: close 1006 (abnormal closure): unexpected EOF"},
+@@ -337,3 +345,23 @@ func assertNoCooldown(t *testing.T, m *Manager, authID, model string) {
+ 		}
+ 	}
+ }
++
++func TestTCPResetKeepsAllAccountsAvailable(t *testing.T) {
++	for _, model := range []string{"gpt-6-astra", ""} {
++		m := NewManager(nil, nil, nil)
++		var accounts []*Auth
++		for i := 0; i < 3; i++ {
++			a := &Auth{ID: fmt.Sprintf("reset-%d", i), Provider: "codex"}
++			if _, err := m.Register(t.Context(), a); err != nil {
++				t.Fatal(err)
++			}
++			m.MarkResult(t.Context(), Result{AuthID: a.ID, Provider: a.Provider, Model: model, Error: &Error{Message: "read tcp: connection reset by peer"}})
++			a, _ = m.GetByID(a.ID)
++			accounts = append(accounts, a)
++		}
++		available, err := m.availableAuthsForRouteModel(accounts, "codex", model, time.Now())
++		if err != nil || len(available) != 3 {
++			t.Fatalf("model=%q available=%d err=%v", model, len(available), err)
++		}
++	}
++}
+diff --git a/internal/runtime/executor/codex_websockets_connection.go b/internal/runtime/executor/codex_websockets_connection.go
+--- a/internal/runtime/executor/codex_websockets_connection.go
++++ b/internal/runtime/executor/codex_websockets_connection.go
+@@ -43,6 +43,10 @@
+ 		// Avoid gorilla/websocket flate tail validation issues on some upstreams/Go versions.
+ 		// Negotiating permessage-deflate is fine; we just don't compress outbound messages.
+ 		conn.EnableWriteCompression(false)
++		conn.SetPingHandler(func(appData string) error {
++			_ = conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
++			return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
++		})
+ 	}
+ 	return conn, closer, resp, err
+ }
+diff --git a/internal/runtime/executor/codex_websockets_session.go b/internal/runtime/executor/codex_websockets_session.go
+--- a/internal/runtime/executor/codex_websockets_session.go
++++ b/internal/runtime/executor/codex_websockets_session.go
+@@ -215,6 +215,7 @@
+ 	}
+ 	s.resetUpstreamDisconnectError(conn)
+ 	conn.SetPingHandler(func(appData string) error {
++		_ = conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
+ 		s.writeMu.Lock()
+ 		defer s.writeMu.Unlock()
+ 		// Reply pongs from the same write lock to avoid concurrent writes.
+diff --git a/internal/runtime/executor/codex_websockets_executor_test.go b/internal/runtime/executor/codex_websockets_executor_test.go
+--- a/internal/runtime/executor/codex_websockets_executor_test.go
++++ b/internal/runtime/executor/codex_websockets_executor_test.go
+@@ -4,6 +4,7 @@
+ 	"bytes"
+ 	"context"
+ 	"errors"
++	"fmt"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"strings"
+@@ -2519,3 +2520,44 @@
+ 		t.Fatalf("RetryAfter = %v, want 120s", got)
+ 	}
+ }
++
++func TestCodexWebsocketPingExtendsReadDeadline(t *testing.T) {
++	for _, session := range []bool{false, true} {
++		t.Run(fmt.Sprint(session), func(t *testing.T) {
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
++				if err != nil {
++					t.Error(err)
++					return
++				}
++				defer conn.Close()
++				if err := conn.WriteControl(websocket.PingMessage, []byte("alive"), time.Now().Add(time.Second)); err != nil {
++					t.Error(err)
++					return
++				}
++				time.Sleep(500 * time.Millisecond)
++				_ = conn.WriteMessage(websocket.TextMessage, []byte("ready"))
++			}))
++			defer server.Close()
++			exec := NewCodexWebsocketsExecutor(&config.Config{})
++			conn, _, _, err := exec.dialCodexWebsocket(t.Context(), nil, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer conn.Close()
++			if session {
++				(&codexWebsocketSession{}).configureConn(conn)
++			}
++			if err := conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
++				t.Fatal(err)
++			}
++			_, payload, err := conn.ReadMessage()
++			if err != nil {
++				t.Fatal(err)
++			}
++			if string(payload) != "ready" {
++				t.Fatalf("payload = %q, want ready", payload)
++			}
++		})
++	}
++}
