@@ -223,7 +223,7 @@ If the user wants multi-account routing, run `fleet account setup` once on this 
 Enable automatic updates:
 
 ```bash
-~/.local/bin/fleet enable-updates
+~/.local/bin/fleet update on
 ```
 
 For a clone with no remote, use `./bin/fleet apply --host HOST` after local checks. Do not push or enable the updater.

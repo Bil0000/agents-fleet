@@ -96,11 +96,45 @@ fleet account current codex
 
 Auto mode defaults to `limits only`: it switches accounts only for a structured subscription-limit response before output starts. `fleet account auto codex on --when any` also switches for temporary provider errors and can spend fallback quota. The retry bridge caps each wait at five minutes. The bundled provider-routing patch also caps quota cooldowns and clears them from fresh provider usage data. Fleet returns to the chosen primary when it is ready. Fleet never replays a request after output starts because that could repeat tool work or other side effects.
 
-The same commands work with `claude`. Run `fleet account auto --help` to see the switching modes. `fleet account current` reports the account used by the latest successful 10-minute request bucket. Use `fleet account enroll` only to adopt credentials from an existing CLIProxyAPI setup.
+Set a fallback order with every enrolled account listed once, starting with the primary:
+
+```bash
+fleet account order codex "Work Pro" "Backup 1" "Backup 2"
+fleet account order codex
+fleet account order codex reset
+fleet account order rebalance
+fleet account order codex manual
+```
+
+`reset` puts the account whose weekly limit resets soonest first. Fleet checks the order after login and hourly when automatic updates are on. `manual` stops these order changes. Setting an explicit order also returns to manual mode. The order stays saved when auto switching is turned off. New accounts go last; removing the primary promotes the next account.
+
+The same commands work with `claude`. Run `fleet account auto --help` to see the switching modes. `fleet account list` shows order, usage, reset times, and the accounts used in the latest successful 10-minute request bucket. `current` and `quota` are aliases for this list. Use `fleet account login codex --existing ACCOUNT` to adopt credentials from an existing CLIProxyAPI setup; `enroll` still works.
+
+Fleet enables upstream WebSocket connections for enrolled Codex accounts. The retry bridge leaves slow responses open and sends small output chunks without delay. The bundled provider-routing patch preserves healthy accounts after connection failures and retries eligible Codex connection failures once before a response starts.
 
 Fleet does not contain a model list. New models, aliases, reasoning controls, auth screens, and non-auth client commands continue to come directly from Claude and Codex.
 
 Newer Fleet-managed CLIProxyAPI builds are supported. The macOS updater source and provider-routing patch are included for existing custom builds. They are not installed by `fleet account setup`. The updater needs Go, a C compiler, and an existing Fleet provider-router setup. It checks a new build and restores the old build if activation fails.
+
+## Optional shared account hub
+
+One host can provide account routing for other devices on the same Tailscale network. Set up Fleet account routing on each device first. Tailscale must be installed and signed in, with MagicDNS enabled. On the host that will serve requests:
+
+```bash
+fleet account hub setup
+```
+
+On another device, use the hub's MagicDNS name and an SSH target for its user:
+
+```bash
+fleet account hub join hub.tail123abc.ts.net --ssh user@hub
+fleet account hub
+fleet account hub leave
+```
+
+Setup serves the router on port 8317 through Tailscale. Access needs the recorded Tailscale login and a hub key. Joining copies the client and management keys over SSH into private local files, then runs a local relay. The client endpoint stays on localhost. Native login commands add accounts to the hub. Local account labels and order settings remain on each device; changes to proxy account priority affect all devices using the hub.
+
+`hub` shows the role and checks the relay connection. `hub leave` restores the device's local router. The local proxy binary, settings, and credentials stay on disk while it uses the hub. The optional proxy updater skips devices that use a hub.
 
 ## Host setup
 
@@ -158,7 +192,7 @@ The shared setup uses Claude-Mem 13.24.0 and checks its worker before applying t
 ./bin/fleet apply --dry-run --host HOST
 ./bin/fleet apply --host HOST
 ~/.local/bin/fleet status --host HOST
-~/.local/bin/fleet enable-updates
+~/.local/bin/fleet update on
 ~/.local/bin/fleet update --host HOST
 ~/.local/bin/fleet scan --host HOST
 ~/.local/bin/fleet rollback
