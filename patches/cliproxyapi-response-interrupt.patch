@@ -1,0 +1,2410 @@
+diff --git a/internal/runtime/executor/codex_websockets_executor.go b/internal/runtime/executor/codex_websockets_executor.go
+--- a/internal/runtime/executor/codex_websockets_executor.go
++++ b/internal/runtime/executor/codex_websockets_executor.go
+@@ -12,6 +12,8 @@ import (
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+ 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+ 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
++	log "github.com/sirupsen/logrus"
++	"github.com/tidwall/gjson"
+ )
+ 
+ // CodexWebsocketsExecutor executes Codex Responses requests using a WebSocket transport.
+@@ -149,3 +151,76 @@ func codexWebsocketsEnabled(auth *cliproxyauth.Auth) bool {
+ 	}
+ 	return false
+ }
++
++func (e *CodexAutoExecutor) InterruptExecutionSession(ctx context.Context, sessionID string, payload []byte) error {
++	if e == nil || e.wsExec == nil {
++		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
++	}
++	return e.wsExec.InterruptExecutionSession(ctx, sessionID, payload)
++}
++
++func (e *CodexWebsocketsExecutor) InterruptExecutionSession(ctx context.Context, sessionID string, payload []byte) error {
++	if e == nil {
++		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
++	}
++	if ctx != nil {
++		if errCtx := ctx.Err(); errCtx != nil {
++			return errCtx
++		}
++	}
++	sessionID = strings.TrimSpace(sessionID)
++	if sessionID == "" {
++		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
++	}
++	store := e.store
++	if store == nil {
++		store = globalCodexWebsocketSessionStore
++	}
++	store.mu.Lock()
++	sess := store.sessions[sessionID]
++	store.mu.Unlock()
++	if sess == nil {
++		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
++	}
++	sess.connMu.Lock()
++	conn := sess.conn
++	authID := sess.authID
++	sess.connMu.Unlock()
++	if conn == nil {
++		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
++	}
++	authEnabled := cliproxyexecutor.WebsocketAuthEnabled(ctx, authID)
++	sess.connMu.Lock()
++	if sess.conn != conn {
++		sess.connMu.Unlock()
++		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
++	}
++	sess.activeMu.Lock()
++	_, alreadyTerminal := sess.terminalResponseIDs[gjson.GetBytes(payload, "response_id").String()]
++	alreadyTerminal = alreadyTerminal && sess.responseStateConn == conn
++	active := sess.activeConn == conn && sess.activeCh != nil
++	var disconnectErr error
++	if sess.terminalConn == conn {
++		disconnectErr = sess.terminalErr
++	}
++	sess.activeMu.Unlock()
++	sess.connMu.Unlock()
++	if disconnectErr != nil {
++		return disconnectErr
++	}
++	if alreadyTerminal {
++		log.WithField("outcome", "already_terminal").Debug("codex websockets: response.interrupt handled")
++		return nil
++	}
++	if !active {
++		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
++	}
++	if !authEnabled {
++		return fmt.Errorf("websocket credential is no longer enabled")
++	}
++	if errWrite := writeCodexWebsocketMessage(sess, conn, payload); errWrite != nil {
++		return errWrite
++	}
++	log.WithField("outcome", "forwarded").Debug("codex websockets: response.interrupt handled")
++	return nil
++}
+diff --git a/internal/runtime/executor/codex_websockets_interrupt_test.go b/internal/runtime/executor/codex_websockets_interrupt_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/runtime/executor/codex_websockets_interrupt_test.go
+@@ -0,0 +1,74 @@
++package executor
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/gorilla/websocket"
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
++)
++
++func TestInterruptExecutionSessionRequiresActiveRead(t *testing.T) {
++	received := make(chan []byte, 1)
++	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		conn, errUpgrade := (&websocket.Upgrader{}).Upgrade(w, r, nil)
++		if errUpgrade != nil {
++			t.Errorf("upgrade: %v", errUpgrade)
++			return
++		}
++		defer func() { _ = conn.Close() }()
++		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
++		_, payload, errRead := conn.ReadMessage()
++		if errRead != nil {
++			return
++		}
++		received <- payload
++	}))
++	defer upstream.Close()
++
++	client, _, errDial := websocket.DefaultDialer.Dial("ws"+upstream.URL[len("http"):], nil)
++	if errDial != nil {
++		t.Fatal(errDial)
++	}
++	defer func() { _ = client.Close() }()
++
++	const sessionID = "interrupt-requires-active-read"
++	executor := NewCodexWebsocketsExecutor(nil)
++	defer executor.CloseExecutionSession(sessionID)
++	sess := executor.getOrCreateSession(sessionID)
++	sess.connMu.Lock()
++	sess.conn = client
++	sess.authID = "auth"
++	sess.wsURL = upstream.URL
++	sess.connMu.Unlock()
++
++	interrupt := []byte(`{"type":"response.interrupt","response_id":"r1","mode":"discard_partial_items"}`)
++	errIdle := executor.InterruptExecutionSession(context.Background(), sessionID, interrupt)
++	if !errors.Is(errIdle, cliproxyexecutor.ErrNoActiveUpstreamWebsocket) {
++		t.Fatalf("idle socket error = %v, want ErrNoActiveUpstreamWebsocket", errIdle)
++	}
++	select {
++	case payload := <-received:
++		t.Fatalf("idle socket was written: %s", payload)
++	case <-time.After(200 * time.Millisecond):
++	}
++
++	readCh := sess.activate(client)
++	defer sess.clearActive(client, readCh)
++	if errActive := executor.InterruptExecutionSession(context.Background(), sessionID, interrupt); errActive != nil {
++		t.Fatal(errActive)
++	}
++	select {
++	case payload := <-received:
++		if !bytes.Equal(payload, interrupt) {
++			t.Fatalf("active interrupt = %s", payload)
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("active socket did not receive the interrupt")
++	}
++}
+diff --git a/internal/runtime/executor/codex_websockets_late_interrupt_test.go b/internal/runtime/executor/codex_websockets_late_interrupt_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/runtime/executor/codex_websockets_late_interrupt_test.go
+@@ -0,0 +1,195 @@
++package executor
++
++import (
++	"context"
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/gorilla/websocket"
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
++)
++
++func TestInterruptExecutionSessionCompletesDuringAuthCheck(t *testing.T) {
++	complete := make(chan struct{})
++	interruptCount := make(chan int, 1)
++	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		conn, errUpgrade := (&websocket.Upgrader{}).Upgrade(w, r, nil)
++		if errUpgrade != nil {
++			t.Errorf("upgrade: %v", errUpgrade)
++			return
++		}
++		defer func() {
++			if errClose := conn.Close(); errClose != nil {
++				t.Errorf("close upstream: %v", errClose)
++			}
++		}()
++		<-complete
++		if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"r1","output":[]}}`)); errWrite != nil {
++			t.Errorf("write completion: %v", errWrite)
++			return
++		}
++		count := 0
++		for {
++			_, payload, errRead := conn.ReadMessage()
++			if errRead != nil {
++				return
++			}
++			if string(payload) == "barrier" {
++				interruptCount <- count
++				return
++			}
++			count++
++		}
++	}))
++	defer upstream.Close()
++	client, _, errDial := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(upstream.URL, "http"), nil)
++	if errDial != nil {
++		t.Fatal(errDial)
++	}
++	exec := NewCodexWebsocketsExecutor(nil)
++	exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
++	const sessionID = "completion-during-auth-check"
++	defer exec.CloseExecutionSession(sessionID)
++	sess := exec.getOrCreateSession(sessionID)
++	sess.conn = client
++	sess.connCloser = newWebsocketConnectionCloser(client)
++	sess.configureConn(client)
++	readCh := sess.activate(client)
++	go exec.readUpstreamLoop(sess, client)
++	ctx := cliproxyexecutor.WithWebsocketAuthCheck(context.Background(), func(string) bool {
++		close(complete)
++		select {
++		case event := <-readCh:
++			if event.err != nil {
++				t.Fatal(event.err)
++			}
++		case <-time.After(3 * time.Second):
++			t.Fatal("completion timed out")
++		}
++		sess.clearActive(client, readCh)
++		return true
++	})
++	if errInterrupt := exec.InterruptExecutionSession(ctx, sessionID, []byte(`{"type":"response.interrupt","response_id":"r1"}`)); errInterrupt != nil {
++		t.Fatalf("completed interrupt = %v", errInterrupt)
++	}
++	if errWrite := client.WriteMessage(websocket.TextMessage, []byte("barrier")); errWrite != nil {
++		t.Fatal(errWrite)
++	}
++	select {
++	case count := <-interruptCount:
++		if count != 0 {
++			t.Fatalf("forwarded %d interrupt(s) after the response became terminal", count)
++		}
++	case <-time.After(3 * time.Second):
++		t.Fatal("upstream barrier timed out")
++	}
++}
++
++func TestInterruptExecutionSessionAfterTerminal(t *testing.T) {
++	for _, terminal := range []string{"response.completed", "response.done", "response.incomplete", "response.failed"} {
++		t.Run(terminal, func(t *testing.T) {
++			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				conn, errUpgrade := (&websocket.Upgrader{}).Upgrade(w, r, nil)
++				if errUpgrade != nil {
++					t.Errorf("upgrade: %v", errUpgrade)
++					return
++				}
++				defer func() {
++					if errClose := conn.Close(); errClose != nil {
++						t.Errorf("close upstream: %v", errClose)
++					}
++				}()
++				for _, payload := range []string{
++					`{"type":"response.created","response":{"id":"r1"}}`,
++					`{"type":"` + terminal + `","response":{"id":"r1","output":[]}}`,
++				} {
++					if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(payload)); errWrite != nil {
++						t.Errorf("write: %v", errWrite)
++						return
++					}
++				}
++				_, payload, errRead := conn.ReadMessage()
++				if errRead != nil {
++					return
++				}
++				if string(payload) != `{"type":"response.interrupt","response_id":"r2"}` {
++					t.Errorf("late interrupt contaminated next response: %s", payload)
++				}
++				if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.incomplete","response":{"id":"r2"}}`)); errWrite != nil {
++					t.Errorf("write r2 terminal: %v", errWrite)
++				}
++				_, _, _ = conn.ReadMessage()
++			}))
++			defer upstream.Close()
++			client, _, errDial := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(upstream.URL, "http"), nil)
++			if errDial != nil {
++				t.Fatal(errDial)
++			}
++			exec := NewCodexWebsocketsExecutor(nil)
++			exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
++			const sessionID = "late-interrupt"
++			defer exec.CloseExecutionSession(sessionID)
++			sess := exec.getOrCreateSession(sessionID)
++			sess.conn = client
++			sess.connCloser = newWebsocketConnectionCloser(client)
++			sess.configureConn(client)
++			readCh := sess.activate(client)
++			go exec.readUpstreamLoop(sess, client)
++			read := func() codexWebsocketRead {
++				t.Helper()
++				select {
++				case event := <-readCh:
++					if event.err != nil {
++						t.Fatal(event.err)
++					}
++					return event
++				case <-time.After(3 * time.Second):
++					t.Fatal("upstream event timed out")
++					return codexWebsocketRead{}
++				}
++			}
++			read()
++			read()
++			sess.clearActive(client, readCh)
++			late := []byte(`{"type":"response.interrupt","response_id":"r1"}`)
++			for i := 0; i < 2; i++ {
++				if errInterrupt := exec.InterruptExecutionSession(context.Background(), sessionID, late); errInterrupt != nil {
++					t.Fatalf("terminal r1 interrupt %d must be idempotent, got %v", i+1, errInterrupt)
++				}
++			}
++			unknown := []byte(`{"type":"response.interrupt","response_id":"unknown"}`)
++			if errUnknown := exec.InterruptExecutionSession(context.Background(), sessionID, unknown); !errors.Is(errUnknown, cliproxyexecutor.ErrNoActiveUpstreamWebsocket) {
++				t.Fatalf("unknown idle interrupt = %v, want ErrNoActiveUpstreamWebsocket for local HTTP fallback", errUnknown)
++			}
++			readCh = sess.activate(client)
++			if errLate := exec.InterruptExecutionSession(context.Background(), sessionID, late); errLate != nil {
++				t.Fatalf("late r1 during r2 = %v", errLate)
++			}
++			if errActive := exec.InterruptExecutionSession(context.Background(), sessionID, []byte(`{"type":"response.interrupt","response_id":"r2"}`)); errActive != nil {
++				t.Fatal(errActive)
++			}
++			read()
++			sess.clearActive(client, readCh)
++			for _, id := range []string{"r1", "r2"} {
++				if errLate := exec.InterruptExecutionSession(context.Background(), sessionID, []byte(`{"type":"response.interrupt","response_id":"`+id+`"}`)); errLate != nil {
++					t.Fatalf("earlier terminal %s = %v", id, errLate)
++				}
++			}
++			if errWrite := client.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "test disconnect")); errWrite != nil {
++				t.Fatal(errWrite)
++			}
++			select {
++			case <-sess.upstreamDisconnectCh:
++			case <-time.After(3 * time.Second):
++				t.Fatal("real disconnect was not reported")
++			}
++			if errDisconnected := exec.InterruptExecutionSession(context.Background(), sessionID, []byte(`{"type":"response.interrupt","response_id":"r2"}`)); !errors.Is(errDisconnected, cliproxyexecutor.ErrNoActiveUpstreamWebsocket) {
++				t.Fatalf("disconnected interrupt = %v, want ErrNoActiveUpstreamWebsocket", errDisconnected)
++			}
++		})
++	}
++}
+diff --git a/internal/runtime/executor/codex_websockets_session.go b/internal/runtime/executor/codex_websockets_session.go
+--- a/internal/runtime/executor/codex_websockets_session.go
++++ b/internal/runtime/executor/codex_websockets_session.go
+@@ -12,6 +12,7 @@ import (
+ 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+ 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+ 	log "github.com/sirupsen/logrus"
++	"github.com/tidwall/gjson"
+ )
+ 
+ type codexWebsocketSessionStore struct {
+@@ -68,6 +69,11 @@ type codexWebsocketSession struct {
+ 	activeCh     chan codexWebsocketRead
+ 	activeDone   <-chan struct{}
+ 	activeCancel context.CancelFunc
++	terminalConn *websocket.Conn
++	terminalErr  error
++
++	responseStateConn   *websocket.Conn
++	terminalResponseIDs map[string]struct{}
+ 
+ 	readerConn *websocket.Conn
+ 
+@@ -90,6 +96,11 @@ func (s *codexWebsocketSession) setActive(conn *websocket.Conn, ch chan codexWeb
+ 		return
+ 	}
+ 	s.activeMu.Lock()
++	s.setActiveLocked(conn, ch)
++	s.activeMu.Unlock()
++}
++
++func (s *codexWebsocketSession) setActiveLocked(conn *websocket.Conn, ch chan codexWebsocketRead) {
+ 	if s.activeCancel != nil {
+ 		s.activeCancel()
+ 		s.activeCancel = nil
+@@ -102,7 +113,6 @@ func (s *codexWebsocketSession) setActive(conn *websocket.Conn, ch chan codexWeb
+ 		s.activeDone = activeCtx.Done()
+ 		s.activeCancel = activeCancel
+ 	}
+-	s.activeMu.Unlock()
+ }
+ 
+ func (s *codexWebsocketSession) activate(conn *websocket.Conn) chan codexWebsocketRead {
+@@ -110,10 +120,47 @@ func (s *codexWebsocketSession) activate(conn *websocket.Conn) chan codexWebsock
+ 		return nil
+ 	}
+ 	ch := make(chan codexWebsocketRead, 4096)
+-	s.setActive(conn, ch)
++	s.activeMu.Lock()
++	defer s.activeMu.Unlock()
++	if s.terminalConn == conn && s.terminalErr != nil {
++		ch <- codexWebsocketRead{conn: conn, err: s.terminalErr}
++		close(ch)
++		return ch
++	}
++	s.setActiveLocked(conn, ch)
+ 	return ch
+ }
+ 
++func (s *codexWebsocketSession) resetTerminalError(conn *websocket.Conn) {
++	if s == nil || conn == nil {
++		return
++	}
++	s.activeMu.Lock()
++	s.terminalConn = conn
++	s.terminalErr = nil
++	if s.responseStateConn != conn {
++		s.responseStateConn = conn
++		s.terminalResponseIDs = make(map[string]struct{})
++	}
++	s.activeMu.Unlock()
++}
++
++func (s *codexWebsocketSession) markTerminalError(conn *websocket.Conn, err error) {
++	if s == nil || conn == nil || err == nil {
++		return
++	}
++	s.connMu.Lock()
++	if s.conn != conn {
++		s.connMu.Unlock()
++		return
++	}
++	s.activeMu.Lock()
++	s.terminalConn = conn
++	s.terminalErr = err
++	s.activeMu.Unlock()
++	s.connMu.Unlock()
++}
++
+ func (s *codexWebsocketSession) activeForConn(conn *websocket.Conn) (chan codexWebsocketRead, <-chan struct{}) {
+ 	if s == nil || conn == nil {
+ 		return nil, nil
+@@ -210,6 +257,7 @@ func sendTerminalWebsocketRead(ch chan<- codexWebsocketRead, done <-chan struct{
+ }
+ 
+ func (s *codexWebsocketSession) configureConn(conn *websocket.Conn) {
++	s.resetTerminalError(conn)
+ 	if s == nil || conn == nil {
+ 		return
+ 	}
+@@ -553,6 +601,7 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession,
+ 		_ = conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
+ 		msgType, payload, errRead := conn.ReadMessage()
+ 		if errRead != nil {
++			sess.markTerminalError(conn, errRead)
+ 			invalidate := func() {
+ 				e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
+ 			}
+@@ -573,6 +622,7 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession,
+ 		if msgType != websocket.TextMessage {
+ 			if msgType == websocket.BinaryMessage {
+ 				errBinary := fmt.Errorf("codex websockets executor: unexpected binary message")
++				sess.markTerminalError(conn, errBinary)
+ 				invalidate := func() {
+ 					e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary)
+ 				}
+@@ -592,6 +642,16 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession,
+ 			continue
+ 		}
+ 
++		eventType := gjson.GetBytes(payload, "type").String()
++		responseID := gjson.GetBytes(payload, "response.id")
++		if isTerminalEvent(eventType) && responseID.Type == gjson.String && responseID.String() != "" {
++			sess.activeMu.Lock()
++			if sess.responseStateConn == conn {
++				sess.terminalResponseIDs[responseID.String()] = struct{}{}
++			}
++			sess.activeMu.Unlock()
++		}
++
+ 		ch, done := sess.activeForConn(conn)
+ 		if ch == nil {
+ 			continue
+@@ -817,3 +877,12 @@ func CloseCodexWebsocketSessionsForAuthID(authID string, reason string) {
+ 		closeCodexWebsocketSession(toClose[i], reason)
+ 	}
+ }
++
++func isTerminalEvent(eventType string) bool {
++	switch eventType {
++	case "response.completed", "response.done", "response.incomplete", "response.failed":
++		return true
++	default:
++		return false
++	}
++}
+diff --git a/internal/runtime/executor/websocket_upstream_disconnect_test.go b/internal/runtime/executor/websocket_upstream_disconnect_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/runtime/executor/websocket_upstream_disconnect_test.go
+@@ -0,0 +1,89 @@
++package executor
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/gorilla/websocket"
++)
++
++func TestWebsocketActivationAfterUpstreamDisconnect(t *testing.T) {
++	tests := []struct {
++		name     string
++		readLoop func(*codexWebsocketSession, *websocket.Conn)
++	}{
++		{
++			name: "codex",
++			readLoop: func(sess *codexWebsocketSession, conn *websocket.Conn) {
++				NewCodexWebsocketsExecutor(nil).readUpstreamLoop(sess, conn)
++			},
++		},
++		{
++			name: "xai",
++			readLoop: func(sess *codexWebsocketSession, conn *websocket.Conn) {
++				NewXAIWebsocketsExecutor(nil).readUpstreamLoop(sess, conn)
++			},
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			serverClosed := make(chan struct{})
++			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				conn, errUpgrade := upgrader.Upgrade(w, r, nil)
++				if errUpgrade != nil {
++					return
++				}
++				_ = conn.Close()
++				close(serverClosed)
++			}))
++			defer server.Close()
++
++			conn, _, errDial := websocket.DefaultDialer.Dial("ws"+server.URL[len("http"):], nil)
++			if errDial != nil {
++				t.Fatalf("dial websocket: %v", errDial)
++			}
++			defer func() { _ = conn.Close() }()
++
++			sess := &codexWebsocketSession{
++				conn:       conn,
++				connCloser: newWebsocketConnectionCloser(conn),
++				readerConn: conn,
++			}
++			sess.configureConn(conn)
++			go test.readLoop(sess, conn)
++
++			<-serverClosed
++			deadline := time.NewTimer(time.Second)
++			ticker := time.NewTicker(time.Millisecond)
++			defer deadline.Stop()
++			defer ticker.Stop()
++			for {
++				sess.connMu.Lock()
++				invalidated := sess.conn == nil
++				sess.connMu.Unlock()
++				if invalidated {
++					break
++				}
++				select {
++				case <-ticker.C:
++				case <-deadline.C:
++					t.Fatal("upstream disconnect was not processed")
++				}
++			}
++
++			readCh := sess.activate(conn)
++			select {
++			case event := <-readCh:
++				if event.err == nil {
++					t.Fatalf("expected terminal upstream error, got event %#v", event)
++				}
++			case <-time.After(time.Second):
++				t.Fatal("activation after upstream disconnect blocked forever")
++			}
++		})
++	}
++}
+diff --git a/internal/runtime/executor/xai_websockets_executor.go b/internal/runtime/executor/xai_websockets_executor.go
+--- a/internal/runtime/executor/xai_websockets_executor.go
++++ b/internal/runtime/executor/xai_websockets_executor.go
+@@ -1229,6 +1229,7 @@ func (e *XAIWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, co
+ 	for {
+ 		msgType, payload, errRead := conn.ReadMessage()
+ 		if errRead != nil {
++			sess.markTerminalError(conn, errRead)
+ 			invalidate := func() {
+ 				e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
+ 			}
+@@ -1249,6 +1250,7 @@ func (e *XAIWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, co
+ 		if msgType != websocket.TextMessage {
+ 			if msgType == websocket.BinaryMessage {
+ 				errBinary := fmt.Errorf("xai websockets executor: unexpected binary message")
++				sess.markTerminalError(conn, errBinary)
+ 				invalidate := func() {
+ 					e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary)
+ 				}
+diff --git a/sdk/api/handlers/openai/openai_responses_interrupt_test.go b/sdk/api/handlers/openai/openai_responses_interrupt_test.go
+new file mode 100644
+--- /dev/null
++++ b/sdk/api/handlers/openai/openai_responses_interrupt_test.go
+@@ -0,0 +1,485 @@
++package openai
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"maps"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/gin-gonic/gin"
++	"github.com/gorilla/websocket"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
++	runtimeexecutor "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
++	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
++	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
++	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executionregistry"
++	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
++	"github.com/tidwall/gjson"
++)
++
++func TestResponsesInterruptInFlight(t *testing.T) {
++	interrupt := []byte(`{"type":"response.interrupt","response_id":"r1","mode":"discard_partial_items","extension":"keep"}`)
++	var connections atomic.Int32
++	upstreamDone := make(chan struct{})
++	var upstreamDoneOnce sync.Once
++	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		connections.Add(1)
++		defer upstreamDoneOnce.Do(func() { close(upstreamDone) })
++		c, errUpgrade := (&websocket.Upgrader{}).Upgrade(w, r, nil)
++		if errUpgrade != nil {
++			t.Errorf("upgrade upstream: %v", errUpgrade)
++			return
++		}
++		defer func() { _ = c.Close() }()
++		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
++		read := func() []byte {
++			_, payload, errRead := c.ReadMessage()
++			if errRead != nil {
++				t.Errorf("upstream read: %v", errRead)
++			}
++			return payload
++		}
++		write := func(payload string) {
++			if errWrite := c.WriteMessage(websocket.TextMessage, []byte(payload)); errWrite != nil {
++				t.Errorf("upstream write: %v", errWrite)
++			}
++		}
++		if payload := read(); gjson.GetBytes(payload, "type").String() != "response.create" {
++			t.Errorf("expected response.create, got %s", payload)
++			return
++		}
++		write(`{"type":"response.created","response":{"id":"r1"}}`)
++		if payload := read(); !bytes.Equal(payload, interrupt) {
++			t.Errorf("interrupt changed: %s", payload)
++			return
++		}
++		write(`{"type":"response.incomplete","response":{"id":"r1","status":"incomplete","incomplete_details":{"reason":"interrupted"},"usage":{"output_tokens":7},"output":[]}}`)
++		if payload := read(); gjson.GetBytes(payload, "type").String() != "response.create" {
++			t.Errorf("expected follow-up response.create, got %s", payload)
++			return
++		}
++		write(`{"type":"response.created","response":{"id":"r2"}}`)
++		write(`{"type":"response.completed","response":{"id":"r2","status":"completed","output":[]}}`)
++		_, _, _ = c.ReadMessage()
++	}))
++	defer upstream.Close()
++
++	cfg := &config.Config{}
++	manager := coreauth.NewManager(nil, nil, nil)
++	manager.SetConfig(cfg)
++	manager.RegisterExecutor(runtimeexecutor.NewCodexAutoExecutor(cfg))
++	authID := "interrupt-false"
++	model := "interrupt-model-" + authID
++	_, errRegister := manager.Register(context.Background(), &coreauth.Auth{
++		ID:       authID,
++		Provider: "codex",
++		Status:   coreauth.StatusActive,
++		Attributes: map[string]string{
++			"api_key":    "test-key",
++			"base_url":   upstream.URL,
++			"websockets": "true",
++		},
++	})
++	if errRegister != nil {
++		t.Fatal(errRegister)
++	}
++	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
++	defer registry.GetGlobalRegistry().UnregisterClient(authID)
++
++	handler := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&cfg.SDKConfig, manager))
++	router := gin.New()
++	router.GET("/v1/responses", handler.ResponsesWebsocket)
++	downstream := httptest.NewServer(router)
++	defer downstream.Close()
++
++	client, _, errDial := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(downstream.URL, "http")+"/v1/responses", nil)
++	if errDial != nil {
++		t.Fatal(errDial)
++	}
++	defer func() { _ = client.Close() }()
++	_ = client.SetReadDeadline(time.Now().Add(8 * time.Second))
++	send := func(payload []byte) {
++		t.Helper()
++		if errSend := client.WriteMessage(websocket.TextMessage, payload); errSend != nil {
++			t.Fatal(errSend)
++		}
++	}
++	expect := func(event string) {
++		t.Helper()
++		_, payload, errRead := client.ReadMessage()
++		if errRead != nil {
++			t.Fatal(errRead)
++		}
++		if got := gjson.GetBytes(payload, "type").String(); got != event {
++			t.Fatalf("expected %s, got %s", event, payload)
++		}
++	}
++
++	send([]byte(`{"type":"response.interrupt"}`))
++	expect("error")
++	send(interrupt)
++	expect("error")
++	if connections.Load() != 0 {
++		t.Fatal("idle interrupt opened an upstream connection")
++	}
++
++	send([]byte(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[]}`, model)))
++	expect("response.created")
++	send([]byte(`{"type":"response.interrupt","response_id":42}`))
++	expect("error")
++	auth, _ := manager.GetByID(authID)
++	auth.Disabled = true
++	if _, errUpdate := manager.Update(context.Background(), auth); errUpdate != nil {
++		t.Fatal(errUpdate)
++	}
++	send(interrupt)
++	expect("error")
++	auth.Disabled = false
++	if _, errUpdate := manager.Update(context.Background(), auth); errUpdate != nil {
++		t.Fatal(errUpdate)
++	}
++	send(interrupt)
++	expect("response.incomplete")
++	send([]byte(fmt.Sprintf(`{"type":"response.create","model":%q,"previous_response_id":"r1","input":[]}`, model)))
++	expect("response.created")
++	expect("response.completed")
++	_ = client.Close()
++	select {
++	case <-upstreamDone:
++	case <-time.After(5 * time.Second):
++		t.Fatal("upstream did not close")
++	}
++	if got := connections.Load(); got != 1 {
++		t.Fatalf("upstream connections=%d, want 1", got)
++	}
++}
++
++type homeInterruptDispatcher struct{}
++
++func (homeInterruptDispatcher) HeartbeatOK() bool { return true }
++
++func (homeInterruptDispatcher) RPopAuth(context.Context, string, string, http.Header, int) ([]byte, error) {
++	return json.Marshal(coreauth.Auth{
++		ID:       "home-interrupt-auth",
++		Provider: "codex",
++		Status:   coreauth.StatusActive,
++		Attributes: map[string]string{
++			"websockets": "true",
++		},
++	})
++}
++
++func (homeInterruptDispatcher) AbortAmbiguousDispatch() {}
++
++type homeInterruptExecutor struct {
++	mu          sync.Mutex
++	metadata    []map[string]any
++	interrupted [][]byte
++	release     chan struct{}
++	releaseOnce sync.Once
++}
++
++func (*homeInterruptExecutor) Identifier() string { return "codex" }
++
++func (*homeInterruptExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
++	return coreexecutor.Response{}, errors.New("not implemented")
++}
++
++func (e *homeInterruptExecutor) ExecuteStream(ctx context.Context, _ *coreauth.Auth, _ coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
++	e.mu.Lock()
++	e.metadata = append(e.metadata, maps.Clone(opts.Metadata))
++	if e.release == nil {
++		e.release = make(chan struct{})
++	}
++	release := e.release
++	e.mu.Unlock()
++	if lifecycle, ok := opts.ExecutionLifecycle.(interface{ Retain() }); ok {
++		lifecycle.Retain()
++	}
++	chunks := make(chan coreexecutor.StreamChunk, 2)
++	go func() {
++		defer close(chunks)
++		chunks <- coreexecutor.StreamChunk{Payload: []byte(`{"type":"response.created","response":{"id":"r1"}}`)}
++		select {
++		case <-release:
++		case <-ctx.Done():
++			return
++		}
++		chunks <- coreexecutor.StreamChunk{Payload: []byte(`{"type":"response.completed","response":{"id":"r1","status":"completed","output":[]}}`)}
++	}()
++	return &coreexecutor.StreamResult{Chunks: chunks}, nil
++}
++
++func (*homeInterruptExecutor) Refresh(context.Context, *coreauth.Auth) (*coreauth.Auth, error) {
++	return nil, errors.New("not implemented")
++}
++
++func (*homeInterruptExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
++	return coreexecutor.Response{}, errors.New("not implemented")
++}
++
++func (*homeInterruptExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
++	return nil, errors.New("not implemented")
++}
++
++func (e *homeInterruptExecutor) InterruptExecutionSession(ctx context.Context, sessionID string, payload []byte) error {
++	if !coreexecutor.WebsocketAuthEnabled(ctx, "home-interrupt-auth") {
++		return fmt.Errorf("websocket credential is no longer enabled")
++	}
++	e.mu.Lock()
++	var want string
++	if len(e.metadata) > 0 {
++		want, _ = e.metadata[0][coreexecutor.ExecutionSessionMetadataKey].(string)
++	}
++	e.mu.Unlock()
++	if want == "" || sessionID != want {
++		return fmt.Errorf("interrupt session = %q, want %q", sessionID, want)
++	}
++	e.mu.Lock()
++	e.interrupted = append(e.interrupted, bytes.Clone(payload))
++	e.mu.Unlock()
++	e.releaseOnce.Do(func() {
++		if e.release != nil {
++			close(e.release)
++		}
++	})
++	return nil
++}
++
++type blockingHTTPInterruptExecutor struct {
++	calls    atomic.Int32
++	canceled atomic.Bool
++}
++
++func (*blockingHTTPInterruptExecutor) Identifier() string { return "codex" }
++
++func (*blockingHTTPInterruptExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
++	return coreexecutor.Response{}, errors.New("not implemented")
++}
++
++func (e *blockingHTTPInterruptExecutor) ExecuteStream(ctx context.Context, _ *coreauth.Auth, _ coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
++	call := e.calls.Add(1)
++	chunks := make(chan coreexecutor.StreamChunk, 2)
++	go func() {
++		defer close(chunks)
++		if call > 1 {
++			chunks <- coreexecutor.StreamChunk{Payload: []byte(`{"type":"response.created","response":{"id":"r-http-2"}}`)}
++			chunks <- coreexecutor.StreamChunk{Payload: []byte(`{"type":"response.completed","response":{"id":"r-http-2","status":"completed","output":[]}}`)}
++			return
++		}
++		chunks <- coreexecutor.StreamChunk{Payload: []byte(`{"type":"response.created","response":{"id":"r-http"}}`)}
++		chunks <- coreexecutor.StreamChunk{Payload: []byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"partial","type":"function_call","call_id":"discarded-call","name":"tool","arguments":"{}"}}`)}
++		<-ctx.Done()
++		e.canceled.Store(true)
++	}()
++	return &coreexecutor.StreamResult{Chunks: chunks}, nil
++}
++
++func (*blockingHTTPInterruptExecutor) Refresh(context.Context, *coreauth.Auth) (*coreauth.Auth, error) {
++	return nil, errors.New("not implemented")
++}
++
++func (*blockingHTTPInterruptExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
++	return coreexecutor.Response{}, errors.New("not implemented")
++}
++
++func (*blockingHTTPInterruptExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
++	return nil, errors.New("not implemented")
++}
++
++func (*blockingHTTPInterruptExecutor) InterruptExecutionSession(context.Context, string, []byte) error {
++	return coreexecutor.ErrNoActiveUpstreamWebsocket
++}
++
++func TestResponsesInterruptStopsHTTPUpstream(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	executor := &blockingHTTPInterruptExecutor{}
++	manager := coreauth.NewManager(nil, nil, nil)
++	manager.SetConfig(&config.Config{})
++	manager.RegisterExecutor(executor)
++	const authID = "interrupt-http-auth"
++	const model = "interrupt-http-model"
++	_, errRegister := manager.Register(context.Background(), &coreauth.Auth{
++		ID:         authID,
++		Provider:   "codex",
++		Status:     coreauth.StatusActive,
++		Attributes: map[string]string{"api_key": "test-key"},
++	})
++	if errRegister != nil {
++		t.Fatal(errRegister)
++	}
++	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
++	defer registry.GetGlobalRegistry().UnregisterClient(authID)
++
++	handler := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&config.SDKConfig{}, manager))
++	router := gin.New()
++	router.GET("/v1/responses", handler.ResponsesWebsocket)
++	downstream := httptest.NewServer(router)
++	defer downstream.Close()
++	client, _, errDial := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(downstream.URL, "http")+"/v1/responses", nil)
++	if errDial != nil {
++		t.Fatal(errDial)
++	}
++	defer func() { _ = client.Close() }()
++	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
++	if errSend := client.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[]}`, model))); errSend != nil {
++		t.Fatal(errSend)
++	}
++	_, created, errRead := client.ReadMessage()
++	if errRead != nil {
++		t.Fatal(errRead)
++	}
++	if got := gjson.GetBytes(created, "type").String(); got != "response.created" {
++		t.Fatalf("expected response.created, got %s", created)
++	}
++	_, partial, errPartial := client.ReadMessage()
++	if errPartial != nil || gjson.GetBytes(partial, "type").String() != "response.output_item.added" {
++		t.Fatalf("missing partial item: %s, %v", partial, errPartial)
++	}
++	if errSend := client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.interrupt","response_id":"wrong"}`)); errSend != nil {
++		t.Fatal(errSend)
++	}
++	_, mismatch, errMismatch := client.ReadMessage()
++	if errMismatch != nil || gjson.GetBytes(mismatch, "type").String() != "error" {
++		t.Fatalf("mismatch = %s, %v", mismatch, errMismatch)
++	}
++	if executor.canceled.Load() {
++		t.Fatal("mismatched interrupt canceled active response")
++	}
++	if errSend := client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.interrupt","response_id":"r-http","mode":"discard_partial_items"}`)); errSend != nil {
++		t.Fatal(errSend)
++	}
++	_, interrupted, errInterrupted := client.ReadMessage()
++	if errInterrupted != nil {
++		t.Fatal(errInterrupted)
++	}
++	if got := gjson.GetBytes(interrupted, "type").String(); got != "response.incomplete" {
++		t.Fatalf("expected response.incomplete, got %s", interrupted)
++	}
++	if got := gjson.GetBytes(interrupted, "response.id").String(); got != "r-http" {
++		t.Fatalf("interrupted response id = %q", got)
++	}
++	if got := gjson.GetBytes(interrupted, "response.incomplete_details.reason").String(); got != "interrupted" {
++		t.Fatalf("interrupt reason = %q, payload %s", got, interrupted)
++	}
++	if got := gjson.GetBytes(interrupted, "response.output").Raw; got != "[]" {
++		t.Fatalf("discarded output = %s", got)
++	}
++	if !executor.canceled.Load() {
++		t.Fatal("http upstream was not canceled")
++	}
++	if errSend := client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.interrupt","response_id":"r-http"}`)); errSend != nil {
++		t.Fatal(errSend)
++	}
++	if errSend := client.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.create","model":%q,"previous_response_id":"r-http","input":[]}`, model))); errSend != nil {
++		t.Fatal(errSend)
++	}
++	_, followCreated, errFollow := client.ReadMessage()
++	if errFollow != nil {
++		t.Fatal(errFollow)
++	}
++	if got := gjson.GetBytes(followCreated, "type").String(); got != "response.created" {
++		t.Fatalf("expected follow-up response.created, got %s", followCreated)
++	}
++	_, followDone, errDone := client.ReadMessage()
++	if errDone != nil {
++		t.Fatal(errDone)
++	}
++	if got := gjson.GetBytes(followDone, "type").String(); got != "response.completed" {
++		t.Fatalf("expected follow-up response.completed, got %s", followDone)
++	}
++}
++
++func TestResponsesInterruptUsesHomeSessionAuth(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	manager := coreauth.NewManager(nil, nil, nil)
++	manager.SetConfig(&config.Config{Home: config.HomeConfig{Enabled: true}})
++	manager.PublishHomeDispatch(homeInterruptDispatcher{}, executionregistry.New(), 1)
++	executor := &homeInterruptExecutor{}
++	manager.RegisterExecutor(executor)
++	const authID = "home-interrupt-auth"
++	const model = "home-interrupt-model"
++	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
++	defer registry.GetGlobalRegistry().UnregisterClient(authID)
++
++	handler := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&config.SDKConfig{}, manager))
++	router := gin.New()
++	router.GET("/v1/responses", handler.ResponsesWebsocket)
++	downstream := httptest.NewServer(router)
++	defer downstream.Close()
++
++	client, _, errDial := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(downstream.URL, "http")+"/v1/responses", nil)
++	if errDial != nil {
++		t.Fatal(errDial)
++	}
++	defer func() { _ = client.Close() }()
++	_ = client.SetReadDeadline(time.Now().Add(8 * time.Second))
++	if errSend := client.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[]}`, model))); errSend != nil {
++		t.Fatal(errSend)
++	}
++	_, payload, errRead := client.ReadMessage()
++	if errRead != nil {
++		t.Fatal(errRead)
++	}
++	if got := gjson.GetBytes(payload, "type").String(); got != "response.created" {
++		t.Fatalf("expected response.created, got %s", payload)
++	}
++	if _, ok := manager.GetByID(authID); ok {
++		t.Fatal("home credential leaked into the global auth map")
++	}
++	executor.mu.Lock()
++	if len(executor.metadata) != 1 {
++		executor.mu.Unlock()
++		t.Fatalf("executor calls = %d, want 1", len(executor.metadata))
++	}
++	sessionID, _ := executor.metadata[0][coreexecutor.ExecutionSessionMetadataKey].(string)
++	executor.mu.Unlock()
++	if _, ok := manager.GetExecutionSessionAuthByID(sessionID, authID); !ok {
++		t.Fatal("home session auth was not staged")
++	}
++
++	interrupt := []byte(`{"type":"response.interrupt","response_id":"r1","mode":"discard_partial_items","extension":"keep"}`)
++	if errSend := client.WriteMessage(websocket.TextMessage, interrupt); errSend != nil {
++		t.Fatal(errSend)
++	}
++	_, completed, errCompleted := client.ReadMessage()
++	if errCompleted != nil {
++		t.Fatal(errCompleted)
++	}
++	if got := gjson.GetBytes(completed, "type").String(); got != "response.completed" {
++		t.Fatalf("expected response.completed after interrupt, got %s", completed)
++	}
++	executor.mu.Lock()
++	gotInterrupt := append([][]byte(nil), executor.interrupted...)
++	executor.mu.Unlock()
++	if len(gotInterrupt) != 1 || !bytes.Equal(gotInterrupt[0], interrupt) {
++		t.Fatalf("interrupt payload = %#v, want %s", gotInterrupt, interrupt)
++	}
++	if errSend := client.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[]}`, model))); errSend != nil {
++		t.Fatal(errSend)
++	}
++	_, followCreated, errFollow := client.ReadMessage()
++	if errFollow != nil {
++		t.Fatal(errFollow)
++	}
++	if got := gjson.GetBytes(followCreated, "type").String(); got != "response.created" {
++		t.Fatalf("expected follow-up response.created, got %s", followCreated)
++	}
++	_, followDone, errDone := client.ReadMessage()
++	if errDone != nil {
++		t.Fatal(errDone)
++	}
++	if got := gjson.GetBytes(followDone, "type").String(); got != "response.completed" {
++		t.Fatalf("expected follow-up response.completed, got %s", followDone)
++	}
++}
+diff --git a/sdk/api/handlers/openai/openai_responses_late_interrupt_test.go b/sdk/api/handlers/openai/openai_responses_late_interrupt_test.go
+new file mode 100644
+--- /dev/null
++++ b/sdk/api/handlers/openai/openai_responses_late_interrupt_test.go
+@@ -0,0 +1,244 @@
++package openai
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/gin-gonic/gin"
++	"github.com/gorilla/websocket"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
++	runtimeexecutor "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
++	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
++	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
++	"github.com/tidwall/gjson"
++)
++
++func TestResponsesLateInterruptDoesNotPoisonNextCreate(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	var connections atomic.Int32
++	httpCanceled := make(chan struct{})
++	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
++			w.Header().Set("Content-Type", "text/event-stream")
++			if _, errWrite := fmt.Fprint(w, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r-http\"}}\n\n"); errWrite != nil {
++				t.Errorf("HTTP created: %v", errWrite)
++				return
++			}
++			w.(http.Flusher).Flush()
++			<-r.Context().Done()
++			close(httpCanceled)
++			return
++		}
++		connections.Add(1)
++		conn, errUpgrade := (&websocket.Upgrader{}).Upgrade(w, r, nil)
++		if errUpgrade != nil {
++			t.Errorf("upgrade: %v", errUpgrade)
++			return
++		}
++		defer func() {
++			if errClose := conn.Close(); errClose != nil {
++				t.Errorf("close upstream: %v", errClose)
++			}
++		}()
++		for _, id := range []string{"r1", "r2"} {
++			_, create, errRead := conn.ReadMessage()
++			if errRead != nil {
++				return
++			}
++			if gjson.GetBytes(create, "type").String() != "response.create" {
++				t.Errorf("terminal interrupt reached upstream: %s", create)
++				return
++			}
++			if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.created","response":{"id":%q}}`, id))); errWrite != nil {
++				t.Errorf("created: %v", errWrite)
++				return
++			}
++			if id == "r2" {
++				_, interrupt, errInterrupt := conn.ReadMessage()
++				if errInterrupt != nil {
++					return
++				}
++				if gjson.GetBytes(interrupt, "response_id").String() != "r2" {
++					t.Errorf("old interrupt affected active r2: %s", interrupt)
++					return
++				}
++			}
++			if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":%q,"status":"completed","output":[]}}`, id))); errWrite != nil {
++				t.Errorf("completed: %v", errWrite)
++				return
++			}
++		}
++		_, _, _ = conn.ReadMessage()
++	}))
++	defer upstream.Close()
++	cfg := &config.Config{}
++	cfg.RequestLog = true
++	manager := coreauth.NewManager(nil, nil, nil)
++	manager.SetConfig(cfg)
++	manager.RegisterExecutor(runtimeexecutor.NewCodexAutoExecutor(cfg))
++	const authID = "late-interrupt-integration"
++	const model = "late-interrupt-model"
++	_, errRegister := manager.Register(context.Background(), &coreauth.Auth{
++		ID: authID, Provider: "codex", Status: coreauth.StatusActive,
++		Attributes: map[string]string{"api_key": "synthetic-key", "base_url": upstream.URL, "websockets": "true"},
++	})
++	if errRegister != nil {
++		t.Fatal(errRegister)
++	}
++	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
++	defer registry.GetGlobalRegistry().UnregisterClient(authID)
++	handler := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&cfg.SDKConfig, manager))
++	timelines := make(chan string, 1)
++	router := gin.New()
++	router.GET("/v1/responses", func(c *gin.Context) {
++		handler.ResponsesWebsocket(c)
++		body, _ := c.Get(wsTimelineBodyKey)
++		data, _ := body.([]byte)
++		timelines <- string(data)
++	})
++	downstream := httptest.NewServer(router)
++	defer downstream.Close()
++	client, _, errDial := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(downstream.URL, "http")+"/v1/responses", nil)
++	if errDial != nil {
++		t.Fatal(errDial)
++	}
++	clientClosed := false
++	defer func() {
++		if !clientClosed {
++			if errClose := client.Close(); errClose != nil {
++				t.Errorf("close client: %v", errClose)
++			}
++		}
++	}()
++	if errDeadline := client.SetReadDeadline(time.Now().Add(5 * time.Second)); errDeadline != nil {
++		t.Fatal(errDeadline)
++	}
++	send := func(payload string) {
++		t.Helper()
++		if errWrite := client.WriteMessage(websocket.TextMessage, []byte(payload)); errWrite != nil {
++			t.Fatal(errWrite)
++		}
++	}
++	expect := func(event, id string) {
++		t.Helper()
++		_, payload, errRead := client.ReadMessage()
++		if errRead != nil {
++			t.Fatal(errRead)
++		}
++		if gjson.GetBytes(payload, "type").String() != event || gjson.GetBytes(payload, "response.id").String() != id {
++			t.Fatalf("expected %s for %s, got %s", event, id, payload)
++		}
++	}
++	send(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[]}`, model))
++	expect("response.created", "r1")
++	expect("response.completed", "r1")
++	send(`{"type":"response.interrupt","response_id":"unknown"}`)
++	expect("error", "")
++	send(`{"type":"response.interrupt","response_id":"r1","mode":"discard_partial_items"}`)
++	send(fmt.Sprintf(`{"type":"response.create","model":%q,"previous_response_id":"r1","input":[]}`, model))
++	expect("response.created", "r2")
++	for i := 0; i < 2; i++ {
++		send(`{"type":"response.interrupt","response_id":"r1","mode":"discard_partial_items"}`)
++	}
++	send(`{"type":"response.interrupt","response_id":"r2","mode":"discard_partial_items"}`)
++	expect("response.completed", "r2")
++	auth, _ := manager.GetByID(authID)
++	auth.Attributes["websockets"] = "false"
++	if _, errUpdate := manager.Update(context.Background(), auth); errUpdate != nil {
++		t.Fatal(errUpdate)
++	}
++	send(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[{"role":"user","content":"next turn"}]}`, model))
++	expect("response.created", "r-http")
++	send(`{"type":"response.interrupt","response_id":"r1"}`)
++	send(`{"type":"response.interrupt","response_id":"r-http"}`)
++	expect("response.incomplete", "r-http")
++	select {
++	case <-httpCanceled:
++	case <-time.After(3 * time.Second):
++		t.Fatal("HTTP fallback was not canceled locally")
++	}
++	if got := connections.Load(); got != 1 {
++		t.Fatalf("connections = %d, want one retained upstream", got)
++	}
++	if errClose := client.Close(); errClose != nil {
++		t.Fatal(errClose)
++	}
++	clientClosed = true
++	select {
++	case timeline := <-timelines:
++		for _, outcome := range []string{"handled", "local_http", "rejected"} {
++			if !strings.Contains(timeline, `"outcome":"`+outcome+`"`) {
++				t.Errorf("missing interrupt outcome %s", outcome)
++			}
++		}
++	case <-time.After(3 * time.Second):
++		t.Fatal("interrupt timeline was not finalized")
++	}
++}
++
++func TestResponsesInterruptDiagnosticsAreSanitized(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	cfg := &config.SDKConfig{RequestLog: true}
++	handler := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(cfg, nil))
++	timelines := make(chan string, 1)
++	router := gin.New()
++	router.GET("/v1/responses", func(c *gin.Context) {
++		handler.ResponsesWebsocket(c)
++		body, _ := c.Get(wsTimelineBodyKey)
++		data, _ := body.([]byte)
++		timelines <- string(data)
++	})
++	downstream := httptest.NewServer(router)
++	defer downstream.Close()
++	client, _, errDial := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(downstream.URL, "http")+"/v1/responses", nil)
++	if errDial != nil {
++		t.Fatal(errDial)
++	}
++	clientClosed := false
++	defer func() {
++		if !clientClosed {
++			if errClose := client.Close(); errClose != nil {
++				t.Errorf("close client: %v", errClose)
++			}
++		}
++	}()
++	if errWrite := client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.interrupt","response_id":"private-id-token","mode":"secret-mode","authorization":"Bearer secret-credential","input":"private-conversation"}`)); errWrite != nil {
++		t.Fatal(errWrite)
++	}
++	if errDeadline := client.SetReadDeadline(time.Now().Add(3 * time.Second)); errDeadline != nil {
++		t.Fatal(errDeadline)
++	}
++	_, payload, errRead := client.ReadMessage()
++	if errRead != nil {
++		t.Fatal(errRead)
++	}
++	if gjson.GetBytes(payload, "type").String() != "error" {
++		t.Fatalf("unknown interrupt must still fail: %s", payload)
++	}
++	if errClose := client.Close(); errClose != nil {
++		t.Fatal(errClose)
++	}
++	clientClosed = true
++	select {
++	case timeline := <-timelines:
++		for _, event := range []string{"Event: websocket.interrupt", "Event: websocket.interrupt.outcome", `"outcome":"rejected"`} {
++			if !strings.Contains(timeline, event) {
++				t.Errorf("missing %s in timeline: %s", event, timeline)
++			}
++		}
++		for _, secret := range []string{"private-id-token", "secret-mode", "secret-credential", "private-conversation"} {
++			if strings.Contains(timeline, secret) {
++				t.Errorf("interrupt diagnostic leaked %s", secret)
++			}
++		}
++	case <-time.After(3 * time.Second):
++		t.Fatal("timeline was not finalized")
++	}
++}
+diff --git a/sdk/api/handlers/openai/openai_responses_websocket.go b/sdk/api/handlers/openai/openai_responses_websocket.go
+--- a/sdk/api/handlers/openai/openai_responses_websocket.go
++++ b/sdk/api/handlers/openai/openai_responses_websocket.go
+@@ -270,14 +270,21 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
+ 	}
+ 	writer := newResponsesWebsocketWriter(conn)
+ 	passthroughSessionID := uuid.NewString()
++	requestLogEnabled := h != nil && h.Cfg != nil && h.Cfg.RequestLog
++	wsTimelineLog := newWebsocketTimelineLog(requestLogEnabled, websocketTimelineSourceFromContext(c))
++	socketCtx, cancelSocket := context.WithCancelCause(c.Request.Context())
++	defer cancelSocket(nil)
++	c.Request = c.Request.WithContext(socketCtx)
++	localInterrupt := newResponsesLocalInterrupt()
++	input, inputDone := readResponsesWebsocketInput(socketCtx, cancelSocket, conn, func(payload []byte) error {
++		return h.forwardResponsesWebsocketInterrupt(socketCtx, passthroughSessionID, payload)
++	}, localInterrupt, writer, wsTimelineLog)
++
+ 	downstreamSessionKey := websocketDownstreamSessionKey(c.Request)
+ 	retainResponsesWebsocketToolCaches(downstreamSessionKey)
+ 	clientIP := websocketClientAddress(c)
+ 	log.Infof("responses websocket: client connected id=%s remote=%s", passthroughSessionID, clientIP)
+ 
+-	requestLogEnabled := h != nil && h.Cfg != nil && h.Cfg.RequestLog
+-	wsTimelineLog := newWebsocketTimelineLog(requestLogEnabled, websocketTimelineSourceFromContext(c))
+-
+ 	wsDone := make(chan struct{})
+ 	defer close(wsDone)
+ 
+@@ -319,10 +326,12 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
+ 			h.AuthManager.CloseExecutionSession(passthroughSessionID)
+ 			log.Infof("responses websocket: upstream execution session closed id=%s", passthroughSessionID)
+ 		}
+-		wsTimelineLog.SetContext(c)
++		cancelSocket(nil)
+ 		if errClose := conn.Close(); errClose != nil && !isWebsocketConnectionClosedError(errClose) {
+ 			log.Warnf("responses websocket: close connection error: %v", errClose)
+ 		}
++		<-inputDone
++		wsTimelineLog.SetContext(c)
+ 	}()
+ 
+ 	var lastRequest []byte
+@@ -385,7 +394,22 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
+ 	}
+ 
+ 	for {
+-		msgType, payload, errReadMessage := conn.ReadMessage()
++		var msgType int
++		var payload []byte
++		var errReadMessage error
++		select {
++		case message, ok := <-input:
++			if !ok {
++				errReadMessage = context.Cause(socketCtx)
++			} else {
++				msgType, payload = websocket.TextMessage, message
++			}
++		case <-socketCtx.Done():
++			errReadMessage = context.Cause(socketCtx)
++		}
++		if errReadMessage != nil && errors.Is(errReadMessage, context.Canceled) {
++			return
++		}
+ 		if errReadMessage != nil {
+ 			wsTerminateErr = errReadMessage
+ 			if websocket.IsCloseError(errReadMessage, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived) {
+@@ -615,8 +639,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
+ 			wsTimelineLog,
+ 			passthroughSessionID,
+ 			responsesWebsocketForwardOptions{
+-				toolCacheTurn: toolCacheTurn,
+-				suppressError: replayPinnedAuthFailure,
++				toolCacheTurn:  toolCacheTurn,
++				suppressError:  replayPinnedAuthFailure,
++				localInterrupt: localInterrupt,
+ 			},
+ 		)
+ 		if errForward != nil {
+diff --git a/sdk/api/handlers/openai/openai_responses_websocket_forward.go b/sdk/api/handlers/openai/openai_responses_websocket_forward.go
+--- a/sdk/api/handlers/openai/openai_responses_websocket_forward.go
++++ b/sdk/api/handlers/openai/openai_responses_websocket_forward.go
+@@ -24,6 +24,7 @@ type responsesWebsocketForwardOptions struct {
+ 	toolCacheTurn     *responsesWebsocketToolCacheTurn
+ 	suppressError     func(*interfaces.ErrorMessage) bool
+ 	keepAliveInterval *time.Duration
++	localInterrupt    *responsesLocalInterrupt
+ }
+ 
+ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
+@@ -66,9 +67,15 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
+ 		defer keepAliveTicker.Stop()
+ 		keepAliveC = keepAliveTicker.C
+ 	}
++	opts.localInterrupt.begin()
++	defer opts.localInterrupt.end()
++	localFrames := opts.localInterrupt.framesChan()
+ 
+ 	for {
+ 		select {
++		case interruptPayload := <-localFrames:
++			opts.localInterrupt.recordTerminal(gjson.GetBytes(interruptPayload, "response_id").String())
++			return completeResponsesWebsocketLocalInterrupt(writer, wsTimelineLog, cancel, interruptPayload, outputItemsByIndex, outputItemsFallback, pendingToolCallIDs)
+ 		case <-c.Request.Context().Done():
+ 			cancel(c.Request.Context().Err())
+ 			return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, c.Request.Context().Err()
+@@ -140,6 +147,9 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
+ 			for i := range payloads {
+ 				collectResponsesWebsocketOutputItem(payloads[i], outputItemsByIndex, &outputItemsFallback)
+ 				eventType := gjson.GetBytes(payloads[i], "type").String()
++				if eventType == "response.created" {
++					opts.localInterrupt.responseCreated(gjson.GetBytes(payloads[i], "response.id").String())
++				}
+ 				if isResponsesWebsocketCompletionEvent(eventType) {
+ 					payloads[i] = restoreResponsesWebsocketCompletionOutput(payloads[i], outputItemsByIndex, outputItemsFallback)
+ 				}
+@@ -159,10 +169,11 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
+ 						cancel(payloadErrMsg.Error)
+ 						return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), payloadErrMsg, nil
+ 					}
+-				} else if isResponsesWebsocketCompletionEvent(eventType) {
++				} else if isResponsesWebsocketCompletionEvent(eventType) || eventType == "response.incomplete" {
+ 					completed = true
+ 					completedOutput = responseCompletedOutputFromPayload(payloads[i], outputItemsByIndex, outputItemsFallback)
+ 					completedResponseID = responseCompletedIDFromPayload(payloads[i])
++					opts.localInterrupt.recordTerminal(completedResponseID)
+ 				}
+ 				markAPIResponseTimestamp(c)
+ 				if payloadErrMsg != nil {
+@@ -208,6 +219,41 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
+ 	}
+ }
+ 
++func completeResponsesWebsocketLocalInterrupt(
++	writer *responsesWebsocketWriter,
++	wsTimelineLog websocketTimelineAppender,
++	cancel handlers.APIHandlerCancelFunc,
++	payload []byte,
++	outputItemsByIndex map[int64][]byte,
++	outputItemsFallback [][]byte,
++	pendingToolCallIDs map[string]struct{},
++) ([]byte, string, []string, *interfaces.ErrorMessage, error) {
++	responseID := strings.TrimSpace(gjson.GetBytes(payload, "response_id").String())
++	output := responseCompletedOutputFromPayload([]byte(`{"response":{"output":[]}}`), outputItemsByIndex, outputItemsFallback)
++	if gjson.GetBytes(payload, "mode").String() == "discard_partial_items" {
++		output = []byte("[]")
++		pendingToolCallIDs = nil
++	}
++	incomplete := []byte(`{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"interrupted"}}}`)
++	var errSet error
++	incomplete, errSet = sjson.SetBytes(incomplete, "response.id", responseID)
++	if errSet != nil {
++		cancel(errSet)
++		return output, responseID, sortedStringSet(pendingToolCallIDs), nil, errSet
++	}
++	incomplete, errSet = sjson.SetRawBytes(incomplete, "response.output", output)
++	if errSet != nil {
++		cancel(errSet)
++		return output, responseID, sortedStringSet(pendingToolCallIDs), nil, errSet
++	}
++	if errWrite := writeResponsesWebsocketPayload(writer, wsTimelineLog, incomplete, time.Now()); errWrite != nil {
++		cancel(errWrite)
++		return output, responseID, sortedStringSet(pendingToolCallIDs), nil, errWrite
++	}
++	cancel(context.Canceled)
++	return output, responseID, sortedStringSet(pendingToolCallIDs), nil, nil
++}
++
+ func responsesWebsocketErrorStatus(errMsg *interfaces.ErrorMessage) int {
+ 	if errMsg == nil {
+ 		return 0
+diff --git a/sdk/api/handlers/openai/openai_responses_websocket_input.go b/sdk/api/handlers/openai/openai_responses_websocket_input.go
+new file mode 100644
+--- /dev/null
++++ b/sdk/api/handlers/openai/openai_responses_websocket_input.go
+@@ -0,0 +1,215 @@
++package openai
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"net/http"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/gorilla/websocket"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
++	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
++	"github.com/tidwall/gjson"
++)
++
++type responsesLocalInterrupt struct {
++	mu                    sync.Mutex
++	active                bool
++	frames                chan []byte
++	terminalResponseIDs   map[string]struct{}
++	terminalResponseOrder []string
++	activeResponseID      string
++}
++
++func newResponsesLocalInterrupt() *responsesLocalInterrupt {
++	return &responsesLocalInterrupt{frames: make(chan []byte, 1), terminalResponseIDs: make(map[string]struct{})}
++}
++
++func (s *responsesLocalInterrupt) begin() {
++	if s == nil {
++		return
++	}
++	s.mu.Lock()
++	s.active = true
++	s.activeResponseID = ""
++	s.mu.Unlock()
++}
++
++func (s *responsesLocalInterrupt) end() {
++	if s == nil {
++		return
++	}
++	s.mu.Lock()
++	s.active = false
++	select {
++	case <-s.frames:
++	default:
++	}
++	s.mu.Unlock()
++}
++
++func (s *responsesLocalInterrupt) deliver(payload []byte) bool {
++	if s == nil {
++		return false
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if !s.active || s.activeResponseID != gjson.GetBytes(payload, "response_id").String() {
++		return false
++	}
++	select {
++	case s.frames <- bytes.Clone(payload):
++	default:
++	}
++	return true
++}
++
++func (s *responsesLocalInterrupt) responseCreated(responseID string) {
++	if s == nil {
++		return
++	}
++	s.mu.Lock()
++	s.activeResponseID = responseID
++	s.mu.Unlock()
++}
++func (s *responsesLocalInterrupt) recordTerminal(responseID string) {
++	if s == nil || responseID == "" {
++		return
++	}
++	s.mu.Lock()
++	if _, exists := s.terminalResponseIDs[responseID]; exists {
++		s.mu.Unlock()
++		return
++	}
++	if len(s.terminalResponseOrder) == 256 {
++		delete(s.terminalResponseIDs, s.terminalResponseOrder[0])
++		s.terminalResponseOrder = s.terminalResponseOrder[1:]
++	}
++	s.terminalResponseIDs[responseID] = struct{}{}
++	s.terminalResponseOrder = append(s.terminalResponseOrder, responseID)
++	s.mu.Unlock()
++}
++func (s *responsesLocalInterrupt) alreadyTerminal(payload []byte) bool {
++	responseID := gjson.GetBytes(payload, "response_id")
++	if s == nil || responseID.Type != gjson.String {
++		return false
++	}
++	s.mu.Lock()
++	_, terminal := s.terminalResponseIDs[responseID.String()]
++	s.mu.Unlock()
++	return terminal
++}
++func (s *responsesLocalInterrupt) framesChan() <-chan []byte {
++	if s == nil {
++		return nil
++	}
++	return s.frames
++}
++
++func readResponsesWebsocketInput(ctx context.Context, cancel context.CancelCauseFunc, conn *websocket.Conn, interrupt func([]byte) error, local *responsesLocalInterrupt, writer *responsesWebsocketWriter, timeline websocketTimelineAppender) (<-chan []byte, <-chan struct{}) {
++	input := make(chan []byte, 16)
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		defer close(input)
++		for {
++			kind, payload, errRead := conn.ReadMessage()
++			if errRead != nil {
++				cancel(errRead)
++				return
++			}
++			if kind != websocket.TextMessage && kind != websocket.BinaryMessage {
++				continue
++			}
++			if json.Valid(payload) && gjson.GetBytes(payload, "type").String() == "response.interrupt" {
++				appendResponsesInterruptDiagnostic(timeline, payload, "")
++				if local.alreadyTerminal(payload) {
++					appendResponsesInterruptDiagnostic(timeline, payload, "handled")
++					continue
++				}
++				errInterrupt := interrupt(payload)
++				switch {
++				case errInterrupt == nil:
++					appendResponsesInterruptDiagnostic(timeline, payload, "handled")
++					continue
++				case errors.Is(errInterrupt, cliproxyexecutor.ErrNoActiveUpstreamWebsocket) && local.deliver(payload):
++					appendResponsesInterruptDiagnostic(timeline, payload, "local_http")
++					continue
++				default:
++					appendResponsesInterruptDiagnostic(timeline, payload, "rejected")
++					_, errWrite := writeResponsesWebsocketError(writer, nil, &interfaces.ErrorMessage{
++						StatusCode: http.StatusBadRequest,
++						Error:      errInterrupt,
++					})
++					if errWrite != nil {
++						cancel(errWrite)
++						return
++					}
++					continue
++				}
++			}
++			select {
++			case input <- payload:
++			case <-ctx.Done():
++				return
++			}
++		}
++	}()
++	return input, done
++}
++
++func appendResponsesInterruptDiagnostic(timeline websocketTimelineAppender, payload []byte, outcome string) {
++	if timeline == nil {
++		return
++	}
++	idHash := sha256.Sum256([]byte(gjson.GetBytes(payload, "response_id").String()))
++	diagnostic := struct {
++		Type           string `json:"type"`
++		ResponseIDHash string `json:"response_id_hash"`
++		Outcome        string `json:"outcome,omitempty"`
++	}{Type: "response.interrupt", ResponseIDHash: fmt.Sprintf("%x", idHash[:8]), Outcome: outcome}
++	data, errMarshal := json.Marshal(diagnostic)
++	if errMarshal != nil {
++		return
++	}
++	event := "interrupt"
++	if outcome != "" {
++		event = "interrupt.outcome"
++	}
++	timeline.Append(event, data, time.Now())
++}
++
++func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocketInterrupt(ctx context.Context, sessionID string, payload []byte) error {
++	responseID := gjson.GetBytes(payload, "response_id")
++	if responseID.Type != gjson.String || strings.TrimSpace(responseID.String()) == "" {
++		return fmt.Errorf("response.interrupt requires response_id")
++	}
++	if h == nil || h.AuthManager == nil {
++		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
++	}
++	exec, ok := h.AuthManager.Executor("codex")
++	if !ok || exec == nil {
++		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
++	}
++	sender, ok := exec.(interface {
++		InterruptExecutionSession(context.Context, string, []byte) error
++	})
++	if !ok || sender == nil {
++		return fmt.Errorf("upstream executor does not support response.interrupt")
++	}
++	ctx = cliproxyexecutor.WithWebsocketAuthCheck(ctx, func(authID string) bool {
++		auth, found := h.AuthManager.GetByID(authID)
++		if !found || auth == nil {
++			auth, found = h.AuthManager.GetExecutionSessionAuthByID(sessionID, authID)
++		}
++		return found && auth != nil && !auth.Disabled && auth.Status != coreauth.StatusDisabled
++	})
++	return sender.InterruptExecutionSession(ctx, sessionID, payload)
++}
+diff --git a/sdk/api/handlers/openai/openai_responses_websocket_timeline.go b/sdk/api/handlers/openai/openai_responses_websocket_timeline.go
+--- a/sdk/api/handlers/openai/openai_responses_websocket_timeline.go
++++ b/sdk/api/handlers/openai/openai_responses_websocket_timeline.go
+@@ -6,6 +6,7 @@ import (
+ 	"io"
+ 	"net/http"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/gin-gonic/gin"
+@@ -26,6 +27,7 @@ type responsesWebsocketPinnedAuthState struct {
+ }
+ 
+ type websocketTimelineLog struct {
++	mu      sync.Mutex
+ 	enabled bool
+ 	source  *requestlogging.FileBodySource
+ 	builder *strings.Builder
+@@ -73,6 +75,12 @@ func (l *websocketTimelineLog) BeginRequest() {
+ 	if l == nil || !l.enabled || l.source == nil {
+ 		return
+ 	}
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	l.beginRequestLocked()
++}
++
++func (l *websocketTimelineLog) beginRequestLocked() {
+ 	l.closeCurrentPart()
+ 	part, errCreate := l.source.CreatePart("request")
+ 	if errCreate != nil {
+@@ -87,13 +95,15 @@ func (l *websocketTimelineLog) Append(eventType string, payload []byte, timestam
+ 	if l == nil || !l.enabled {
+ 		return
+ 	}
++	l.mu.Lock()
++	defer l.mu.Unlock()
+ 	data := formatWebsocketTimelineEvent(eventType, payload, timestamp)
+ 	if len(data) == 0 {
+ 		return
+ 	}
+ 	if l.source != nil {
+ 		if l.currentPart == nil {
+-			l.BeginRequest()
++			l.beginRequestLocked()
+ 		}
+ 		if l.currentPart == nil {
+ 			return
+@@ -114,6 +124,8 @@ func (l *websocketTimelineLog) SetContext(c *gin.Context) {
+ 	if l == nil || !l.enabled {
+ 		return
+ 	}
++	l.mu.Lock()
++	defer l.mu.Unlock()
+ 	l.closeCurrentPart()
+ 	if l.source != nil {
+ 		if l.source.HasPayload() {
+@@ -133,6 +145,8 @@ func (l *websocketTimelineLog) String() string {
+ 	if l == nil || !l.enabled {
+ 		return ""
+ 	}
++	l.mu.Lock()
++	defer l.mu.Unlock()
+ 	l.closeCurrentPart()
+ 	if l.source != nil {
+ 		data, errRead := l.source.Bytes()
+diff --git a/sdk/cliproxy/executor/websocket_input.go b/sdk/cliproxy/executor/websocket_input.go
+new file mode 100644
+--- /dev/null
++++ b/sdk/cliproxy/executor/websocket_input.go
+@@ -0,0 +1,18 @@
++package executor
++
++import (
++	"context"
++	"errors"
++)
++
++var ErrNoActiveUpstreamWebsocket = errors.New("no active upstream websocket for response.interrupt")
++
++type websocketAuthCheckKey struct{}
++
++func WithWebsocketAuthCheck(ctx context.Context, check func(string) bool) context.Context {
++	return context.WithValue(ctx, websocketAuthCheckKey{}, check)
++}
++func WebsocketAuthEnabled(ctx context.Context, authID string) bool {
++	check, _ := ctx.Value(websocketAuthCheckKey{}).(func(string) bool)
++	return check == nil || check(authID)
++}
+diff --git a/internal/runtime/executor/codex_websockets_session.go b/internal/runtime/executor/codex_websockets_session.go
+index 478b7ac..e221e41 100644
+--- a/internal/runtime/executor/codex_websockets_session.go
++++ b/internal/runtime/executor/codex_websockets_session.go
+@@ -64,13 +64,14 @@ type codexWebsocketSession struct {
+ 
+ 	writeMu sync.Mutex
+ 
+-	activeMu     sync.Mutex
+-	activeConn   *websocket.Conn
+-	activeCh     chan codexWebsocketRead
+-	activeDone   <-chan struct{}
+-	activeCancel context.CancelFunc
+-	terminalConn *websocket.Conn
+-	terminalErr  error
++	activeMu            sync.Mutex
++	activeConn          *websocket.Conn
++	activeCh            chan codexWebsocketRead
++	activeDone          <-chan struct{}
++	activeCancel        context.CancelFunc
++	activeBootstrapDone <-chan struct{}
++	terminalConn        *websocket.Conn
++	terminalErr         error
+ 
+ 	responseStateConn   *websocket.Conn
+ 	terminalResponseIDs map[string]struct{}
+@@ -108,6 +109,7 @@ func (s *codexWebsocketSession) setActiveLocked(conn *websocket.Conn, ch chan co
+ 	}
+ 	s.activeConn = conn
+ 	s.activeCh = ch
++	s.activeBootstrapDone = nil
+ 	if conn != nil && ch != nil {
+ 		activeCtx, activeCancel := context.WithCancel(context.Background())
+ 		s.activeDone = activeCtx.Done()
+@@ -116,6 +118,10 @@ func (s *codexWebsocketSession) setActiveLocked(conn *websocket.Conn, ch chan co
+ }
+ 
+ func (s *codexWebsocketSession) activate(conn *websocket.Conn) chan codexWebsocketRead {
++	return s.activateWithBootstrap(conn, nil)
++}
++
++func (s *codexWebsocketSession) activateWithBootstrap(conn *websocket.Conn, bootstrapDone <-chan struct{}) chan codexWebsocketRead {
+ 	if s == nil || conn == nil {
+ 		return nil
+ 	}
+@@ -128,6 +134,7 @@ func (s *codexWebsocketSession) activate(conn *websocket.Conn) chan codexWebsock
+ 		return ch
+ 	}
+ 	s.setActiveLocked(conn, ch)
++	s.activeBootstrapDone = bootstrapDone
+ 	return ch
+ }
+ 
+@@ -173,6 +180,15 @@ func (s *codexWebsocketSession) activeForConn(conn *websocket.Conn) (chan codexW
+ 	return s.activeCh, s.activeDone
+ }
+ 
++func (s *codexWebsocketSession) bootstrapForConn(conn *websocket.Conn, ch chan codexWebsocketRead) <-chan struct{} {
++	s.activeMu.Lock()
++	defer s.activeMu.Unlock()
++	if s.activeConn != conn || s.activeCh != ch {
++		return nil
++	}
++	return s.activeBootstrapDone
++}
++
+ func clearRetryActiveState(sess *codexWebsocketSession, conn *websocket.Conn, ch chan codexWebsocketRead) bool {
+ 	if sess == nil {
+ 		return false
+@@ -191,6 +207,7 @@ func (s *codexWebsocketSession) clearActive(conn *websocket.Conn, ch chan codexW
+ 	}
+ 	s.activeConn = nil
+ 	s.activeCh = nil
++	s.activeBootstrapDone = nil
+ 	if s.activeCancel != nil {
+ 		s.activeCancel()
+ 	}
+@@ -356,6 +373,11 @@ func (s *codexWebsocketSession) detachConnection(conn *websocket.Conn, lifecycle
+ 		s.lifecycleModel = ""
+ 	}
+ 	s.connMu.Unlock()
++	s.activeMu.Lock()
++	if s.activeConn == conn && s.activeCancel != nil {
++		s.activeCancel()
++	}
++	s.activeMu.Unlock()
+ 	return closer
+ }
+ 
+@@ -609,6 +631,17 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession,
+ 			ch, done := sess.activeForConn(conn)
+ 			if ch != nil {
+ 				invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
++				if !invalidated {
++					close(ch)
++					if bootstrapDone := sess.bootstrapForConn(conn, ch); bootstrapDone != nil {
++						select {
++						case <-bootstrapDone:
++						case <-done:
++						}
++					}
++					invalidate()
++					return
++				}
+ 				if sess.clearActive(conn, ch) {
+ 					close(ch)
+ 				}
+@@ -630,6 +663,17 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession,
+ 				ch, done := sess.activeForConn(conn)
+ 				if ch != nil {
+ 					invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errBinary}, invalidate)
++					if !invalidated {
++						close(ch)
++						if bootstrapDone := sess.bootstrapForConn(conn, ch); bootstrapDone != nil {
++							select {
++							case <-bootstrapDone:
++							case <-done:
++							}
++						}
++						invalidate()
++						return
++					}
+ 					if sess.clearActive(conn, ch) {
+ 						close(ch)
+ 					}
+@@ -789,6 +833,11 @@ func closeCodexWebsocketSession(sess *codexWebsocketSession, reason string) {
+ 	}
+ 	sessionID := sess.sessionID
+ 	sess.connMu.Unlock()
++	sess.activeMu.Lock()
++	if sess.activeCancel != nil {
++		sess.activeCancel()
++	}
++	sess.activeMu.Unlock()
+ 
+ 	if conn != nil {
+ 		logCodexWebsocketDisconnected(sessionID, authID, wsURL, reason, nil)
+diff --git a/internal/runtime/executor/codex_websockets_stream.go b/internal/runtime/executor/codex_websockets_stream.go
+index 50bf77c..248a828 100644
+--- a/internal/runtime/executor/codex_websockets_stream.go
++++ b/internal/runtime/executor/codex_websockets_stream.go
+@@ -188,9 +188,15 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
+ 		logCodexWebsocketConnected(executionSessionID, authID, wsURL)
+ 	}
+ 
++	buffering := e.cfg != nil && e.cfg.Codex.StreamBootstrapBuffering
+ 	var readCh chan codexWebsocketRead
++	var bootstrapDone chan struct{}
+ 	if sess != nil {
+-		readCh = sess.activate(conn)
++		if buffering {
++			bootstrapDone = make(chan struct{})
++			defer close(bootstrapDone)
++		}
++		readCh = sess.activateWithBootstrap(conn, bootstrapDone)
+ 	}
+ 	restoreMultiAgentV2 := !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
+ 
+@@ -233,7 +239,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
+ 				closeWebsocketAfterBindFailure(sess, conn, closer)
+ 				return nil, errBind
+ 			}
+-			readCh = sess.activate(conn)
++			readCh = sess.activateWithBootstrap(conn, bootstrapDone)
+ 			restoreMultiAgentV2 = !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
+ 			wsReqBodyRetry := buildCodexWebsocketRequestBody(upstreamBody)
+ 			helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+@@ -272,8 +278,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
+ 		sess.setMultiAgentV2Optimized(conn, optimizeMultiAgentV2 && !multiAgentV2Conflict)
+ 	}
+ 
+-	buffering := e.cfg != nil && e.cfg.Codex.StreamBootstrapBuffering
+-
+ 	claudeInputTokens := helps.NewClaudeInputTokenState(from, to, responseFormat, originalPayload)
+ 	var param any
+ 	outputItemsByIndex := make(map[int64][]byte)
+@@ -343,7 +347,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
+ 
+ 			if wsErr, ok := parseCodexWebsocketError(payload); ok {
+ 				if sess != nil {
+-					e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
++					if !cliproxyexecutor.RequiredUpstreamWebsocket(ctx) && cliproxyauth.RequestScopedErrorAllowsContinue(auth, wsErr, e.cfg) {
++						e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "upstream_error", wsErr)
++					} else {
++						e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
++					}
+ 					sess.clearActive(conn, readCh)
+ 					unlockStreamSession()
+ 				} else {
+diff --git a/internal/runtime/executor/fleet_model_access_bootstrap_test.go b/internal/runtime/executor/fleet_model_access_bootstrap_test.go
+new file mode 100644
+index 0000000..0b3e87d
+--- /dev/null
++++ b/internal/runtime/executor/fleet_model_access_bootstrap_test.go
+@@ -0,0 +1,135 @@
++package executor
++
++import (
++	"context"
++	"net/http"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/gorilla/websocket"
++
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
++	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
++)
++
++func TestFleetCodexWebsocketModelAccessBootstrapGuards(t *testing.T) {
++	const accountError = `{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"model_not_found","message":"The 'fleet-model-access' model is not supported when using Codex with a ChatGPT account."}}`
++	const requestError = `{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"invalid_parameter","message":"Invalid request option"}}`
++	for _, tc := range []struct {
++		name        string
++		frames      []string
++		wantNotify  bool
++		wantPayload bool
++	}{
++		{"account_before_output", []string{accountError}, false, false},
++		{"request_fault", []string{requestError}, true, false},
++		{"account_after_output", []string{codexCreatedEvent, codexOutputAddedEvent, accountError}, true, true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			server := codexWebsocketServerHoldingConnection(t, tc.frames...)
++			defer server.Close()
++			cfg := codexBufferingConfig(true)
++			cfg.OAuthRequestScopedErrors = map[string][]config.RequestScopedErrorRule{
++				"codex": {
++					{Status: 400, Match: []string{"model is not supported when using Codex with a ChatGPT account."}, Action: cliproxyauth.RequestScopedActionContinueAndCooldown},
++					{Status: 400, MatchRegexr: []string{"(?s).*"}, Action: cliproxyauth.RequestScopedActionStop},
++				},
++			}
++			exec := NewCodexWebsocketsExecutor(cfg)
++			exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
++			const session = "fleet-model-access-guard"
++			defer exec.CloseExecutionSession(session)
++			disconnect := exec.UpstreamDisconnectChan(session)
++			auth := codexTestAuth(server.URL)
++			auth.Provider = "codex"
++			delete(auth.Attributes, "api_key")
++			auth.Metadata = map[string]any{"access_token": "synthetic-token"}
++			req, opts := codexWebsocketRequest()
++			opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: session}
++			result, err := exec.ExecuteStream(context.Background(), auth, req, opts)
++			if tc.wantPayload {
++				if err != nil || result == nil {
++					t.Fatalf("expected an active stream, got result=%v err=%v", result, err)
++				}
++				combined, streamErr := drainChunks(result)
++				if !strings.Contains(combined, "response.output_item.added") || streamErr == nil {
++					t.Fatalf("output and terminal error were not delivered in-stream: %s err=%v", combined, streamErr)
++				}
++				err = streamErr
++			} else if result != nil || err == nil {
++				t.Fatalf("expected a synchronous pre-output error, got result=%v err=%v", result, err)
++			}
++			if got := statusCodeFromTestError(t, err); got != http.StatusBadRequest {
++				t.Fatalf("status=%d, want400", got)
++			}
++			if tc.wantNotify {
++				select {
++				case <-disconnect:
++				case <-time.After(time.Second):
++					t.Fatal("terminal request/after-output failure lost its disconnect notification")
++				}
++			} else {
++				select {
++				case <-disconnect:
++					t.Fatal("retryable pre-output account failure closed the downstream session")
++				default:
++				}
++			}
++		})
++	}
++}
++
++func TestFleetCodexWebsocketTerminalReadReleasesOnOwnerExit(t *testing.T) {
++	for _, exit := range []string{"consumer", "session", "lifecycle"} {
++		t.Run(exit, func(t *testing.T) {
++			server := codexWebsocketServer(t, `{"type":"error","status":400,"error":{"message":"terminal"}}`)
++			defer server.Close()
++			client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer func() { _ = client.Close() }()
++			exec := NewCodexWebsocketsExecutor(nil)
++			exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
++			const session = "fleet-terminal-owner"
++			defer exec.CloseExecutionSession(session)
++			sess := exec.getOrCreateSession(session)
++			sess.conn, sess.readerConn = client, client
++			sess.connCloser = newWebsocketConnectionCloser(client)
++			sess.configureConn(client)
++			reads := sess.activateWithBootstrap(client, make(chan struct{}))
++			finished := make(chan struct{})
++			go func() { exec.readUpstreamLoop(sess, client); close(finished) }()
++			if err := client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)); err != nil {
++				t.Fatal(err)
++			}
++			for index := 0; index < 2; index++ {
++				select {
++				case event := <-reads:
++					if index == 0 && len(event.payload) == 0 || index == 1 && event.err == nil {
++						t.Fatalf("terminal FIFO event%d: %+v", index, event)
++					}
++				case <-time.After(time.Second):
++					t.Fatal("terminal read delivery stalled")
++				}
++			}
++			switch exit {
++			case "consumer":
++				sess.clearActive(client, reads)
++			case "session":
++				exec.CloseExecutionSession(session)
++			case "lifecycle":
++				if err := sess.closeBoundConnection(client, sess.connCloser, newTerminalFailureLifecycle()); err != nil {
++					t.Fatal(err)
++				}
++			}
++			select {
++			case <-finished:
++			case <-time.After(time.Second):
++				t.Fatal("terminal reader did not exit with its owner")
++			}
++		})
++	}
++}
+diff --git a/internal/runtime/executor/fleet_websocket_backpressure_test.go b/internal/runtime/executor/fleet_websocket_backpressure_test.go
+new file mode 100644
+index 0000000..33ae170
+--- /dev/null
++++ b/internal/runtime/executor/fleet_websocket_backpressure_test.go
+@@ -0,0 +1,40 @@
++package executor
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
++)
++
++func TestFleetCodexWebsocketDisconnectSurvivesOutputBackpressure(t *testing.T) {
++	server := codexWebsocketServer(t, codexCreatedEvent, codexOutputAddedEvent,
++		`{"type":"response.output_text.delta","delta":"one"}`,
++		`{"type":"response.output_text.delta","delta":"two"}`)
++	defer server.Close()
++	exec := NewCodexWebsocketsExecutor(codexBufferingConfig(true))
++	exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
++	const session = "fleet-backpressure"
++	defer exec.CloseExecutionSession(session)
++	disconnect := exec.UpstreamDisconnectChan(session)
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	ctx = cliproxyexecutor.WithDownstreamWebsocket(ctx)
++	req, opts := codexWebsocketRequest()
++	opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: session}
++	result, err := exec.ExecuteStream(ctx, codexTestAuth(server.URL), req, opts)
++	if err != nil || result == nil {
++		t.Fatalf("stream: %v", err)
++	}
++	defer func() {
++		cancel()
++		for range result.Chunks {
++		}
++	}()
++	select {
++	case <-disconnect:
++	case <-time.After(time.Second):
++		t.Fatal("upstream EOF notification blocked behind unread output")
++	}
++}
+diff --git a/sdk/api/handlers/openai/fleet_model_access_websocket_test.go b/sdk/api/handlers/openai/fleet_model_access_websocket_test.go
+new file mode 100644
+index 0000000..4557c42
+--- /dev/null
++++ b/sdk/api/handlers/openai/fleet_model_access_websocket_test.go
+@@ -0,0 +1,166 @@
++package openai
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/gin-gonic/gin"
++	"github.com/gorilla/websocket"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
++	runtimeexecutor "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
++	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
++	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
++	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
++	"github.com/tidwall/gjson"
++)
++
++type fleetModelAccessRouter struct{}
++
++func (*fleetModelAccessRouter) HasModelRouters() bool { return true }
++
++func (*fleetModelAccessRouter) RouteModel(context.Context, pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, bool) {
++	return pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetProvider, Target: "codex"}, true
++}
++
++func TestFleetCodexWebsocketModelAccessFailoverKeepsSocketAndInterrupts(t *testing.T) {
++	for _, immediateClose := range []bool{false, true} {
++		t.Run(fmt.Sprintf("immediate_close=%t", immediateClose), func(t *testing.T) {
++			gin.SetMode(gin.TestMode)
++			var attemptsA, attemptsB atomic.Int32
++			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
++				if err != nil {
++					t.Errorf("upgrade: %v", err)
++					return
++				}
++				defer func() { _ = conn.Close() }()
++				_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
++				read := func() []byte {
++					_, payload, errRead := conn.ReadMessage()
++					if errRead != nil {
++						t.Errorf("read upstream: %v", errRead)
++					}
++					return payload
++				}
++				write := func(payload string) {
++					if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(payload)); errWrite != nil {
++						t.Errorf("write upstream: %v", errWrite)
++					}
++				}
++				if gjson.GetBytes(read(), "type").String() != "response.create" {
++					t.Error("missing first response.create")
++					return
++				}
++				if r.Header.Get("Authorization") == "Bearer account-a" {
++					attemptsA.Add(1)
++					write(`{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"model_not_found","message":"The 'fleet-model-access' model is not supported when using Codex with a ChatGPT account."}}`)
++					if !immediateClose {
++						_, _, _ = conn.ReadMessage()
++					}
++					return
++				}
++				attemptsB.Add(1)
++				write(`{"type":"response.completed","response":{"id":"r1","status":"completed","output":[]}}`)
++				if gjson.GetBytes(read(), "type").String() != "response.create" {
++					t.Error("missing second response.create")
++					return
++				}
++				attemptsB.Add(1)
++				write(`{"type":"response.created","response":{"id":"r2"}}`)
++				write(`{"type":"response.output_text.delta","response_id":"r2","item_id":"out-r2","output_index":0,"content_index":0,"delta":"ready"}`)
++				interrupt := read()
++				if gjson.GetBytes(interrupt, "type").String() != "response.interrupt" || gjson.GetBytes(interrupt, "response_id").String() != "r2" {
++					t.Errorf("interrupt did not reach fallback: %s", interrupt)
++					return
++				}
++				write(`{"type":"response.interrupt.accepted","response_id":"r2"}`)
++				write(`{"type":"response.incomplete","response":{"id":"r2","status":"incomplete","incomplete_details":{"reason":"interrupted"},"output":[]}}`)
++				if gjson.GetBytes(read(), "type").String() != "response.create" {
++					t.Error("missing third response.create")
++					return
++				}
++				attemptsB.Add(1)
++				write(`{"type":"response.completed","response":{"id":"r3","status":"completed","output":[]}}`)
++				_, _, _ = conn.ReadMessage()
++			}))
++			defer upstream.Close()
++
++			cfg := &config.Config{}
++			cfg.Codex.StreamBootstrapBuffering = true
++			cfg.SDKConfig.DisableImageGeneration = config.DisableImageGenerationAll
++			cfg.OAuthRequestScopedErrors = map[string][]config.RequestScopedErrorRule{
++				"codex": {
++					{Status: 400, Match: []string{"model is not supported when using Codex with a ChatGPT account."}, Action: coreauth.RequestScopedActionContinueAndCooldown},
++					{Status: 400, MatchRegexr: []string{"(?s).*"}, Action: coreauth.RequestScopedActionStop},
++				},
++			}
++			manager := coreauth.NewManager(nil, coreauth.NewSessionAffinitySelector(&coreauth.FillFirstSelector{}), nil)
++			manager.SetConfig(cfg)
++			manager.RegisterExecutor(runtimeexecutor.NewCodexAutoExecutor(cfg))
++			const model = "fleet-model-access"
++			for index, token := range []string{"account-a", "account-b"} {
++				auth := &coreauth.Auth{
++					ID: token, Provider: "codex", Status: coreauth.StatusActive,
++					Attributes: map[string]string{"base_url": upstream.URL, "priority": fmt.Sprint(2 - index)},
++					Metadata:   map[string]any{"access_token": token, "websockets": true},
++				}
++				if _, err := manager.Register(context.Background(), auth); err != nil {
++					t.Fatal(err)
++				}
++				registry.GetGlobalRegistry().RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: model}})
++				defer registry.GetGlobalRegistry().UnregisterClient(auth.ID)
++			}
++			base := handlers.NewBaseAPIHandlers(&cfg.SDKConfig, manager)
++			base.SetModelRouterHost(&fleetModelAccessRouter{})
++			handler := NewOpenAIResponsesAPIHandler(base)
++			router := gin.New()
++			router.GET("/v1/responses", handler.ResponsesWebsocket)
++			downstream := httptest.NewServer(router)
++			defer downstream.Close()
++			headers := http.Header{"Session-Id": []string{"fleet-model-access-session"}}
++			client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(downstream.URL, "http")+"/v1/responses", headers)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer func() { _ = client.Close() }()
++			_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
++			send := func(payload string) {
++				t.Helper()
++				if err := client.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
++					t.Fatal(err)
++				}
++			}
++			expect := func(event string) {
++				t.Helper()
++				_, payload, err := client.ReadMessage()
++				if err != nil {
++					t.Fatal(err)
++				}
++				if gjson.GetBytes(payload, "type").String() != event {
++					t.Fatalf("want %s, got %s", event, payload)
++				}
++			}
++			create := fmt.Sprintf(`{"type":"response.create","model":%q,"input":[]}`, model)
++			send(create)
++			expect("response.completed")
++			send(create)
++			expect("response.created")
++			expect("response.output_text.delta")
++			send(`{"type":"response.interrupt","response_id":"r2","mode":"discard_partial_items"}`)
++			expect("response.interrupt.accepted")
++			expect("response.incomplete")
++			send(create)
++			expect("response.completed")
++			if attemptsA.Load() != 1 || attemptsB.Load() != 3 {
++				t.Fatalf("attempts A=%d B=%d, want A=1 B=3", attemptsA.Load(), attemptsB.Load())
++			}
++		})
++	}
++}
+diff --git a/sdk/cliproxy/auth/conductor_request_scoped_errors.go b/sdk/cliproxy/auth/conductor_request_scoped_errors.go
+index 6804863..8a5b705 100644
+--- a/sdk/cliproxy/auth/conductor_request_scoped_errors.go
++++ b/sdk/cliproxy/auth/conductor_request_scoped_errors.go
+@@ -238,6 +238,11 @@ func matchRequestScopedErrorAction(auth *Auth, err error, cfg *internalconfig.Co
+ 	return "", false
+ }
+ 
++func RequestScopedErrorAllowsContinue(auth *Auth, err error, cfg *internalconfig.Config) bool {
++	action, ok := matchRequestScopedErrorAction(auth, err, cfg)
++	return ok && (action == RequestScopedActionContinue || action == RequestScopedActionContinueAndCooldown)
++}
++
+ func applyRequestScopedActionToResult(action string, okAction bool, result *Result) {
+ 	if !okAction || result == nil || result.Error == nil {
+ 		return

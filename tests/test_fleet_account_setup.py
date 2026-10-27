@@ -169,7 +169,7 @@ class FleetAccountSetupTest(unittest.TestCase):
             ACCOUNTS.runtime_for_mutation(self.home)
 
         probe.assert_called_once_with(client.url, client_key)
-        self.assertIs(runtime["routing"]["session-affinity"], False)
+        self.assertIs(runtime["routing"]["session-affinity"], True)
         runtime["auth-dir"] = str(self.home / "other-auth")
         with self.assertRaisesRegex(ACCOUNTS.fleet.FleetError, "auth directory"):
             ACCOUNTS.managed_runtime_config(paths, runtime)
@@ -222,13 +222,14 @@ class FleetAccountSetupTest(unittest.TestCase):
         self.assertIn(f'api-keys:\n  - "{client_key.read_text().strip()}"', config_text)
         self.assertIn(f'secret-key: "{management_key.read_text().strip()}"', config_text)
         self.assertNotIn(f'api-keys:\n  - "{management_key.read_text().strip()}"', config_text)
-        self.assertIn('claude-header-defaults:\n  user-agent: "claude-cli/2.1.258 (external, cli)"', config_text)
+        self.assertNotIn("claude-header-defaults:", config_text)
         self.assertIn("codex:\n  stream-bootstrap-buffering: true", config_text)
+        self.assertIn("  disable-codex-cloaking: true", config_text)
         self.assertIn("provider-model-lists:\n  enabled: true", config_text)
         self.assertIn("oauth-request-scoped-errors:\n  claude:", config_text)
         self.assertIn('      - "rate_limit_error"', config_text)
         self.assertIn("  codex:", config_text)
-        self.assertIn('      - "usage_limit_reached"', config_text)
+        self.assertIn('      - "usage_limit_reached"\n        - "turn_rate_limit_exceeded"', config_text)
         configured = ACCOUNTS.configured_error_rules(ACCOUNTS.default_account_routing())
         for provider, status in (("claude", 529), ("codex", 404)):
             self.assertIn(
@@ -413,23 +414,49 @@ class FleetAccountSetupTest(unittest.TestCase):
         claude.parent.mkdir()
         codex.parent.mkdir()
         claude.write_text('{"env":{"KEEP":"yes"},"hooks":{"keep":true}}\n')
-        codex.write_text('model = "gpt-5.5"\n\n[features]\nmemories = true\n')
+        codex.write_text('model = "provider-owned-future-model"\nmodel_reasoning_effort = "xhigh"\nservice_tier = "priority"\n\n[features]\nmemories = true\n')
         ACCOUNTS.configure_provider_routing(self.home, "claude", "http://127.0.0.1:8317", probe=lambda _url: None)
         ACCOUNTS.configure_provider_routing(self.home, "codex", "http://127.0.0.1:8317", probe=lambda _url: None)
 
         claude_value = json.loads(claude.read_text())
         self.assertEqual(
             claude_value["env"],
-            {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8317", "CLAUDE_CODE_MAX_RETRIES": "100", "KEEP": "yes"},
+            {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8317", "CLAUDE_CODE_MAX_RETRIES": "3", "KEEP": "yes"},
         )
         self.assertEqual(claude_value["apiKeyHelper"], f"/bin/cat {client_key}")
         self.assertEqual(claude_value["hooks"], {"keep": True})
         codex_value = tomllib.loads(codex.read_text())
-        self.assertEqual(codex_value["model"], "gpt-5.5")
+        self.assertEqual(codex_value["model"], "provider-owned-future-model")
+        self.assertEqual(codex_value["model_reasoning_effort"], "xhigh")
+        self.assertEqual(codex_value["service_tier"], "priority")
         self.assertTrue(codex_value["features"]["memories"])
         self.assertNotIn("model_provider", codex_value)
         self.assertNotIn("fleet_cliproxyapi", codex_value.get("model_providers", {}))
         self.assertEqual(codex_value["openai_base_url"], "http://127.0.0.1:8317/v1")
+
+    def test_provider_routing_refreshes_legacy_claude_retries_and_restores_prior_config(self):
+        client_key = self.home / ".local/state/fleet/cliproxyapi-client-key"
+        client_key.parent.mkdir(parents=True)
+        client_key.write_text("client-key\n")
+        client_key.chmod(0o600)
+        path = self.home / ".claude/settings.json"
+        path.parent.mkdir()
+        prior = b'{"env":{"KEEP":"yes","CLAUDE_CODE_MAX_RETRIES":"7"}}\n'
+        legacy = json.loads(ACCOUNTS.claude_routing_config(prior, "http://127.0.0.1:8317", client_key))
+        legacy["env"]["CLAUDE_CODE_MAX_RETRIES"] = "100"
+        written = json.dumps(legacy).encode()
+        path.write_bytes(written)
+        path.chmod(0o600)
+        ACCOUNTS.save_client_routing_state(self.home, "claude", (prior, 0o640), written)
+
+        self.assertFalse(ACCOUNTS.provider_routing_valid(self.home, "claude", "http://127.0.0.1:8317"))
+        ACCOUNTS.configure_provider_routing(self.home, "claude", "http://127.0.0.1:8317", probe=lambda _url: None)
+
+        self.assertEqual(json.loads(path.read_bytes())["env"]["CLAUDE_CODE_MAX_RETRIES"], "3")
+        self.assertTrue(ACCOUNTS.provider_routing_valid(self.home, "claude", "http://127.0.0.1:8317"))
+        ACCOUNTS.restore_client_routing(self.home)
+        self.assertEqual(path.read_bytes(), prior)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
 
     def test_provider_routing_can_refresh_existing_codex_route(self):
         client_key = self.home / ".local/state/fleet/cliproxyapi-client-key"

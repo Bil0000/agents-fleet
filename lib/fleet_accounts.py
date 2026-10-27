@@ -28,6 +28,7 @@ from pathlib import Path
 ACCOUNT_FILE = re.compile(r"^(claude|codex)-([A-Za-z0-9][A-Za-z0-9_.@+-]{0,199})\.json$")
 PROVIDERS = ("claude", "codex")
 ROUTING_MODES = ("limits", "any")
+CREDIT_MODES = ("never", "last", "same-account")
 MANAGEMENT_HELP = (
     "Enable CLIProxyAPI remote-management.secret-key, set FLEET_CLIPROXY_MANAGEMENT_KEY, "
     "and keep FLEET_CLIPROXY_URL on localhost."
@@ -149,6 +150,8 @@ def load_account_routing(home, *, allow_missing=False):
         or not isinstance(providers, dict)
         or set(providers) != set(PROVIDERS)
         or any(providers[provider] not in ROUTING_MODES for provider in PROVIDERS)
+        or not isinstance(value.get("credits", {}), dict)
+        or any(provider not in PROVIDERS or mode not in CREDIT_MODES for provider, mode in value.get("credits", {}).items())
     ):
         raise fleet.FleetError("Invalid Fleet account routing policy.")
     return value
@@ -159,9 +162,12 @@ def account_routing_bytes(value):
 
 
 def limit_error_rules(provider):
-    kind = "rate_limit_error" if provider == "claude" else "usage_limit_reached"
+    kinds = ["rate_limit_error"] if provider == "claude" else ["usage_limit_reached", "turn_rate_limit_exceeded"]
     return [
-        {"status": 429, "match": [kind], "action": "continue-and-cooldown"},
+        {"status": 429, "match": kinds, "action": "continue-and-cooldown"},
+        *([
+            {"status": 400, "match": ["model is not supported when using Codex with a ChatGPT account."], "action": "continue-and-cooldown"}
+        ] if provider == "codex" else []),
         *(
             {"status": status, "match-regexr": ["(?s).*"], "action": "stop"}
             for status in range(400, 600)
@@ -187,7 +193,7 @@ def error_rules_yaml(routing):
         for rule in rules:
             lines.append(f"    - status: {rule['status']}")
             key = "match" if "match" in rule else "match-regexr"
-            lines.extend((f"      {key}:", f"        - {json.dumps(rule[key][0])}", f"      action: {json.dumps(rule['action'])}"))
+            lines.extend((f"      {key}:", *(f"        - {json.dumps(value)}" for value in rule[key]), f"      action: {json.dumps(rule['action'])}"))
     return "\n".join(lines) + "\n"
 
 
@@ -279,15 +285,14 @@ def setup_config(auth, client_key, management_key, routing=None):
         "max-retry-credentials: 0\n"
         "routing:\n"
         "  strategy: fill-first\n"
-        "  session-affinity: false\n"
+        "  session-affinity: true\n"
         "streaming:\n"
         "  bootstrap-retries: 0\n"
         "codex:\n"
         "  stream-bootstrap-buffering: true\n"
+        "  disable-codex-cloaking: true\n"
         "provider-model-lists:\n"
         "  enabled: true\n"
-        "claude-header-defaults:\n"
-        '  user-agent: "claude-cli/2.1.258 (external, cli)"\n'
         + error_rules_yaml(routing)
         + "remote-management:\n"
         "  allow-remote: false\n"
@@ -965,7 +970,7 @@ def claude_routing_config(current, url, client_key_path):
         raise fleet.FleetError("Ambiguous existing Claude settings environment.")
     environment = dict(environment)
     environment["ANTHROPIC_BASE_URL"] = url
-    environment["CLAUDE_CODE_MAX_RETRIES"] = "100"
+    environment["CLAUDE_CODE_MAX_RETRIES"] = "3"
     value["env"] = environment
     value["apiKeyHelper"] = f"/bin/cat {shlex.quote(str(client_key_path))}"
     return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
@@ -1305,7 +1310,7 @@ def provider_routing_valid(home, provider, url):
             isinstance(value, dict)
             and isinstance(value.get("env"), dict)
             and value["env"].get("ANTHROPIC_BASE_URL") == url
-            and value["env"].get("CLAUDE_CODE_MAX_RETRIES") == "100"
+            and value["env"].get("CLAUDE_CODE_MAX_RETRIES") == "3"
             and value.get("apiKeyHelper") == f"/bin/cat {shlex.quote(str(client_key_path))}"
         )
     except (OSError, UnicodeError, json.JSONDecodeError, tomllib.TOMLDecodeError, AttributeError):
@@ -1419,7 +1424,7 @@ def managed_runtime_config(paths, config):
         raise fleet.FleetError("CLIProxyAPI auth directory does not match Fleet setup.")
     config.setdefault("remote-management", {"allow-remote": False})
     if isinstance(config.get("routing"), dict):
-        config["routing"].setdefault("session-affinity", False)
+        config["routing"].setdefault("session-affinity", True)
     return client_key
 
 
@@ -1518,7 +1523,7 @@ def valid_state(state):
         policy = state["providers"][provider]
         if not isinstance(policy, dict) or set(policy) - {"order", "rebalance"} != {"accounts", "primary", "auto"}:
             return False
-        if "rebalance" in policy and (policy["rebalance"] != "reset" or "order" not in policy):
+        if "rebalance" in policy and (policy["rebalance"] not in ("reset", "reset-fallbacks") or "order" not in policy):
             return False
         accounts = policy["accounts"]
         if not isinstance(accounts, dict) or any(
@@ -1851,6 +1856,8 @@ def list_accounts(home, provider=None):
         )
         if policy.get("rebalance") == "reset":
             auto += " · reset order"
+        elif policy.get("rebalance") == "reset-fallbacks":
+            auto += " · fallback reset"
         try:
             cells = {label: f"{used:.0f}% · {format_reset(reset)}" for label, used, reset in account_usage(client, entry)}
         except fleet.FleetError:
@@ -1923,7 +1930,7 @@ def require_safe_failover_config(config, client_key):
         (config.get("api-keys") == [client_key], "api-keys: managed client key"),
         (isinstance(management, dict) and management.get("allow-remote") is False, "remote-management.allow-remote: false"),
         (isinstance(routing, dict) and routing.get("strategy") == "fill-first", "routing.strategy: fill-first"),
-        (isinstance(routing, dict) and routing.get("session-affinity") is False, "routing.session-affinity: false"),
+        (isinstance(routing, dict) and routing.get("session-affinity") is True, "routing.session-affinity: true"),
         (config.get("max-retry-credentials") == 0, "max-retry-credentials: 0"),
         (config.get("request-retry") == 0, "request-retry: 0"),
         (isinstance(streaming, dict) and streaming.get("bootstrap-retries", 0) == 0, "streaming.bootstrap-retries: 0"),
@@ -2069,12 +2076,26 @@ def use_account(home, provider, wanted, *, order=None, keep_rebalance=False):
     operations.extend(priority_operations(entries, selected["name"], policy.get("order")))
     if policy["auto"] is False:
         operations.extend(("disabled", entry, True, entry["disabled"]) for entry in entries if entry["name"] != selected["name"])
+    reset_affinity = policy["auto"] and not keep_rebalance
+    if reset_affinity and config.get("fleet-session-affinity-supported") is not True:
+        raise fleet.FleetError("Update the Fleet proxy before selecting an account with session affinity.")
     secure_credentials(home, config, entries)
-    apply_transaction(client, operations, lambda: write_state_transaction(home, state, state_before))
+
+    def save():
+        rollback = write_state_transaction(home, state, state_before)
+        try:
+            if reset_affinity:
+                client.request("POST", "routing/session-affinity/reset", {"provider": provider})
+        except BaseException:
+            rollback()
+            raise
+
+    apply_transaction(client, operations, save)
     if order is not None:
         show_account_order(home, provider)
     if policy["auto"]:
-        print(f"Primary {provider.title()} account: {account_label(state, selected)}. Auto switching is on; each new request tries it first.")
+        sessions = "existing sessions keep their available account" if keep_rebalance else "existing sessions rebind on their next request"
+        print(f"Primary {provider.title()} account: {account_label(state, selected)}. Auto switching is on; new sessions try it first and {sessions}.")
     else:
         print(
             f"Primary {provider.title()} account: {account_label(state, selected)}. Auto switching is off; other accounts are unavailable, "
@@ -2109,8 +2130,29 @@ def show_account_order(home, provider):
     if not policy.get("order"):
         print(f"No fixed {provider} account order. Set one with fleet account order {provider} <primary> <fallback> ...")
     else:
-        suffix = " (auto: soonest reset first)" if policy.get("rebalance") == "reset" else ""
+        suffix = {"reset": " (auto: soonest reset first)", "reset-fallbacks": " (auto: primary first, fallbacks by soonest reset)"}.get(policy.get("rebalance"), "")
         print(f"{provider.title()} account order: " + " -> ".join(policy["accounts"][name] for name in policy["order"]) + suffix)
+
+
+
+
+def credit_account(home, provider, mode):
+    if provider not in PROVIDERS or mode not in CREDIT_MODES:
+        raise fleet.FleetError("Usage: fleet account credits <claude|codex> <never|last|same-account>")
+    if is_spoke(home):
+        raise fleet.FleetError("Run credit changes on the Fleet hub.")
+    if ManagementClient().config().get("fleet-credit-routing-supported") is not True:
+        raise fleet.FleetError("The account router needs the Fleet credit routing patch before credits can be configured.")
+    snapshot = client_config_snapshot(account_routing_path(home))
+    routing = load_account_routing(home, allow_missing=True)
+    routing.setdefault("credits", {})[provider] = mode
+    write_account_routing_transaction(home, routing, snapshot)
+    descriptions = {
+        "never": "switch at either subscription limit; stop when all allowances are used",
+        "last": "use all account allowances first, then available credits",
+        "same-account": "use allowance and credits on each account before switching",
+    }
+    print(f"{provider.title()} credits: {mode}; {descriptions[mode]}. Auto switching and account order are unchanged.")
 
 
 def auto_account(home, provider, enabled, mode=None):
@@ -2162,7 +2204,7 @@ def auto_account(home, provider, enabled, mode=None):
         raise
     status = "on (limits only)" if enabled and routing["providers"][provider] == "limits" else "on (limits + temporary errors)" if enabled else "off"
     if enabled:
-        message = f"{provider.title()} auto switching: {status}. Each new request tries the primary first and can fall back before output."
+        message = f"{provider.title()} auto switching: {status}. New sessions try the primary first; existing sessions keep their available account and can fall back before output."
         if routing["providers"][provider] == "any":
             message += " Temporary provider errors can spend fallback quota."
         print(message)
@@ -2185,6 +2227,9 @@ def account_usage(client, entry):
         for label, key in (("weekly", "primary_window"), ("5-hour", "secondary_window")):
             window = limit.get(key)
             if isinstance(window, dict) and type(window.get("reset_at")) in {int, float} and type(window.get("used_percent")) in {int, float}:
+                duration = window.get("limit_window_seconds")
+                if type(duration) in {int, float}:
+                    label = "5-hour" if duration <= 18000 else "weekly"
                 windows.append((label, float(window["used_percent"]), float(window["reset_at"])))
     else:
         for label, key in (("5-hour", "five_hour"), ("weekly", "seven_day")):
@@ -2212,7 +2257,7 @@ def reset_order(entries, usage):
 def rebalance_provider(home, provider):
     state = load_state(home)
     policy = state["providers"][provider]
-    if policy.get("rebalance") != "reset" or len(policy["accounts"]) < 2:
+    if policy.get("rebalance") not in {"reset", "reset-fallbacks"} or len(policy["accounts"]) < 2:
         return False
     client = ManagementClient()
     entries = enrolled_accounts(policy, accounts_for(client.accounts(), provider))
@@ -2220,7 +2265,9 @@ def rebalance_provider(home, provider):
         raise fleet.FleetError(f"Enrolled {provider} accounts changed; run fleet account list.")
     usage = {entry["name"]: account_usage(client, entry) for entry in entries}
     order = reset_order(entries, usage)
-    if order == policy["order"]:
+    if policy["rebalance"] == "reset-fallbacks":
+        order = [policy["primary"], *[name for name in order if name != policy["primary"]]]
+    if order == policy["order"] and all(value == previous for _, _, value, previous in priority_operations(entries, order[0], order)):
         return False
     use_account(home, provider, order[0], order=order, keep_rebalance=True)
     print(f"{provider.title()} order rebalanced by soonest reset: " + " -> ".join(policy["accounts"][name] for name in order))
@@ -2238,23 +2285,24 @@ def rebalance(home, provider=None):
         print("Account order is already balanced.")
 
 
-def set_rebalance(home, provider, enabled):
-    if provider not in PROVIDERS:
-        raise fleet.FleetError("Account provider must be claude or codex.")
+def set_rebalance(home, provider, mode):
+    if provider not in PROVIDERS or mode not in {"reset", "reset-fallbacks", "manual"}:
+        raise fleet.FleetError("Usage: fleet account order <claude|codex> <reset|reset-fallbacks|manual>")
     with fleet.operation_lock(home):
         state = load_state(home)
         policy = state["providers"][provider]
-        if enabled:
+        if mode != "manual":
             if len(policy["accounts"]) < 2:
                 raise fleet.FleetError(f"Reset ordering needs at least two enrolled {provider} accounts.")
             if "order" not in policy:
                 policy["order"] = [policy["primary"], *sorted(name for name in policy["accounts"] if name != policy["primary"])]
-            policy["rebalance"] = "reset"
+            policy["rebalance"] = mode
         else:
             policy.pop("rebalance", None)
         write_state(home, state)
-    if enabled:
-        print(f"{provider.title()} order now follows the soonest limit reset. Fleet rebalances after each login and every hour.")
+    if mode != "manual":
+        order = "primary first, then the soonest limit reset" if mode == "reset-fallbacks" else "the soonest limit reset"
+        print(f"{provider.title()} order now follows {order}. Fleet rebalances after each login and every hour.")
         rebalance(home, provider)
     else:
         print(f"{provider.title()} order is manual again. Set it with fleet account order {provider} <primary> <fallback> ...")
@@ -2623,7 +2671,9 @@ def native_claude_credential(home):
     if not config_home.is_absolute():
         raise fleet.FleetError("CLAUDE_CONFIG_DIR must be absolute.")
     path = config_home / ".credentials.json"
-    native = read_native_json(path, "Claude") if path.exists() else claude_keychain_credential(home)
+    native = read_native_json(path, "Claude") if path.exists() else None
+    if native is None or not isinstance(native.get("claudeAiOauth"), dict):
+        native = claude_keychain_credential(home)
     if native is None or not isinstance(native.get("claudeAiOauth"), dict):
         raise fleet.FleetError("Native Claude login is not a Claude subscription.")
     oauth = native["claudeAiOauth"]
@@ -2959,8 +3009,9 @@ USAGE = """Usage: fleet account <command>
 
   list [claude|codex]                    accounts, order, auto, usage, and reset
   use <p> [account]                      pick the primary account
-  order <p> [accounts... | reset | manual | rebalance]
+  order <p> [accounts... | reset | reset-fallbacks | manual | rebalance]
   auto <p> on|off [--when limits|any]    quota failover
+  credits <p> never|last|same-account    credit use and account switching
   login <p> [label] | logout <p> [account] | rename <p> <account> <label>
   login <p> --existing <account>         enroll a credential already in CLIProxyAPI
   setup [--check | --restore-clients]    local CLIProxyAPI router
@@ -3013,6 +3064,13 @@ def main(arguments):
         if command in {"list", "quota", "current"} and len(rest) <= 1:
             list_accounts(home, rest[0] if rest else None)
             return
+        if command == "credits" and rest == ["--help"]:
+            print("Usage: fleet account credits <claude|codex> <never|last|same-account>\n\nnever         Skip accounts at either subscription limit. Stop before credits.\nlast          Use all account allowances before available credits.\nsame-account  Use allowance and credits on each account before switching.\n\nEach provider has its own choice. Auto switching must be on to use fallback accounts.\nUsage checks can fail or lag. Provider billing controls are required for a strict zero-credit guarantee.")
+            return
+        if command == "credits" and len(rest) == 2:
+            with fleet.operation_lock(home):
+                credit_account(home, rest[0], rest[1])
+            return
         if command == "auto" and rest == ["--help"]:
             print("Usage: fleet account auto <claude|codex> <on|off> [--when <limits|any>]\n\n--when limits  Switch only when subscription limits are reached (default).\n--when any     Also switch on temporary provider errors; this can spend fallback quota.")
             return
@@ -3047,8 +3105,8 @@ def main(arguments):
         if command == "rebalance" and len(rest) <= 1:
             rebalance(home, rest[0] if rest else None)
             return
-        if command == "order" and rest[:1] == ["--auto"] and len(rest) == 3 and rest[2] in {"reset", "manual"}:
-            set_rebalance(home, rest[1], rest[2] == "reset")
+        if command == "order" and rest[:1] == ["--auto"] and len(rest) == 3 and rest[2] in {"reset", "reset-fallbacks", "manual"}:
+            set_rebalance(home, rest[1], rest[2])
             return
         if command == "order" and rest == ["rebalance"]:
             rebalance(home)
@@ -3059,8 +3117,8 @@ def main(arguments):
         if command == "order" and len(rest) == 2 and rest[1] == "rebalance":
             rebalance(home, rest[0])
             return
-        if command == "order" and len(rest) == 2 and rest[1] in {"reset", "manual"}:
-            set_rebalance(home, rest[0], rest[1] == "reset")
+        if command == "order" and len(rest) == 2 and rest[1] in {"reset", "reset-fallbacks", "manual"}:
+            set_rebalance(home, rest[0], rest[1])
             return
         if command == "order" and len(rest) >= 2:
             with fleet.operation_lock(home):

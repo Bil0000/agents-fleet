@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import fcntl
 import http.client
 import json
 import select
@@ -7,6 +8,7 @@ import socket
 import subprocess
 import sys
 import time
+import threading
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -14,7 +16,10 @@ from urllib.parse import urlsplit
 
 
 MAX_ERROR_BODY = 64 * 1024
-MAX_RETRY_DELAY = 5 * 60
+MAX_RETRY_ATTEMPTS = 3
+MAX_RETRY_ELAPSED = 120
+FIRST_RESPONSE_TIMEOUT = 180
+STREAM_IDLE_TIMEOUT = 300
 HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -35,10 +40,13 @@ def quota_retry_delay(path, status, headers, response_body, mode="limits"):
     if not isinstance(payload, dict):
         return None
     error = payload.get("error")
+    if isinstance(error, dict) and str(error.get("message", "")).startswith("fleet_credit_"):
+        return None
     nested = error.get("type") if isinstance(error, dict) else None
     kind = nested if nested is not None else payload.get("type")
+    code = error.get("code") if isinstance(error, dict) else payload.get("code")
     retryable = (
-        path == "/v1/responses" and status == 429 and kind == "usage_limit_reached"
+        path == "/v1/responses" and status == 429 and (kind == "usage_limit_reached" or code == "turn_rate_limit_exceeded")
     ) or (
         path == "/v1/messages"
         and (status == 429 and kind == "rate_limit_error" or mode == "any" and status == 529 and kind == "overloaded_error")
@@ -48,17 +56,17 @@ def quota_retry_delay(path, status, headers, response_body, mode="limits"):
     retry_after = headers.get("Retry-After")
     if retry_after is not None:
         try:
-            return max(0, min(int(retry_after), MAX_RETRY_DELAY))
+            return max(0, int(retry_after))
         except ValueError:
             try:
-                return max(0, min(parsedate_to_datetime(retry_after).timestamp() - time.time(), MAX_RETRY_DELAY))
+                return max(0, parsedate_to_datetime(retry_after).timestamp() - time.time())
             except (TypeError, ValueError, OverflowError):
                 pass
     error = error if isinstance(error, dict) else payload
     if type(error.get("resets_at")) in {int, float}:
-        return max(0, min(error["resets_at"] - time.time(), MAX_RETRY_DELAY))
+        return max(0, error["resets_at"] - time.time())
     if type(error.get("resets_in_seconds")) in {int, float}:
-        return max(0, min(error["resets_in_seconds"], MAX_RETRY_DELAY))
+        return max(0, error["resets_in_seconds"])
     return 5
 
 
@@ -68,6 +76,9 @@ class RetryBridgeServer(ThreadingHTTPServer):
     request_queue_size = 128
 
     def __init__(self, address, handler, upstream_port, child=None, policy_path=None, client_key=None, upstream_host="127.0.0.1", relay=False, hub_login=None, management_key=None):
+        self.activity_lock = threading.Lock()
+        self.active_requests = 0
+        self.drain_until = 0
         self.upstream_port = upstream_port
         self.upstream_host = upstream_host
         self.relay = relay
@@ -77,6 +88,20 @@ class RetryBridgeServer(ThreadingHTTPServer):
         self.policy_path = policy_path or Path.home() / ".local/state/fleet/account-routing.json"
         self.client_key = client_key
         super().__init__(address, handler)
+
+    def update_locked(self):
+        try:
+            with (self.policy_path.parent / "cliproxyapi-activation.lock").open("r") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return True
+                fcntl.flock(lock, fcntl.LOCK_UN)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return True
+        return False
 
     def routing_mode(self, provider):
         try:
@@ -180,6 +205,47 @@ class RetryBridgeHandler(BaseHTTPRequestHandler):
         return not self.path.startswith("/v0/management/") or self.headers.get("Authorization") != f"Bearer {self.server.management_key}"
 
     def forward(self):
+        path = urlsplit(self.path).path
+        update_path = path == "/v0/management/fleet-update"
+        if update_path and not self.server.relay:
+            if self.server.management_key is None or self.headers.get("Authorization") != f"Bearer {self.server.management_key}" or self.remote_denied():
+                self.send_proxy_error(403, "Fleet update requires the management key.")
+                return
+            try:
+                payload = json.loads(self.request_body()) if self.command == "POST" else {}
+                if self.command not in {"GET", "POST"} or not isinstance(payload, dict) or (self.command == "POST" and type(payload.get("drain")) is not bool):
+                    raise ValueError
+                with self.server.activity_lock:
+                    if payload.get("drain") and self.server.active_requests:
+                        self.send_proxy_error(409, "Fleet update deferred while requests are active.")
+                        return
+                    if self.command == "POST":
+                        self.server.drain_until = time.monotonic() + 60 if payload["drain"] else 0
+                    body = json.dumps({"protocol": 1, "active": self.server.active_requests, "draining": self.server.drain_until > time.monotonic()}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (ValueError, TypeError):
+                self.send_proxy_error(400, "Invalid Fleet update request.")
+            return
+        tracked = not path.startswith(("/v0/management/", "/v8/management/"))
+        if tracked:
+            with self.server.activity_lock:
+                if self.server.drain_until > time.monotonic() or self.server.update_locked():
+                    self.send_proxy_error(503, "Fleet proxy update in progress; retry shortly.")
+                    self.close_connection = True
+                    return
+                self.server.active_requests += 1
+        try:
+            self.forward_request()
+        finally:
+            if tracked:
+                with self.server.activity_lock:
+                    self.server.active_requests -= 1
+
+    def forward_request(self):
         connection = None
         response = None
         response_started = False
@@ -193,35 +259,100 @@ class RetryBridgeHandler(BaseHTTPRequestHandler):
             path = target.path or "/"
             if target.query:
                 path += "?" + target.query
+            fast_request = False
+            if target.path == "/v1/messages":
+                betas = self.headers.get("Anthropic-Beta", "").split(",")
+                fast_request = "fast-mode-2026-02-01" in {beta.strip() for beta in betas}
+                try:
+                    payload = json.loads(body)
+                    fast_request |= isinstance(payload, dict) and payload.get("speed") == "fast"
+                except ValueError:
+                    pass
             buffered = b""
+            attempts = 0
+            retry_response = None
+            retry_exhausted = False
+            deadline = time.monotonic() + (FIRST_RESPONSE_TIMEOUT if self.server.relay else MAX_RETRY_ELAPSED)
             while True:
-                connection = http.client.HTTPConnection(self.server.upstream_host, self.server.upstream_port, timeout=30)
-                connection.connect()
-                connection.sock.settimeout(None)
-                connection.request(self.command, path, body=body, headers=self.upstream_headers(body, target.path))
-                response = connection.getresponse()
-                status = response.status
-                if self.server.relay or self.command != "POST" or not (
-                    target.path == "/v1/responses" and status == 429
-                    or target.path == "/v1/messages" and status in {429, 529}
-                ):
+                attempts += 1
+                connection = http.client.HTTPConnection(self.server.upstream_host, self.server.upstream_port, timeout=min(30, max(0.001, deadline - time.monotonic())))
+                timed_out = threading.Event()
+                response_timer = None
+                try:
+                    connection.connect()
+                    upstream_socket = connection.sock
+                    response_timeout = min(FIRST_RESPONSE_TIMEOUT, max(0.001, deadline - time.monotonic()))
+                    upstream_socket.settimeout(response_timeout)
+
+                    def expire_response(sock=upstream_socket, expired=timed_out):
+                        expired.set()
+                        try:
+                            sock.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+
+                    response_timer = threading.Timer(response_timeout, expire_response)
+                    response_timer.daemon = True
+                    response_timer.start()
+                    connection.request(self.command, path, body=body, headers=self.upstream_headers(body, target.path))
+                    response = connection.getresponse()
+                    if timed_out.is_set():
+                        raise TimeoutError
+                    upstream_socket.settimeout(STREAM_IDLE_TIMEOUT)
+                    status = response.status
+                    if self.server.relay or self.command != "POST" or not (
+                        target.path == "/v1/responses" and status == 429
+                        or target.path == "/v1/messages" and status in {429, 529}
+                    ):
+                        response_timer.cancel()
+                        response_timer.join()
+                        if timed_out.is_set():
+                            raise TimeoutError
+                        break
+                    upstream_socket.settimeout(max(0.001, deadline - time.monotonic()))
+                    buffered = response.read(MAX_ERROR_BODY + 1)
+                    if timed_out.is_set():
+                        raise TimeoutError
+                except (OSError, http.client.HTTPException) as error:
+                    if not isinstance(error, TimeoutError) and not timed_out.is_set():
+                        raise
+                    if retry_response is None:
+                        raise TimeoutError from None
+                    if response is not None:
+                        response.close()
+                    response = None
+                    status, headers, buffered = retry_response
+                    retry_exhausted = True
                     break
-                buffered = response.read(MAX_ERROR_BODY + 1)
+                finally:
+                    if response_timer is not None:
+                        response_timer.cancel()
                 if len(buffered) > MAX_ERROR_BODY:
                     break
                 provider = "codex" if target.path == "/v1/responses" else "claude"
-                delay = quota_retry_delay(target.path, status, response.headers, buffered, self.server.routing_mode(provider))
+                delay = None if fast_request else quota_retry_delay(target.path, status, response.headers, buffered, self.server.routing_mode(provider))
                 if delay is None:
+                    break
+                retry_response = status, self.response_headers(response), buffered
+                if attempts >= MAX_RETRY_ATTEMPTS or delay >= deadline - time.monotonic():
+                    retry_exhausted = True
+                    break
+                if not self.wait_for_retry(delay):
+                    return
+                if time.monotonic() >= deadline:
+                    retry_exhausted = True
                     break
                 response.close()
                 connection.close()
                 response = None
                 connection = None
                 buffered = b""
-                if not self.wait_for_retry(delay):
-                    return
-            headers = self.response_headers(response)
+            if response is not None:
+                headers = self.response_headers(response)
+            if attempts > 1 or retry_exhausted:
+                headers.extend((("X-Fleet-Retry-Attempts", str(attempts)), ("X-Fleet-Retry-State", "exhausted" if retry_exhausted else "completed")))
             if status == 101 and connection.sock is not None:
+                connection.sock.settimeout(None)
                 self.send_response_only(status)
                 for name, value in headers:
                     self.send_header(name, value)
@@ -245,9 +376,9 @@ class RetryBridgeHandler(BaseHTTPRequestHandler):
                 return
             if buffered:
                 self.write_body(buffered, chunked)
-            while data := response.read1(64 * 1024):
+            while response is not None and (data := response.read1(64 * 1024)):
                 self.write_body(data, chunked)
-            if response.length not in (None, 0):
+            if response is not None and response.length not in (None, 0):
                 self.close_connection = True
                 return
             if chunked:
@@ -255,11 +386,14 @@ class RetryBridgeHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
-        except (OSError, http.client.HTTPException, ValueError):
+        except (OSError, http.client.HTTPException, ValueError) as error:
             self.close_connection = True
             if not response_started and not self.wfile.closed:
                 try:
-                    self.send_proxy_error(502, "Local account router is unavailable.")
+                    if isinstance(error, TimeoutError):
+                        self.send_proxy_error(504, "Upstream response timed out.")
+                    else:
+                        self.send_proxy_error(502, "Local account router is unavailable.")
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     pass
         finally:

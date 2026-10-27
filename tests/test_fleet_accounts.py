@@ -153,6 +153,16 @@ class ManagementHandler(BaseHTTPRequestHandler):
         self.response(200, {"status": "ok", "deleted": 1, "files": [name], "failed": []})
 
     def do_POST(self):
+        if self.path == "/v0/management/routing/session-affinity/reset":
+            if not self.authorized():
+                return
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if self.server.affinity_reset_fail:
+                self.response(500, {"error": "injected reset failure"})
+                return
+            self.server.history.append((self.path, request["provider"], True))
+            self.response(200, {"status": "ok"})
+            return
         if not self.authorized():
             return
         parsed = urllib.parse.urlparse(self.path)
@@ -222,12 +232,13 @@ class FakeManagement:
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), ManagementHandler)
         self.server.accounts = {}
         self.server.config = {
+            "fleet-session-affinity-supported": True,
             "host": "127.0.0.1",
             "auth-dir": str(auth),
             "api-keys": ["test-client-key"],
             "request-retry": 0,
             "max-retry-credentials": 0,
-            "routing": {"strategy": "fill-first", "session-affinity": False},
+            "routing": {"strategy": "fill-first", "session-affinity": True},
             "streaming": {"bootstrap-retries": 0},
             "codex": {"stream-bootstrap-buffering": True},
             "remote-management": {"allow-remote": False},
@@ -235,6 +246,7 @@ class FakeManagement:
         self.server.history = []
         self.server.mutation_count = 0
         self.server.delete_fail = False
+        self.server.affinity_reset_fail = False
         self.server.fail_at = None
         self.server.ignore_at = None
         self.server.ignore_status = False
@@ -306,7 +318,7 @@ class FleetAccountsTest(unittest.TestCase):
             "api-keys:\n  - test-client-key\n"
             "request-retry: 0\n"
             "max-retry-credentials: 0\n"
-            "routing:\n  strategy: fill-first\n  session-affinity: false\n"
+            "routing:\n  strategy: fill-first\n  session-affinity: true\n"
             "streaming:\n  bootstrap-retries: 0\n"
             "codex:\n  stream-bootstrap-buffering: true\n"
             "remote-management:\n  allow-remote: false\n  secret-key: test-management-key\n"
@@ -456,6 +468,7 @@ class FleetAccountsTest(unittest.TestCase):
         self.assertIs(policy["auto"], False)
         settings = json.loads((self.home / ".claude/settings.json").read_text())
         self.assertEqual(settings["env"]["ANTHROPIC_BASE_URL"], self.management.url)
+        self.assertEqual(settings["env"]["CLAUDE_CODE_MAX_RETRIES"], "3")
 
     def test_add_codex_enables_first_account_and_routes_shared_home(self):
         config = self.home / ".codex/config.toml"
@@ -635,6 +648,21 @@ class FleetAccountsTest(unittest.TestCase):
             },
         )
         self.assertEqual((self.base / "native-calls").read_text(), "--setting-sources  auth login --sso")
+
+    def test_native_claude_import_uses_keychain_when_file_only_has_mcp_logins(self):
+        directory = self.home / ".claude"
+        directory.mkdir()
+        path = directory / ".credentials.json"
+        path.write_text('{"mcpOAuth":{}}')
+        (self.home / ".claude.json").write_text('{"oauthAccount":{"emailAddress":"claude@example.com"}}')
+        credentials = {"claudeAiOauth": {"accessToken": "max-access", "refreshToken": "max-refresh", "expiresAt": 1893456000000}}
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(directory)}), mock.patch.object(ACCOUNTS, "claude_keychain_credential", return_value=credentials) as keychain:
+            name, _, _, payload = ACCOUNTS.native_claude_credential(self.home)
+        keychain.assert_called_once_with(self.home)
+        self.assertEqual(name, "claude-claude@example.com.json")
+        self.assertEqual(payload["access_token"], "max-access")
+        self.assertEqual(payload["refresh_token"], "max-refresh")
+        self.assertEqual(path.read_text(), '{"mcpOAuth":{}}')
 
     def test_native_login_refreshes_the_matching_account_without_losing_its_label(self):
         old = self.codex_native_auth(access="old-access")
@@ -877,7 +905,7 @@ class FleetAccountsTest(unittest.TestCase):
         result = self.run_fleet("use", "claude", "second")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("each new request tries it first", result.stdout)
+        self.assertIn("new sessions try it first", result.stdout)
         self.assertEqual(first.read_bytes(), b"first opaque bytes")
         self.assertEqual(second.read_bytes(), b"second opaque bytes")
         self.assertEqual(self.management.server.accounts["claude-first.json"]["priority"], 0)
@@ -1025,6 +1053,43 @@ class FleetAccountsTest(unittest.TestCase):
         saved = json.loads(self.state.read_text())["providers"]["codex"]
         self.assertEqual(saved["primary"], "codex-second.json")
 
+    def test_manual_choice_resets_only_its_provider(self):
+        self.add_account("codex", "first")
+        self.add_account("codex", "second")
+        self.write_state(codex={"accounts": {"codex-first.json": "first", "codex-second.json": "second"}, "primary": "codex-first.json", "auto": True})
+        self.assertEqual(self.run_fleet("use", "codex", "second").returncode, 0)
+        resets = [entry for entry in self.management.server.history if entry[0].endswith("/session-affinity/reset")]
+        self.assertEqual(resets, [("/v0/management/routing/session-affinity/reset", "codex", True)])
+
+    def test_manual_choice_rejects_unpatched_proxy_before_changing_accounts(self):
+        self.add_account("claude", "first", priority=9)
+        self.add_account("claude", "second", priority=4)
+        self.write_state(claude={"accounts": {"claude-first.json": "first", "claude-second.json": "second"}, "primary": "claude-first.json", "auto": True})
+        before = self.state.read_bytes()
+        self.management.server.config.pop("fleet-session-affinity-supported")
+
+        result = self.run_fleet("use", "claude", "second")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Update the Fleet proxy", result.stderr)
+        self.assertEqual(self.management.server.history, [])
+        self.assertEqual(self.state.read_bytes(), before)
+
+    def test_manual_choice_reset_failure_rolls_back_accounts_and_saved_state(self):
+        self.add_account("claude", "first", priority=9)
+        self.add_account("claude", "second", priority=4)
+        self.write_state(claude={"accounts": {"claude-first.json": "first", "claude-second.json": "second"}, "primary": "claude-first.json", "auto": True})
+        before = self.state.read_bytes()
+        self.management.server.affinity_reset_fail = True
+
+        result = self.run_fleet("use", "claude", "second")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("rolled back", result.stderr)
+        self.assertEqual(self.management.server.accounts["claude-first.json"]["priority"], 9)
+        self.assertEqual(self.management.server.accounts["claude-second.json"]["priority"], 4)
+        self.assertEqual(self.state.read_bytes(), before)
+
     def test_codex_use_allows_a_routing_no_op_and_persists_auto_off(self):
         self.add_account("codex", "first", disabled=False, priority=100)
         self.management.server.accounts["codex-first.json"]["websockets"] = True
@@ -1131,16 +1196,11 @@ class FleetAccountsTest(unittest.TestCase):
         self.add_account("claude", "first", priority=9)
         self.add_account("claude", "second", priority=4)
         self.write_state(claude={"accounts": {"claude-first.json": "first", "claude-second.json": "second"}, "primary": "claude-first.json", "auto": True})
-        directory = self.state.parent
-        (directory / "lock").write_text("")
-        directory.chmod(0o500)
-        try:
-            result = self.run_fleet("auto", "claude", "off")
-        finally:
-            directory.chmod(0o700)
-
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("rolled back", result.stderr)
+        before_state = self.state.read_bytes()
+        with mock.patch.dict(os.environ, self.environment), mock.patch.object(ACCOUNTS.fleet, "atomic_write", side_effect=PermissionError):
+            with self.assertRaisesRegex(ACCOUNTS.fleet.FleetError, "rolled back"):
+                ACCOUNTS.auto_account(self.home, "claude", False)
+        self.assertEqual(self.state.read_bytes(), before_state)
         self.assertEqual(self.management.server.accounts["claude-first.json"]["priority"], 9)
         self.assertEqual(self.management.server.accounts["claude-second.json"]["priority"], 4)
         self.assertFalse(self.management.server.accounts["claude-second.json"]["disabled"])
@@ -1226,6 +1286,50 @@ class FleetAccountsTest(unittest.TestCase):
             ACCOUNTS.apply_transaction(client, [("priority", account, 100, 9)], lambda: None)
         self.assertEqual(client.live, 9)
 
+    def test_credit_modes_preserve_accounts_and_other_routing_choices(self):
+        self.management.server.config["fleet-credit-routing-supported"] = True
+        self.write_state()
+        state_before = self.state.read_bytes()
+        for provider in ("claude", "codex"):
+            for mode in ("never", "last", "same-account"):
+                with self.subTest(provider=provider, mode=mode):
+                    result = self.run_fleet("credits", provider, mode)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    saved = json.loads(self.policy.read_text())
+                    self.assertEqual(saved["credits"][provider], mode)
+                    self.assertEqual(saved["providers"], {"claude": "limits", "codex": "limits"})
+                    self.assertEqual(self.policy.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(self.state.read_bytes(), state_before)
+                    self.assertFalse(self.management.server.history)
+        self.assertEqual(saved["credits"], {"claude": "same-account", "codex": "same-account"})
+
+    def test_credit_changes_reject_invalid_modes_and_unpatched_router(self):
+        for args in (("codex", "never"), ("codex", "invalid"), ("other", "last")):
+            with self.subTest(args=args):
+                result = self.run_fleet("credits", *args)
+                self.assertEqual(result.returncode, 2)
+                self.assertFalse(self.policy.exists())
+                self.assertFalse(self.management.server.history)
+
+    def test_invalid_saved_credit_policy_cannot_be_overwritten(self):
+        self.management.server.config["fleet-credit-routing-supported"] = True
+        self.policy.write_text('{"version":1,"providers":{"claude":"limits","codex":"limits"},"credits":{"codex":"invalid"}}')
+        self.policy.chmod(0o600)
+        before = self.policy.read_bytes()
+        result = self.run_fleet("credits", "codex", "never")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.policy.read_bytes(), before)
+
+
+
+    def test_spoke_credit_change_requires_the_hub_without_writing_local_policy(self):
+        ACCOUNTS.hub_state_path(self.home).write_bytes(ACCOUNTS.hub_state_bytes("spoke", "owner@example.com", "http://hub.example.ts.net:8317"))
+        ACCOUNTS.hub_state_path(self.home).chmod(0o600)
+        with self.assertRaisesRegex(ACCOUNTS.fleet.FleetError, "Run credit changes on the Fleet hub"):
+            ACCOUNTS.credit_account(self.home, "codex", "last")
+        self.assertFalse(self.policy.exists())
+        self.assertFalse(self.management.server.history)
+
     def test_auto_on_enables_every_claude_account_in_one_bounded_pass(self):
         accounts = {}
         for number in range(12):
@@ -1237,7 +1341,7 @@ class FleetAccountsTest(unittest.TestCase):
         result = self.run_fleet("auto", "claude", "on")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Each new request tries the primary first", result.stdout)
+        self.assertIn("New sessions try the primary first", result.stdout)
         live = self.management.server.accounts
         self.assertTrue(all(not item["disabled"] for item in live.values()))
         self.assertEqual(live["claude-00.json"]["priority"], 100)
@@ -1271,7 +1375,7 @@ class FleetAccountsTest(unittest.TestCase):
         cases = (
             (("api-keys",), ["wrong-client-key"], "api-keys: managed client key"),
             (("routing", "strategy"), "round-robin", "routing.strategy: fill-first"),
-            (("routing", "session-affinity"), True, "routing.session-affinity: false"),
+            (("routing", "session-affinity"), False, "routing.session-affinity: true"),
             (("max-retry-credentials",), 2, "max-retry-credentials: 0"),
             (("request-retry",), 1, "request-retry: 0"),
             (("streaming", "bootstrap-retries"), 1, "streaming.bootstrap-retries: 0"),
@@ -1338,7 +1442,9 @@ class FleetAccountsTest(unittest.TestCase):
         self.assertFalse(self.management.server.accounts["codex-first.json"]["disabled"])
         self.assertFalse(self.management.server.accounts["codex-second.json"]["disabled"])
         rules = self.management.server.config["oauth-request-scoped-errors"]["codex"]
-        self.assertEqual(rules[0], {"status": 429, "match": ["usage_limit_reached"], "action": "continue-and-cooldown"})
+        self.assertEqual(rules[0], {"status": 429, "match": ["usage_limit_reached", "turn_rate_limit_exceeded"], "action": "continue-and-cooldown"})
+        self.assertEqual(rules[1], {"status": 400, "match": ["model is not supported when using Codex with a ChatGPT account."], "action": "continue-and-cooldown"})
+        self.assertEqual(rules[2], {"status": 400, "match-regexr": ["(?s).*"], "action": "stop"})
         self.assertEqual(json.loads(self.policy.read_text())["providers"]["codex"], "limits")
         saved = json.loads(self.state.read_text())["providers"]["codex"]
         self.assertIs(saved["auto"], True)
@@ -1855,6 +1961,46 @@ class FleetAccountsTest(unittest.TestCase):
         off = self.run_fleet("order", "codex", "manual")
         self.assertEqual(off.returncode, 0, off.stderr)
 
+    def test_reset_fallbacks_keeps_selected_main_and_reorders_only_fallbacks(self):
+        for provider in ("claude", "codex"):
+            with self.subTest(provider=provider):
+                names = [f"{provider}-{stem}.json" for stem in ("main", "early", "late")]
+                for stem in ("main", "early", "late"):
+                    self.add_account(provider, stem)
+                self.write_state(**{provider: {"accounts": dict(zip(names, ("Main", "Early", "Late"))), "primary": names[0], "auto": True}})
+                usage = {name: [("weekly", used, reset)] for name, used, reset in zip(names, (0, 100, 3), (9000, 1000, 9000))}
+                self.management.server.usage = {
+                    f"index-{name}": {"rate_limit": {"primary_window": {"used_percent": used, "reset_at": reset}}} if provider == "codex" else {"seven_day": {"utilization": used, "resets_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(reset))}}
+                    for name, [(_, used, reset)] in usage.items()
+                }
+                self.management.server.history.clear()
+                result = self.run_fleet("order", provider, "reset-fallbacks")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                with mock.patch.dict(os.environ, self.environment), mock.patch.object(ACCOUNTS, "account_usage", side_effect=lambda _client, entry: usage[entry["name"]]):
+                    policy = ACCOUNTS.load_state(self.home)["providers"][provider]
+                    self.assertEqual(policy["order"], names)
+                    self.assertEqual(policy["rebalance"], "reset-fallbacks")
+                    self.assertEqual([self.management.server.accounts[name]["priority"] for name in names], [3, 2, 1])
+                    usage[names[2]] = [("weekly", 3, 500)]
+                    ACCOUNTS.rebalance_provider(self.home, provider)
+                    policy = ACCOUNTS.load_state(self.home)["providers"][provider]
+                    self.assertEqual(policy["primary"], names[0])
+                    self.assertEqual(policy["order"], [names[0], names[2], names[1]])
+                    self.assertFalse(any(entry[0].endswith("/session-affinity/reset") for entry in self.management.server.history))
+                    ACCOUNTS.use_account(self.home, provider, names[2])
+                    ACCOUNTS.rebalance_provider(self.home, provider)
+                    policy = ACCOUNTS.load_state(self.home)["providers"][provider]
+                    self.assertEqual(policy["primary"], names[2])
+                    self.assertEqual(policy["order"], [names[2], names[1], names[0]])
+                    resets = [entry for entry in self.management.server.history if entry[0].endswith("/session-affinity/reset")]
+                    self.assertEqual(resets, [("/v0/management/routing/session-affinity/reset", provider, True)])
+                shown = self.run_fleet("order", provider)
+                self.assertEqual(shown.returncode, 0, shown.stderr)
+                self.assertIn("primary first", shown.stdout)
+                manual = self.run_fleet("order", provider, "manual")
+                self.assertEqual(manual.returncode, 0, manual.stderr)
+                self.assertNotIn("rebalance", ACCOUNTS.load_state(self.home)["providers"][provider])
+
     def test_list_shows_usage_windows_and_reset_countdown(self):
         self.add_account("codex", "work", priority=100)
         self.add_account("claude", "main", priority=100)
@@ -1885,8 +2031,11 @@ class FleetAccountsTest(unittest.TestCase):
         self.assertFalse(ACCOUNTS.valid_state(state))
         state["providers"]["codex"]["order"] = ["codex-a.json", "codex-b.json"]
         self.assertTrue(ACCOUNTS.valid_state(state))
-        state["providers"]["codex"]["rebalance"] = "other"
-        self.assertFalse(ACCOUNTS.valid_state(state))
+        state["providers"]["codex"]["rebalance"] = "reset-fallbacks"
+        self.assertTrue(ACCOUNTS.valid_state(state))
+        for invalid in ("other", [], {}):
+            state["providers"]["codex"]["rebalance"] = invalid
+            self.assertFalse(ACCOUNTS.valid_state(state))
 
     def test_spoke_uses_hub_keys_and_refuses_local_proxy_logins(self):
         self.add_account("codex", "work", priority=100)

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import http.client
+import importlib.util
+import itertools
 import json
 import os
 import re
@@ -31,6 +33,7 @@ class UpstreamHandler(BaseHTTPRequestHandler):
         size = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(size)
         self.server.calls.append((self.headers.get("Authorization") or self.headers.get("x-api-key"), body))
+        self.server.headers.append({name.lower(): value for name, value in self.headers.items()})
         self.server.paths.append(self.path)
         request = json.loads(body)
         texts = []
@@ -43,6 +46,23 @@ class UpstreamHandler(BaseHTTPRequestHandler):
         if not texts and isinstance(request.get("input"), str):
             texts.append(request["input"])
         turn = next((text for text in texts if text.startswith(("turn-", "claude-", "bounded-"))), texts[-1] if texts else "request")
+        if self.server.mode == "bad-request" or (
+            self.server.mode == "model-access"
+            and self.server.calls[-1][0] == "Bearer account-a"
+            and request["model"] == "gpt-6.1-sol"
+        ):
+            error = {"message": "Invalid request option", "type": "invalid_request_error", "code": "invalid_parameter"}
+            if self.server.mode == "model-access":
+                error = {"message": "The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account.", "type": "invalid_request_error", "code": "model_not_found"}
+            elif request["model"] == "provider-owned-unknown-model":
+                error = {"message": "Unknown model", "type": "invalid_request_error", "code": "model_not_found"}
+            payload = json.dumps({"error": error}).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if self.server.mode == "sequence" and len(self.server.calls) == 2:
             payload = b'{"error":{"message":"quota reached","type":"rate_limit_error","code":"rate_limit_exceeded"}}'
             self.send_response(429)
@@ -86,6 +106,8 @@ class UpstreamHandler(BaseHTTPRequestHandler):
                 "stop_sequence": None,
                 "usage": {"input_tokens": 1, "output_tokens": 1},
             }).encode()
+            if request.get("stream"):
+                payload = b'event: message_start\ndata: {"type":"message_start","message":' + payload + b'}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n'
         elif urllib.parse.urlsplit(self.path).path.endswith("/responses"):
             response = {
                 "id": f"accepted-{turn}",
@@ -130,7 +152,7 @@ def installed_binary():
     except (OSError, KeyError, json.JSONDecodeError):
         managed_version = "7.2.149"
     managed = Path.home() / f".local/share/fleet/cliproxyapi/{managed_version}/cli-proxy-api"
-    candidates = (configured, managed, shutil.which("cliproxyapi"), "/opt/homebrew/bin/cliproxyapi", "/usr/local/bin/cliproxyapi")
+    candidates = (configured,) if configured else (managed, shutil.which("cliproxyapi"), "/opt/homebrew/bin/cliproxyapi", "/usr/local/bin/cliproxyapi")
     for candidate in candidates:
         if not candidate or not Path(candidate).is_file():
             continue
@@ -138,6 +160,8 @@ def installed_binary():
         match = re.search(r"CLIProxyAPI Version: ([0-9]+\.[0-9]+\.[0-9]+)", version.stdout + version.stderr)
         if match and tuple(map(int, match.group(1).split("."))) >= (7, 2, 149):
             return candidate, match.group(1)
+    if configured:
+        raise RuntimeError("The requested CLIProxyAPI test binary is missing or has an unsupported version.")
     return None
 
 
@@ -154,6 +178,7 @@ class CLIProxyFailoverTest(unittest.TestCase):
         self.base = Path(self.temporary.name)
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
         self.upstream.calls = []
+        self.upstream.headers = []
         self.upstream.paths = []
         self.upstream.successes = 0
         self.upstream.turn_successes = {}
@@ -163,7 +188,20 @@ class CLIProxyFailoverTest(unittest.TestCase):
         self.proxy = None
         self.start_proxy(["account-a", "account-b"])
 
-    def start_proxy(self, accounts, protocol="openai", plugin=None, priorities=None):
+    def build_router_plugin(self):
+        configured = os.environ.get("FLEET_CLIPROXY_PLUGIN")
+        if configured:
+            plugin = Path(configured)
+            self.assertTrue(plugin.is_file(), "The requested Fleet provider plugin is missing")
+            return plugin
+        source = ROOT / "lib/fleet_provider_router.c"
+        self.assertTrue(source.is_file())
+        plugin = self.base / ("fleet-provider-router.dylib" if sys.platform == "darwin" else "fleet-provider-router.so")
+        flags = ["-dynamiclib"] if sys.platform == "darwin" else ["-shared", "-fPIC"]
+        subprocess.run(["cc", *flags, "-O2", str(source), "-o", str(plugin)], check=True)
+        return plugin
+
+    def start_proxy(self, accounts, protocol="openai", plugin=None, priorities=None, cloak=False, affinity=False, limit_rules=False):
         self.proxy_port = free_port()
         auth = self.base / "auth"
         auth.mkdir(exist_ok=True)
@@ -174,18 +212,30 @@ class CLIProxyFailoverTest(unittest.TestCase):
                 f"    priority: {priorities[index] if priorities else 100 if index == 0 else 0}\n"
                 + ("    disable-cooling: true\n" if index == 0 else "")
                 + f'    base-url: "http://127.0.0.1:{self.upstream.server_port}"\n'
+                + ("    cloak:\n      mode: always\n" if cloak else "")
                 + "    models:\n"
                 + "      - name: fake-model\n"
                 + "        alias: fake-model\n"
                 for index, account in enumerate(accounts)
             )
         elif protocol == "codex":
+            error_rules = ""
+            if limit_rules:
+                source = ROOT / "lib/fleet_accounts.py"
+                if source.is_file():
+                    spec = importlib.util.spec_from_file_location("fleet_accounts", source)
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    rules = module.limit_error_rules("codex")
+                else:
+                    rules = json.loads(Path(__file__).with_name("codex-error-rules.json").read_text())
+                error_rules = f"    request-scoped-errors: {json.dumps(rules)}\n"
             provider = "codex-api-key:\n" + "".join(
                 f"  - api-key: {account}\n"
                 f"    priority: {priorities[index] if priorities else 100 if index == 0 else 0}\n"
-                + ("    disable-cooling: true\n" if index == 0 else "")
+                + ("    disable-cooling: true\n" if index == 0 and not limit_rules else "")
                 + f'    base-url: "http://127.0.0.1:{self.upstream.server_port}/v1"\n'
-                + "    models:\n      - name: gpt-5.4\n        alias: gpt-5.4\n"
+                + error_rules
                 for index, account in enumerate(accounts)
             )
         else:
@@ -210,7 +260,7 @@ class CLIProxyFailoverTest(unittest.TestCase):
             "api-keys:\n  - client-key\n"
             "request-retry: 0\n"
             "max-retry-credentials: 0\n"
-            "routing:\n  strategy: fill-first\n  session-affinity: false\n"
+            f"routing:\n  strategy: fill-first\n  session-affinity: {str(affinity).lower()}\n"
             "streaming:\n  bootstrap-retries: 0\n"
             "codex:\n  stream-bootstrap-buffering: true\n"
             "remote-management:\n  allow-remote: false\n  secret-key: test-management-key\n"
@@ -223,7 +273,8 @@ class CLIProxyFailoverTest(unittest.TestCase):
             )
         )
         self.proxy = subprocess.Popen(
-            [self.binary, "-config", str(config)],
+            [self.binary, "-local-model", "-config", str(config)],
+            env={**os.environ, "FLEET_ACCOUNT_ROUTING_FILE": str(self.base / "account-routing.json")},
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -275,12 +326,12 @@ class CLIProxyFailoverTest(unittest.TestCase):
         self.upstream_thread.join()
         self.temporary.cleanup()
 
-    def request(self, turn="turn-1", *, stream=False):
+    def request(self, turn="turn-1", *, stream=False, session="same-thread-123"):
         body = json.dumps(
             {
                 "model": "fake-model",
                 "messages": [{"role": "user", "content": turn}],
-                "session_id": "same-thread-123",
+                "session_id": session,
                 "stream": stream,
             }
         ).encode()
@@ -290,17 +341,18 @@ class CLIProxyFailoverTest(unittest.TestCase):
             headers={
                 "Authorization": "Bearer client-key",
                 "Content-Type": "application/json",
-                "Session-Id": "same-thread-123",
+                "Session-Id": session,
             },
         )
         return urllib.request.urlopen(request, timeout=5)
 
-    def claude_request(self, turn, model="fake-model"):
+    def claude_request(self, turn, model="fake-model", *, session="same-claude-thread-123", **options):
         body = json.dumps({
             "model": model,
             "max_tokens": 32,
             "messages": [{"role": "user", "content": turn}],
-            "metadata": {"user_id": "same-claude-thread-123"},
+            "metadata": {"user_id": session},
+            **options,
         }).encode()
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.proxy_port}/v1/messages",
@@ -309,17 +361,17 @@ class CLIProxyFailoverTest(unittest.TestCase):
                 "x-api-key": "client-key",
                 "anthropic-version": "2023-06-01",
                 "Content-Type": "application/json",
-                "x-session-id": "same-claude-thread-123",
+                "x-session-id": session,
             },
         )
         return urllib.request.urlopen(request, timeout=5)
 
-    def provider_request(self, model):
-        body = json.dumps({"model": model, "input": "future-model", "stream": False}).encode()
+    def provider_request(self, model, *, session=None, turn="future-model", **options):
+        body = json.dumps({"model": model, "input": turn, "stream": False, **options}).encode()
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.proxy_port}/v1/responses",
             data=body,
-            headers={"Authorization": "Bearer client-key", "Content-Type": "application/json"},
+            headers={"Authorization": "Bearer client-key", "Content-Type": "application/json", **({"Session-Id": session} if session else {})},
         )
         return urllib.request.urlopen(request, timeout=5)
 
@@ -344,16 +396,96 @@ class CLIProxyFailoverTest(unittest.TestCase):
                     response.read()
                 self.assertEqual([call[0].removeprefix("Bearer ") for call in self.upstream.calls], ["z-main"])
 
+    def test_affinity_keeps_fallback_after_main_recovers_and_manual_switch_overrides_it(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                self.stop_proxy()
+                self.upstream.calls.clear()
+                self.upstream.mode = "sequence"
+                self.start_proxy(["account-a", "account-b", "account-c"], protocol=provider, priorities=[3, 1, 2], affinity=True, plugin=self.build_router_plugin())
+                request = self.claude_request if provider == "claude" else lambda turn, session: self.provider_request("gpt-5.4", session=session, turn=turn)
+                self.upstream.mode = "ordered"
+                self.upstream.exhausted = set()
+                for turn, session, exhausted, expected in (
+                    ("turn-1", "working", set(), "account-a"),
+                    ("turn-2", "working", {"account-a"}, "account-c"),
+                    ("turn-3", "during-limit", {"account-a"}, "account-c"),
+                    ("turn-4", "working", set(), "account-c"),
+                    ("turn-5", "after-reset", set(), "account-a"),
+                    ("turn-6", "during-limit", {"account-a", "account-c"}, "account-b"),
+                    ("turn-7", "during-limit", set(), "account-b"),
+                ):
+                    self.upstream.exhausted = exhausted
+                    with request(turn, session=session) as response:
+                        response.read()
+                    self.assertEqual(self.upstream.calls[-1][0].removeprefix("Bearer "), expected)
+                reset_url = f"http://127.0.0.1:{self.proxy_port}/v0/management/routing/session-affinity/reset"
+                for key, target, expected_status in (("wrong-key", provider, 401), ("test-management-key", "invalid", 400)):
+                    rejected = urllib.request.Request(
+                        reset_url,
+                        data=json.dumps({"provider": target}).encode(),
+                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as error:
+                        urllib.request.urlopen(rejected, timeout=5)
+                    self.assertEqual(error.exception.code, expected_status)
+                reset = urllib.request.Request(
+                    reset_url,
+                    data=json.dumps({"provider": provider}).encode(),
+                    headers={"Authorization": "Bearer test-management-key", "Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(reset, timeout=5) as response:
+                    self.assertEqual(response.status, 200)
+                with request("turn-8", session="during-limit") as response:
+                    response.read()
+                self.assertEqual(self.upstream.calls[-1][0].removeprefix("Bearer "), "account-a")
+
+    def test_model_access_failure_uses_fallback_and_only_cools_that_model(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                self.stop_proxy()
+                self.upstream.calls.clear()
+                self.upstream.mode = "model-access"
+                self.start_proxy(["account-a", "account-b"], protocol="codex", plugin=self.build_router_plugin(), affinity=True, limit_rules=True)
+                for model, session, expected in (
+                    ("gpt-6.1-sol", "working", [["Bearer account-a", "Bearer account-b"]]),
+                    ("gpt-6.1-sol", "working", [["Bearer account-b"]]),
+                    ("gpt-6.1-sol", "new-thread", [["Bearer account-b"], ["Bearer account-a", "Bearer account-b"]]),
+                    ("provider-owned-future-model", "other-model", [["Bearer account-a"]]),
+                ):
+                    self.upstream.calls.clear()
+                    with self.provider_request(model, session=session, stream=stream) as response:
+                        self.assertEqual(response.status, 200)
+                        self.assertIn(b"completed", response.read())
+                    self.assertIn([call[0] for call in self.upstream.calls], expected)
+
+    def test_invalid_request_stops_without_rotating_or_cooling_account(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                self.stop_proxy()
+                self.upstream.calls.clear()
+                self.start_proxy(["account-a", "account-b"], protocol="codex", plugin=self.build_router_plugin(), affinity=True, limit_rules=True)
+                for model, code in (("gpt-6.1-sol", "invalid_parameter"), ("provider-owned-unknown-model", "model_not_found")):
+                    self.upstream.calls.clear()
+                    self.upstream.mode = "bad-request"
+                    with self.assertRaises(urllib.error.HTTPError) as error:
+                        self.provider_request(model, session="invalid", stream=stream)
+                    self.assertEqual(error.exception.code, 400)
+                    with error.exception as response:
+                        self.assertEqual(json.load(response)["error"]["code"], code)
+                    self.assertEqual([call[0] for call in self.upstream.calls], ["Bearer account-a"])
+                    self.upstream.mode = "normal"
+                    with self.provider_request(model, session="valid", stream=stream) as response:
+                        self.assertEqual(response.status, 200)
+                        self.assertIn(b"completed", response.read())
+                    self.assertEqual([call[0] for call in self.upstream.calls], ["Bearer account-a", "Bearer account-a"])
+
     def test_future_codex_model_is_routed_without_a_fleet_model_entry(self):
-        source = ROOT / "lib/fleet_provider_router.c"
-        self.assertTrue(source.is_file())
-        plugin = self.base / ("fleet-provider-router.dylib" if sys.platform == "darwin" else "fleet-provider-router.so")
-        flags = ["-dynamiclib"] if sys.platform == "darwin" else ["-shared", "-fPIC"]
-        subprocess.run(["cc", *flags, "-O2", str(source), "-o", str(plugin)], check=True)
+        plugin = self.build_router_plugin()
         self.stop_proxy()
         self.upstream.calls.clear()
         self.upstream.mode = "normal"
-        self.start_proxy(["account-a"], protocol="codex", plugin=plugin)
+        self.start_proxy(["account-a"], protocol="codex", plugin=plugin, affinity=True)
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.proxy_port}/v0/management/plugins",
             headers={"Authorization": "Bearer test-management-key"},
@@ -368,30 +500,33 @@ class CLIProxyFailoverTest(unittest.TestCase):
             self.fail(output)
 
         try:
-            with self.provider_request("provider-owned-future-model") as response:
+            with self.provider_request("provider-owned-future-model", session="future-codex", reasoning={"effort": "xhigh"}, service_tier="priority") as response:
                 self.assertEqual(response.status, 200)
         except urllib.error.HTTPError as error:
             self.fail(error.read().decode())
 
-        self.assertEqual(json.loads(self.upstream.calls[0][1])["model"], "provider-owned-future-model")
+        forwarded = json.loads(self.upstream.calls[0][1])
+        self.assertEqual(forwarded["model"], "provider-owned-future-model")
+        self.assertEqual(forwarded["reasoning"]["effort"], "xhigh")
+        self.assertEqual(forwarded["service_tier"], "priority")
 
     def test_future_claude_model_is_routed_without_a_fleet_model_entry(self):
-        source = ROOT / "lib/fleet_provider_router.c"
-        plugin = self.base / ("fleet-provider-router.dylib" if sys.platform == "darwin" else "fleet-provider-router.so")
-        flags = ["-dynamiclib"] if sys.platform == "darwin" else ["-shared", "-fPIC"]
-        subprocess.run(["cc", *flags, "-O2", str(source), "-o", str(plugin)], check=True)
+        plugin = self.build_router_plugin()
         self.stop_proxy()
         self.upstream.calls.clear()
         self.upstream.mode = "normal"
-        self.start_proxy(["account-a"], protocol="claude", plugin=plugin)
+        self.start_proxy(["account-a"], protocol="claude", plugin=plugin, affinity=True)
 
         try:
-            with self.claude_request("claude-future", "provider-owned-future-model") as response:
+            with self.claude_request("claude-future", "provider-owned-future-model", thinking={"type": "adaptive"}, output_config={"effort": "max"}) as response:
                 self.assertEqual(response.status, 200)
         except urllib.error.HTTPError as error:
             self.fail(error.read().decode())
 
-        self.assertEqual(json.loads(self.upstream.calls[0][1])["model"], "provider-owned-future-model")
+        forwarded = json.loads(self.upstream.calls[0][1])
+        self.assertEqual(forwarded["model"], "provider-owned-future-model")
+        self.assertEqual(forwarded["thinking"], {"type": "adaptive"})
+        self.assertEqual(forwarded["output_config"], {"effort": "max"})
 
     def test_management_response_identifies_exact_proxy_version(self):
         request = urllib.request.Request(
@@ -499,6 +634,34 @@ class CLIProxyFailoverTest(unittest.TestCase):
 
         self.assertEqual(len(self.upstream.calls), 1)
         self.assertTrue(all(urllib.parse.urlsplit(path).path.endswith("/v1/messages") for path in self.upstream.paths))
+
+    def test_native_claude_versions_are_not_downgraded(self):
+        self.stop_proxy()
+        self.start_proxy(["account-a"], protocol="claude", cloak=True, affinity=True)
+        self.upstream.mode = "success"
+        user_id = json.dumps({"device_id": "a" * 64, "account_uuid": "", "session_id": "11111111-2222-4333-8444-555555555555"}, separators=(",", ":"))
+        for version, entrypoint, stream in itertools.product(("2.1.296", "3.0.0"), ("cli", "sdk-ts", "sdk-py"), (False, True)):
+            with self.subTest(version=version, entrypoint=entrypoint, stream=stream):
+                user_agent = f"claude-cli/{version} (external, {entrypoint})"
+                billing = f"x-anthropic-billing-header: cc_version={version}.abc; cc_entrypoint={entrypoint}; cch=00000;"
+                body = json.dumps({
+                    "model": "fake-model", "max_tokens": 32, "stream": stream,
+                    "system": [{"type": "text", "text": billing}, {"type": "text", "text": "Test system prompt."}],
+                    "messages": [{"role": "user", "content": "claude-version-test"}],
+                    "metadata": {"user_id": user_id},
+                }).encode()
+                request = urllib.request.Request(f"http://127.0.0.1:{self.proxy_port}/v1/messages", data=body, headers={
+                    "x-api-key": "client-key", "Content-Type": "application/json", "anthropic-version": "2023-06-01",
+                    "User-Agent": user_agent, "X-App": "cli", "Anthropic-Beta": "claude-code-20250219",
+                    "X-Stainless-Package-Version": "0.120.0", "X-Stainless-Runtime-Version": "v26.4.0",
+                })
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    self.assertEqual(response.status, 200)
+                    response.read()
+                self.assertEqual(self.upstream.headers[-1]["user-agent"], user_agent)
+                self.assertEqual(self.upstream.headers[-1]["x-stainless-package-version"], "0.120.0")
+                self.assertEqual(self.upstream.headers[-1]["x-stainless-runtime-version"], "v26.4.0")
+                self.assertEqual(json.loads(self.upstream.calls[-1][1])["system"][0]["text"], billing)
 
 
 if __name__ == "__main__":

@@ -23,11 +23,14 @@ assert job["timeout-minutes"] > 0
 steps = job["steps"]
 checkout = "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803"
 uses = [step["uses"] for step in steps if "uses" in step]
-assert uses == [checkout]
+setup_go = "actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16"
+assert uses == [checkout, setup_go]
+assert next(step for step in steps if step.get("uses") == setup_go)["with"] == {"go-version": "1.26.0", "cache": False}
 assert next(step for step in steps if step.get("uses") == checkout)["with"]["persist-credentials"] is False
 assert sorted(step["run"] for step in steps if "run" in step) == [
     "bash tests/test_fleet.sh",
     "bin/fleet check",
+    "python3 -B lib/fleet_cliproxy_update.py --check-candidate 7.2.151",
 ]
 
 promote = jobs["promote"]

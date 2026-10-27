@@ -1175,6 +1175,33 @@ diff --git a/internal/runtime/executor/codex_websockets_executor_test.go b/inter
  	"net/http"
  	"net/http/httptest"
  	"strings"
+@@ -1838,7 +1839,7 @@
+ 	}
+ 
+ 	applyCodexHeaders(req, auth, "oauth-token", true, cfg)
+-	applyModelHeaderOverrides(req.Header, "gpt-5.6-luna")
++	applyModelHeaderOverrides(req.Header, "gpt-5.6-luna", nil)
+ 
+ 	if got := req.Header.Get("User-Agent"); got != wantUA {
+ 		t.Fatalf("User-Agent = %q, want %q", got, wantUA)
+@@ -1847,7 +1848,7 @@
+ 		t.Fatal("expected Session_id to be set for Mac OS User-Agent override")
+ 	}
+ 
+-	applyModelHeaderOverrides(req.Header, "gpt-5.4")
++	applyModelHeaderOverrides(req.Header, "gpt-5.4", nil)
+ 	if got := req.Header.Get("User-Agent"); got != wantUA {
+ 		t.Fatalf("User-Agent after no-op override = %q, want %q", got, wantUA)
+ 	}
+@@ -1873,7 +1874,7 @@
+ 	headers.Set("Originator", "old-origin")
+ 	headers.Set("X-Test-Header", "old-value")
+ 
+-	applyModelHeaderOverrides(headers, "test-override-headers-model")
++	applyModelHeaderOverrides(headers, "test-override-headers-model", nil)
+ 
+ 	if got := headers.Get("User-Agent"); got != "custom-ua/1.0" {
+ 		t.Fatalf("User-Agent = %q, want custom-ua/1.0", got)
 @@ -2519,3 +2520,44 @@
  		t.Fatalf("RetryAfter = %v, want 120s", got)
  	}
@@ -1220,3 +1247,492 @@ diff --git a/internal/runtime/executor/codex_websockets_executor_test.go b/inter
 +		})
 +	}
 +}
+diff --git a/internal/runtime/executor/helps/claude_device_profile.go b/internal/runtime/executor/helps/claude_device_profile.go
+--- a/internal/runtime/executor/helps/claude_device_profile.go
++++ b/internal/runtime/executor/helps/claude_device_profile.go
+@@ -614,8 +614,8 @@
+ 	}
+ 
+ 	if confirmedClaudeCode {
+-		miscEnsure("X-Stainless-Runtime-Version", profile.RuntimeVersion, func(value string) bool { return value == profile.RuntimeVersion })
+-		miscEnsure("X-Stainless-Package-Version", profile.PackageVersion, func(value string) bool { return value == profile.PackageVersion })
++		miscEnsure("X-Stainless-Runtime-Version", profile.RuntimeVersion, claudeRuntimeVersionPattern.MatchString)
++		miscEnsure("X-Stainless-Package-Version", profile.PackageVersion, claudePackageVersionPattern.MatchString)
+ 		miscEnsure("X-Stainless-Os", mapStainlessOS(), nil)
+ 		miscEnsure("X-Stainless-Arch", mapStainlessArch(), nil)
+ 		if clientUA := strings.TrimSpace(ginHeaders.Get("User-Agent")); plausibleClaudeCodeUserAgent(clientUA, cfg) {
+diff --git a/internal/runtime/executor/helps/claude_device_profile_test.go b/internal/runtime/executor/helps/claude_device_profile_test.go
+--- a/internal/runtime/executor/helps/claude_device_profile_test.go
++++ b/internal/runtime/executor/helps/claude_device_profile_test.go
+@@ -132,7 +132,7 @@
+ 	if errRequest != nil {
+ 		t.Fatal(errRequest)
+ 	}
+-	incoming := claudeDeviceHeaders("claude-cli/999.0.0 (external, cli)")
++	incoming := claudeDeviceHeaders("claude-cli/not-a-version (external, cli)")
+ 	incoming.Set("X-Stainless-Package-Version", "999.0.0")
+ 	incoming.Set("X-Stainless-Runtime-Version", "v999.0.0")
+ 
+diff --git a/internal/runtime/executor/helps/claude_client_detection.go b/internal/runtime/executor/helps/claude_client_detection.go
+--- a/internal/runtime/executor/helps/claude_client_detection.go
++++ b/internal/runtime/executor/helps/claude_client_detection.go
+@@ -60,12 +60,11 @@
+ 	"claude-coworker-terminal":  "claude-coworker-terminal",
+ }
+ 
+-// Only product surfaces with verified 2.1.220 wire behavior are eligible for
+-// pass-through. Other first-party-looking entrypoints are cloaked until their
+-// CPA-reachable request shape has been captured and reviewed.
+ var nativeClaudeEntrypoints = map[string]bool{
+ 	"cli":           true,
+ 	"sdk-cli":       true,
++	"sdk-ts":        true,
++	"sdk-py":        true,
+ 	"claude-vscode": true,
+ }
+ 
+@@ -123,8 +122,7 @@
+ // applies CPA's native-client policy. Standard Messages requests require all
+ // four strong signals; count_tokens omits metadata.user_id. A separate narrow
+ // profile recognizes measured native Haiku helper requests that intentionally
+-// omit claude-code-20250219. Generic sdk-ts/sdk-py Agent SDK entrypoints remain
+-// unconfirmed and receive CLI cloaking.
++// omit claude-code-20250219.
+ func DetectClaudeCodeRequest(headers http.Header, payload []byte, countTokens bool, configs ...*config.Config) ClaudeCodeRequestDetection {
+ 	var cfg *config.Config
+ 	if len(configs) > 0 {
+@@ -464,9 +462,8 @@
+ 	if !claudeCodeUserAgentPattern.MatchString(userAgent) || !claudeCodeNativeUserAgentPattern.MatchString(userAgent) {
+ 		return false
+ 	}
+-	candidate, okCandidate := parseClaudeCLIVersion(userAgent)
+-	baseline, okBaseline := parseClaudeCLIVersion(defaultClaudeDeviceProfile(cfg).UserAgent)
+-	return okCandidate && okBaseline && plausibleClaudeCLIVersion(candidate, baseline)
++	_, valid := parseClaudeCLIVersion(userAgent)
++	return valid
+ }
+ 
+ func parseClaudeCodeUserAgentDetails(userAgent string) (entrypoint, agentSDKVersion string) {
+diff --git a/internal/runtime/executor/helps/claude_client_detection_test.go b/internal/runtime/executor/helps/claude_client_detection_test.go
+--- a/internal/runtime/executor/helps/claude_client_detection_test.go
++++ b/internal/runtime/executor/helps/claude_client_detection_test.go
+@@ -81,16 +81,16 @@
+ 	}
+ }
+ 
+-func TestDetectClaudeCodeRequestAcceptsConfiguredMeasuredBaseline(t *testing.T) {
++func TestDetectClaudeCodeRequestAcceptsClientVersionWithoutConfiguredBaseline(t *testing.T) {
+ 	headers := confirmedClaudeCodeHeaders()
+-	headers.Set("User-Agent", "claude-cli/2.2.0 (external, cli)")
++	headers.Set("User-Agent", "claude-cli/3.0.0 (external, cli)")
+ 	payload := claudeCodeDetectionPayload(validClaudeCodeMetadataUserID)
+-	if detection := DetectClaudeCodeRequest(headers, payload, false); detection.Confirmed {
+-		t.Fatalf("default detection = %#v, want unconfigured 2.2.0 rejected", detection)
++	if detection := DetectClaudeCodeRequest(headers, payload, false); !detection.Confirmed {
++		t.Fatalf("default detection = %#v, want client version accepted without a configured baseline", detection)
+ 	}
+ 
+ 	cfg := &config.Config{ClaudeHeaderDefaults: config.ClaudeHeaderDefaults{
+-		UserAgent:      "claude-cli/2.2.0 (external, cli)",
++		UserAgent:      "claude-cli/3.0.0 (external, cli)",
+ 		PackageVersion: "0.95.0",
+ 		RuntimeVersion: "v26.4.0",
+ 	}}
+@@ -132,8 +132,8 @@
+ 		{name: "cli", userAgent: "claude-cli/2.1.258 (external, cli)", entrypoint: "cli", subclient: "claude-code-cli", native: true},
+ 		{name: "vscode-agent-sdk", userAgent: "claude-cli/2.1.258 (external, claude-vscode, agent-sdk/0.3.220)", entrypoint: "claude-vscode", subclient: "claude-code-vscode", agentSDKVersion: "0.3.220", native: true},
+ 		{name: "sdk-cli", userAgent: "claude-cli/2.1.258 (external, sdk-cli)", entrypoint: "sdk-cli", subclient: "claude-code-cli-sdk", native: true},
+-		{name: "sdk-ts", userAgent: "claude-cli/2.1.258 (external, sdk-ts, agent-sdk/0.3.220)", entrypoint: "sdk-ts", subclient: "claude-code-sdk-ts", agentSDKVersion: "0.3.220"},
+-		{name: "sdk-py", userAgent: "claude-cli/2.1.258 (external, sdk-py, agent-sdk/0.1.0)", entrypoint: "sdk-py", subclient: "claude-code-sdk-py", agentSDKVersion: "0.1.0"},
++		{name: "sdk-ts", userAgent: "claude-cli/2.1.258 (external, sdk-ts, agent-sdk/0.3.220)", entrypoint: "sdk-ts", subclient: "claude-code-sdk-ts", agentSDKVersion: "0.3.220", native: true},
++		{name: "sdk-py", userAgent: "claude-cli/2.1.258 (external, sdk-py, agent-sdk/0.1.0)", entrypoint: "sdk-py", subclient: "claude-code-sdk-py", agentSDKVersion: "0.1.0", native: true},
+ 		{name: "desktop", userAgent: "claude-cli/2.1.258 (external, claude-desktop)", entrypoint: "claude-desktop", subclient: "claude-desktop"},
+ 		{name: "desktop-third-party-inference", userAgent: "claude-cli/2.1.258 (external, claude-desktop-3p)", entrypoint: "claude-desktop-3p", subclient: "claude-desktop-3p"},
+ 		{name: "remote", userAgent: "claude-cli/2.1.258 (external, remote)", entrypoint: "remote", subclient: "claude-remote"},
+@@ -349,8 +349,8 @@
+ 		{name: "uppercase device", headers: confirmedClaudeCodeHeaders(), userID: `{"device_id":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","account_uuid":"","session_id":"11111111-2222-4333-8444-555555555555"}`},
+ 		{name: "invalid session", headers: confirmedClaudeCodeHeaders(), userID: `{"device_id":"0000000000000000000000000000000000000000000000000000000000000000","account_uuid":"","session_id":"session"}`},
+ 		{name: "malformed user agent", headers: http.Header{"User-Agent": {"claude-cli/not-a-version (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {"claude-code-20250219"}}, userID: validClaudeCodeMetadataUserID},
+-		{name: "unmeasured next-minor user agent", headers: http.Header{"User-Agent": {"claude-cli/2.2.0 (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {"claude-code-20250219"}}, userID: validClaudeCodeMetadataUserID},
+-		{name: "implausible future user agent", headers: http.Header{"User-Agent": {"claude-cli/999.0.0 (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {"claude-code-20250219"}}, userID: validClaudeCodeMetadataUserID},
++		{name: "incomplete version", headers: http.Header{"User-Agent": {"claude-cli/3.0 (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {"claude-code-20250219"}}, userID: validClaudeCodeMetadataUserID},
++		{name: "overflowing version", headers: http.Header{"User-Agent": {"claude-cli/999999999999999999999999999999999.0.0 (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {"claude-code-20250219"}}, userID: validClaudeCodeMetadataUserID},
+ 		{name: "unrelated beta", headers: http.Header{"User-Agent": {"claude-cli/2.1.258 (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {"anything"}}, userID: validClaudeCodeMetadataUserID},
+ 	}
+ 	for _, test := range tests {
+diff --git a/internal/runtime/executor/claude_executor_test.go b/internal/runtime/executor/claude_executor_test.go
+--- a/internal/runtime/executor/claude_executor_test.go
++++ b/internal/runtime/executor/claude_executor_test.go
+@@ -607,7 +607,7 @@
+ 		"X-Stainless-Arch":            []string{"x64"},
+ 	})
+ 	applyClaudeHeaders(firstReq, auth, "key-disable-stability", false, nil, nil, cfg, nil, true)
+-	assertClaudeFingerprint(t, firstReq.Header, "claude-cli/2.1.60 (external, cli)", "0.70.0", "v22.0.0", "MacOS", "arm64")
++	assertClaudeFingerprint(t, firstReq.Header, "claude-cli/2.1.62 (external, cli)", "0.74.0", "v24.3.0", "Linux", "x64")
+ 
+ 	thirdPartyReq := newClaudeHeaderTestRequest(t, http.Header{
+ 		"User-Agent":                  []string{"lobe-chat/1.0"},
+@@ -627,7 +627,7 @@
+ 		"X-Stainless-Arch":            []string{"x64"},
+ 	})
+ 	applyClaudeHeaders(lowerReq, auth, "key-disable-stability", false, nil, nil, cfg, nil, true)
+-	assertClaudeFingerprint(t, lowerReq.Header, "claude-cli/2.1.60 (external, cli)", "0.70.0", "v22.0.0", "MacOS", "arm64")
++	assertClaudeFingerprint(t, lowerReq.Header, "claude-cli/2.1.61 (external, cli)", "0.73.0", "v24.2.0", "Windows", "x64")
+ }
+ 
+ func TestApplyClaudeHeaders_LegacyModePreservesConfiguredUserAgentOverrideForClaudeClients(t *testing.T) {
+@@ -659,7 +659,7 @@
+ 	})
+ 	applyClaudeHeaders(req, auth, "key-legacy-ua-override", false, nil, nil, cfg, nil, true)
+ 
+-	assertClaudeFingerprint(t, req.Header, "config-ua/1.0", "0.70.0", "v22.0.0", "MacOS", "arm64")
++	assertClaudeFingerprint(t, req.Header, "config-ua/1.0", "0.74.0", "v24.3.0", "Linux", "x64")
+ }
+ 
+ func TestApplyClaudeHeaders_LegacyThirdPartyUsesStableConfiguredOSArch(t *testing.T) {
+diff --git a/internal/runtime/executor/fleet_client_versions_test.go b/internal/runtime/executor/fleet_client_versions_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/runtime/executor/fleet_client_versions_test.go
+@@ -0,0 +1,78 @@
++package executor
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"testing"
++
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
++	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
++)
++
++func TestFleetClaudeClientUpdatesPreserveSoftwareHeaders(t *testing.T) {
++	const userID = `{"device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","account_uuid":"","session_id":"11111111-2222-4333-8444-555555555555"}`
++	body := []byte(`{"model":"claude-opus-4-6","messages":[{"role":"user","content":"x"}],"metadata":{"user_id":` + fmt.Sprintf("%q", userID) + `}}`)
++	for _, version := range []string{"1.0.0", "2.1.280", "2.2.0", "3.0.0", "999.0.0"} {
++		for _, entrypoint := range []string{"cli", "sdk-cli", "claude-vscode, agent-sdk/0.3.240", "sdk-ts, agent-sdk/0.3.276", "sdk-py, agent-sdk/0.1.0"} {
++			t.Run(version+"/"+entrypoint, func(t *testing.T) {
++				incoming := http.Header{
++					"User-Agent":                  {"claude-cli/" + version + " (external, " + entrypoint + ")"},
++					"X-App":                       {"cli"},
++					"Anthropic-Beta":              {"claude-code-20250219,oauth-2025-04-20"},
++					"X-Stainless-Package-Version": {"0.120.0"},
++					"X-Stainless-Runtime-Version": {"v26.4.0"},
++				}
++				for _, path := range []string{"/v1/messages", "/v1/messages/count_tokens"} {
++					cfg := &config.Config{}
++					detection := helps.DetectClaudeCodeRequest(incoming, body, path != "/v1/messages", cfg)
++					if !detection.Confirmed {
++						t.Fatalf("native client rejected: %#v", detection)
++					}
++					request, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com"+path, nil)
++					if err := applyClaudeHeaders(request, &cliproxyauth.Auth{Provider: "claude", Attributes: map[string]string{"auth_kind": "oauth"}}, "", true, nil, body, cfg, incoming, detection.Confirmed); err != nil {
++						t.Fatal(err)
++					}
++					for _, name := range []string{"User-Agent", "X-Stainless-Package-Version", "X-Stainless-Runtime-Version"} {
++						if got, want := request.Header.Get(name), incoming.Get(name); got != want {
++							t.Fatalf("%s %s = %q, want %q", path, name, got, want)
++						}
++					}
++				}
++			})
++		}
++	}
++}
++
++func TestFleetCodexClientUpdatesPreserveHTTPAndWebsocketHeaders(t *testing.T) {
++	reg := registry.GetGlobalRegistry()
++	reg.RegisterClient("fleet-version-test", "codex", []*registry.ModelInfo{{
++		ID: "fleet-version-test",
++		Config: &registry.ModelConfig{OverrideHeader: map[string]string{
++			"user-agent": "old-client/0.144.0", "version": "0.144.0", "originator": "old-client", "x-test-header": "model-option",
++		}},
++	}})
++	t.Cleanup(func() { reg.UnregisterClient("fleet-version-test") })
++	cfg := &config.Config{}
++	cfg.Codex.DisableCodexCloaking = true
++	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"auth_kind": "oauth"}}
++	for _, version := range []string{"0.154.0", "0.200.0"} {
++		incoming := http.Header{"User-Agent": {"codex_cli_rs/" + version}, "Version": {version}, "Originator": {"codex_cli_rs"}}
++		request, _ := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", nil)
++		applyCodexHeadersFromSources(request, auth, "", true, cfg, incoming)
++		websocket := applyCodexWebsocketHeaders(context.Background(), nil, auth, "", cfg, incoming)
++		for _, headers := range []http.Header{request.Header, websocket} {
++			applyModelHeaderOverrides(headers, "fleet-version-test", cfg)
++			if headers.Get("X-Test-Header") != "model-option" {
++				t.Fatal("model-specific non-identity header was lost")
++			}
++			for _, name := range []string{"User-Agent", "Version", "Originator"} {
++				if got, want := headers.Get(name), incoming.Get(name); got != want {
++					t.Fatalf("%s = %q, want %q", name, got, want)
++				}
++			}
++		}
++	}
++}
+diff --git a/internal/runtime/executor/codex_websockets_stream.go b/internal/runtime/executor/codex_websockets_stream.go
+--- a/internal/runtime/executor/codex_websockets_stream.go
++++ b/internal/runtime/executor/codex_websockets_stream.go
+@@ -83,7 +83,7 @@
+ 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
+ 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
+ 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg, opts.Headers)
+-	applyModelHeaderOverrides(wsHeaders, baseModel)
++	applyModelHeaderOverrides(wsHeaders, baseModel, e.cfg)
+ 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
+ 
+ 	var authID, authLabel, authType, authValue string
+diff --git a/internal/runtime/executor/codex_openai_images.go b/internal/runtime/executor/codex_openai_images.go
+--- a/internal/runtime/executor/codex_openai_images.go
++++ b/internal/runtime/executor/codex_openai_images.go
+@@ -113,7 +113,7 @@
+ 		return resp, errCache
+ 	}
+ 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg, opts.Headers)
+-	applyModelHeaderOverrides(httpReq.Header, mainModel)
++	applyModelHeaderOverrides(httpReq.Header, mainModel, e.cfg)
+ 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+ 	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq.Header.Clone(), body)
+ 
+@@ -210,7 +210,7 @@
+ 		return nil, errCache
+ 	}
+ 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg, opts.Headers)
+-	applyModelHeaderOverrides(httpReq.Header, mainModel)
++	applyModelHeaderOverrides(httpReq.Header, mainModel, e.cfg)
+ 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+ 	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq.Header.Clone(), body)
+ 
+@@ -337,7 +337,7 @@
+ 		return resp, errCache
+ 	}
+ 	applyCodexDirectImageHeaders(httpReq, auth, apiKey, false, e.cfg)
+-	applyModelHeaderOverrides(httpReq.Header, model)
++	applyModelHeaderOverrides(httpReq.Header, model, e.cfg)
+ 	if contentType != "" {
+ 		httpReq.Header.Set("Content-Type", contentType)
+ 	}
+@@ -398,7 +398,7 @@
+ 		return nil, errCache
+ 	}
+ 	applyCodexDirectImageHeaders(httpReq, auth, apiKey, true, e.cfg)
+-	applyModelHeaderOverrides(httpReq.Header, model)
++	applyModelHeaderOverrides(httpReq.Header, model, e.cfg)
+ 	if contentType != "" {
+ 		httpReq.Header.Set("Content-Type", contentType)
+ 	}
+diff --git a/internal/runtime/executor/codex_executor_stream.go b/internal/runtime/executor/codex_executor_stream.go
+--- a/internal/runtime/executor/codex_executor_stream.go
++++ b/internal/runtime/executor/codex_executor_stream.go
+@@ -86,7 +86,7 @@
+ 		return nil, err
+ 	}
+ 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg, opts.Headers)
+-	applyModelHeaderOverrides(httpReq.Header, baseModel)
++	applyModelHeaderOverrides(httpReq.Header, baseModel, e.cfg)
+ 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+ 	var authID, authLabel, authType, authValue string
+ 	if auth != nil {
+diff --git a/internal/runtime/executor/codex_websockets_execute.go b/internal/runtime/executor/codex_websockets_execute.go
+--- a/internal/runtime/executor/codex_websockets_execute.go
++++ b/internal/runtime/executor/codex_websockets_execute.go
+@@ -86,7 +86,7 @@
+ 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)
+ 	reporter.SetTranslatedReasoningEffort(clientBody, to.String())
+ 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg, opts.Headers)
+-	applyModelHeaderOverrides(wsHeaders, baseModel)
++	applyModelHeaderOverrides(wsHeaders, baseModel, e.cfg)
+ 	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
+ 
+ 	var authID, authLabel, authType, authValue string
+diff --git a/internal/runtime/executor/codex_executor_execute.go b/internal/runtime/executor/codex_executor_execute.go
+--- a/internal/runtime/executor/codex_executor_execute.go
++++ b/internal/runtime/executor/codex_executor_execute.go
+@@ -80,7 +80,7 @@
+ 		return resp, err
+ 	}
+ 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg, opts.Headers)
+-	applyModelHeaderOverrides(httpReq.Header, baseModel)
++	applyModelHeaderOverrides(httpReq.Header, baseModel, e.cfg)
+ 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+ 	var authID, authLabel, authType, authValue string
+ 	if auth != nil {
+@@ -240,7 +240,7 @@
+ 		return resp, err
+ 	}
+ 	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg, opts.Headers)
+-	applyModelHeaderOverrides(httpReq.Header, baseModel)
++	applyModelHeaderOverrides(httpReq.Header, baseModel, e.cfg)
+ 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+ 	var authID, authLabel, authType, authValue string
+ 	if auth != nil {
+diff --git a/internal/runtime/executor/codex_executor_request.go b/internal/runtime/executor/codex_executor_request.go
+--- a/internal/runtime/executor/codex_executor_request.go
++++ b/internal/runtime/executor/codex_executor_request.go
+@@ -289,7 +289,7 @@
+ }
+ 
+ // applyModelHeaderOverrides forces models.json config.override_header onto upstream headers.
+-func applyModelHeaderOverrides(headers http.Header, modelName string) {
++func applyModelHeaderOverrides(headers http.Header, modelName string, cfg *config.Config) {
+ 	if headers == nil {
+ 		return
+ 	}
+@@ -298,6 +298,12 @@
+ 		return
+ 	}
+ 	for key, value := range overrides {
++		if cfg != nil && cfg.Codex.DisableCodexCloaking {
++			switch strings.ToLower(key) {
++			case "user-agent", "version", "originator":
++				continue
++			}
++		}
+ 		headers.Set(key, value)
+ 	}
+ 	if strings.Contains(headers.Get("User-Agent"), "Mac OS") && codexSessionHeaderValue(headers) == "" {
+diff --git a/sdk/cliproxy/auth/conductor_request_scoped_errors.go b/sdk/cliproxy/auth/conductor_request_scoped_errors.go
+--- a/sdk/cliproxy/auth/conductor_request_scoped_errors.go
++++ b/sdk/cliproxy/auth/conductor_request_scoped_errors.go
+@@ -182,8 +182,11 @@
+ func matchRequestScopedErrorAction(auth *Auth, err error, cfg *internalconfig.Config) (string, bool) {
+ 	if err == nil {
+ 		return "", false
+ 	}
++	if auth != nil && auth.Provider == "claude" && statusCodeFromError(err) == 429 && isRequestScopedError(err) {
++		return RequestScopedActionStop, true
++	}
+ 	rules := extractRequestScopedErrorRules(auth, cfg)
+ 	if len(rules) == 0 {
+ 		return "", false
+ 	}
+
+diff --git a/sdk/cliproxy/auth/fleet_opus_cooldown_test.go b/sdk/cliproxy/auth/fleet_opus_cooldown_test.go
+new file mode 100644
+--- /dev/null
++++ b/sdk/cliproxy/auth/fleet_opus_cooldown_test.go
+@@ -0,0 +1,66 @@
++package auth
++
++import (
++	"context"
++	"errors"
++	"net/http"
++	"sync/atomic"
++	"testing"
++
++	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
++)
++
++func TestFleetFastRefusalCannotPoisonStandardOpus(t *testing.T) {
++	for _, stream := range []bool{false, true} {
++		t.Run(map[bool]string{false: "non-stream", true: "stream"}[stream], func(t *testing.T) {
++			var calls atomic.Int32
++			const body = `{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}`
++			refusal := newFastDirectResponseTestError(http.StatusTooManyRequests, body)
++			executor := &claudeCancellationTestExecutor{}
++			executor.executeFn = func(context.Context, *Auth) (cliproxyexecutor.Response, error) {
++				if calls.Add(1) == 1 {
++					return cliproxyexecutor.Response{}, refusal
++				}
++				return cliproxyexecutor.Response{Payload: []byte(`{"type":"message","content":[]}`)}, nil
++			}
++			executor.streamFn = func(context.Context, *Auth) (*cliproxyexecutor.StreamResult, error) {
++				if calls.Add(1) == 1 {
++					return nil, refusal
++				}
++				chunks := make(chan cliproxyexecutor.StreamChunk, 1)
++				chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("ok")}
++				close(chunks)
++				return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
++			}
++			manager, auth, model := newClaudeCancellationTestManager(t, executor, nil)
++			manager.SetConfig(&internalconfig.Config{OAuthRequestScopedErrors: map[string][]internalconfig.RequestScopedErrorRule{
++				"claude": {{Status: 429, Match: []string{"rate_limit_error"}, Action: RequestScopedActionContinueAndCooldown}},
++			}})
++			run := func() error {
++				if !stream {
++					_, err := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
++					return err
++				}
++				result, err := manager.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
++				if err == nil {
++					for range result.Chunks {
++					}
++				}
++				return err
++			}
++			err := run()
++			var direct *cliproxyexecutor.RequestTerminatedError
++			if !errors.As(err, &direct) || string(direct.Body) != body {
++				t.Fatalf("Fast refusal was replaced: %v", err)
++			}
++			requireClaudeCancellationNeutral(t, manager, auth.ID, model)
++			if err = run(); err != nil {
++				t.Fatalf("standard follow-up failed: %v", err)
++			}
++			if calls.Load() != 2 {
++				t.Fatalf("upstream calls = %d, want 2", calls.Load())
++			}
++		})
++	}
++}
+diff --git a/internal/runtime/executor/antigravity_executor_transport_test.go b/internal/runtime/executor/antigravity_executor_transport_test.go
+--- a/internal/runtime/executor/antigravity_executor_transport_test.go
++++ b/internal/runtime/executor/antigravity_executor_transport_test.go
+@@ -176,24 +176,38 @@
+ // the pool limit: with Go's default of 2 idle connections per host, repeated waves of
+ // concurrent requests on one credential keep re-handshaking.
+ func TestAntigravityConcurrentRequestsReusePooledConnections(t *testing.T) {
+-	var mu sync.Mutex
+-	remotes := map[string]struct{}{}
+-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		mu.Lock()
+-		remotes[r.RemoteAddr] = struct{}{}
+-		mu.Unlock()
+-		w.WriteHeader(http.StatusOK)
+-	}))
+-	defer srv.Close()
+-
+-	auth := antigravityAuthWithIDAndProxy("concurrent-reuse", "")
+-	client := &http.Client{Transport: antigravityHTTP11Transport(auth, http.DefaultTransport.(*http.Transport))}
+-
+ 	const (
+ 		waves      = 3
+ 		perWave    = 8
+ 		totalConns = waves * perWave
+ 	)
++	var mu sync.Mutex
++	remotes := map[string]struct{}{}
++	arrived := 0
++	waveReady := make(chan struct{})
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		mu.Lock()
++		remotes[r.RemoteAddr] = struct{}{}
++		ready := waveReady
++		arrived++
++		if arrived == perWave {
++			close(waveReady)
++			arrived = 0
++			waveReady = make(chan struct{})
++		}
++		mu.Unlock()
++		select {
++		case <-ready:
++		case <-r.Context().Done():
++			return
++		}
++		w.WriteHeader(http.StatusOK)
++	}))
++	defer srv.Close()
++
++	auth := antigravityAuthWithIDAndProxy("concurrent-reuse", "")
++	client := &http.Client{Transport: antigravityHTTP11Transport(auth, http.DefaultTransport.(*http.Transport)), Timeout: 5 * time.Second}
++
+ 	for wave := 0; wave < waves; wave++ {
+ 		start := make(chan struct{})
+ 		var wg sync.WaitGroup

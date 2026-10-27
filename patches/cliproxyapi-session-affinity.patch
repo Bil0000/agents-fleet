@@ -1,0 +1,472 @@
+diff --git a/internal/api/handlers/management/config_basic.go b/internal/api/handlers/management/config_basic.go
+--- a/internal/api/handlers/management/config_basic.go
++++ b/internal/api/handlers/management/config_basic.go
+@@ -30,8 +30,9 @@
+ 	}
+ 	c.JSON(200, struct {
+ 		*config.Config
+-		FleetCreditRoutingSupported bool `json:"fleet-credit-routing-supported"`
+-	}{new(*h.cfg), true})
++		FleetCreditRoutingSupported   bool `json:"fleet-credit-routing-supported"`
++		FleetSessionAffinitySupported bool `json:"fleet-session-affinity-supported"`
++	}{new(*h.cfg), true, true})
+ }
+ 
+ type releaseInfo struct {
+diff --git a/internal/api/handlers/management/fleet_session_affinity.go b/internal/api/handlers/management/fleet_session_affinity.go
+new file mode 100644
+--- /dev/null
++++ b/internal/api/handlers/management/fleet_session_affinity.go
+@@ -0,0 +1,32 @@
++package management
++
++import (
++	"net/http"
++
++	"github.com/gin-gonic/gin"
++)
++
++func (h *Handler) ResetFleetSessionAffinity(c *gin.Context) {
++	var request struct {
++		Provider string `json:"provider"`
++	}
++	if c.ShouldBindJSON(&request) != nil || (request.Provider != "claude" && request.Provider != "codex") {
++		c.JSON(http.StatusBadRequest, gin.H{"error": "provider must be claude or codex"})
++		return
++	}
++	if h.authManager == nil {
++		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "auth manager unavailable"})
++		return
++	}
++	selector, ok := h.authManager.Selector().(interface{ InvalidateAuth(string) })
++	if !ok {
++		c.JSON(http.StatusConflict, gin.H{"error": "session affinity is not enabled"})
++		return
++	}
++	for _, account := range h.authManager.List() {
++		if account.Provider == request.Provider {
++			selector.InvalidateAuth(account.ID)
++		}
++	}
++	c.JSON(http.StatusOK, gin.H{"status": "ok"})
++}
+diff --git a/internal/api/server_management.go b/internal/api/server_management.go
+--- a/internal/api/server_management.go
++++ b/internal/api/server_management.go
+@@ -28,6 +28,7 @@
+ 	mgmt.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
+ 	{
+ 		mgmt.GET("/config", s.mgmt.GetConfig)
++		mgmt.POST("/routing/session-affinity/reset", s.mgmt.ResetFleetSessionAffinity)
+ 		mgmt.GET("/config.yaml", s.mgmt.GetConfigYAML)
+ 		mgmt.PUT("/config.yaml", s.mgmt.PutConfigYAML)
+ 		mgmt.GET("/latest-version", s.mgmt.GetLatestVersion)
+diff --git a/sdk/cliproxy/auth/conductor_selection.go b/sdk/cliproxy/auth/conductor_selection.go
+--- a/sdk/cliproxy/auth/conductor_selection.go
++++ b/sdk/cliproxy/auth/conductor_selection.go
+@@ -1501,6 +1501,9 @@
+ 
+ 	m.mu.RLock()
+ 	selector := m.selector
++	if affinity, ok := selector.(*SessionAffinitySelector); ok {
++		ctx = affinity.withResetGeneration(ctx, opts.Metadata)
++	}
+ 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = selectionArgForSelector(selector, model)
+ 	pluginScheduler := m.pluginScheduler
+ 	executor, okExecutor := m.executors[provider]
+@@ -1841,6 +1844,9 @@
+ 
+ 	m.mu.RLock()
+ 	selector := m.selector
++	if affinity, ok := selector.(*SessionAffinitySelector); ok {
++		ctx = affinity.withResetGeneration(ctx, opts.Metadata)
++	}
+ 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = selectionArgForSelector(selector, model)
+ 	pluginScheduler := m.pluginScheduler
+ 	candidates := make([]*Auth, 0, len(m.auths))
+diff --git a/sdk/cliproxy/auth/selector.go b/sdk/cliproxy/auth/selector.go
+--- a/sdk/cliproxy/auth/selector.go
++++ b/sdk/cliproxy/auth/selector.go
+@@ -878,14 +878,21 @@
+ 	return true, blockReasonOther, time.Time{}
+ }
+ 
++const fleetSessionAffinityGenerationMetadataKey = "fleet-session-affinity-generation"
++
++type fleetSessionAffinityGenerationContextKey struct{}
++
+ // SessionAffinitySelector wraps another selector with session-sticky behavior.
+ // It extracts session ID from multiple sources and maintains session-to-auth
+ // mappings with automatic failover when the bound auth becomes unavailable.
+ type SessionAffinitySelector struct {
+-	fallback         Selector
+-	cache            *SessionCache
+-	matcher          *cliproxysession.MerklePrefixMatcher
+-	subagentAffinity bool
++	resetMu           sync.RWMutex
++	resetGeneration   uint64
++	authInvalidatedAt map[string]uint64
++	fallback          Selector
++	cache             *SessionCache
++	matcher           *cliproxysession.MerklePrefixMatcher
++	subagentAffinity  bool
+ }
+ 
+ // SessionAffinityConfig configures the session affinity selector.
+@@ -927,6 +934,17 @@
+ // Deprecated: Session tree management has moved to Home.
+ func (s *SessionAffinitySelector) Trees() *cliproxysession.InMemorySessionTreeStore {
+ 	return cliproxysession.NewInMemorySessionTreeStore(0, time.Hour)
++}
++
++func (s *SessionAffinitySelector) withResetGeneration(ctx context.Context, metadata map[string]any) context.Context {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	s.resetMu.RLock()
++	generation := s.resetGeneration
++	metadata[fleetSessionAffinityGenerationMetadataKey] = generation
++	s.resetMu.RUnlock()
++	return context.WithValue(ctx, fleetSessionAffinityGenerationContextKey{}, generation)
+ }
+ 
+ // Pick selects an auth with session affinity when possible.
+@@ -943,12 +961,26 @@
+ // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
+ // that may be supported by different auth credentials, and to avoid cross-provider conflicts.
+ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
++	s.resetMu.RLock()
++	defer s.resetMu.RUnlock()
+ 	entry := selectorLogEntry(ctx)
+ 	if opts.Metadata == nil {
+ 		opts.Metadata = make(map[string]any)
+ 	}
++	generation := s.resetGeneration
++	if ctx != nil {
++		if captured, ok := ctx.Value(fleetSessionAffinityGenerationContextKey{}).(uint64); ok {
++			generation = captured
++		}
++	}
++	opts.Metadata[fleetSessionAffinityGenerationMetadataKey] = generation
+ 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
+ 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
++	for _, auth := range auths {
++		if auth != nil && generation < s.authInvalidatedAt[auth.ID] {
++			return s.fallback.Pick(ctx, provider, model, opts, auths)
++		}
++	}
+ 
+ 	// Explicit harness identities are absolute authority. The LCP matcher is only
+ 	// consulted when no header, body, or execution-session identity is present.
+@@ -1249,9 +1281,16 @@
+ // InvalidateAuth removes all session bindings for a specific auth.
+ // Called when an auth becomes rate-limited or unavailable.
+ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
+-	if s == nil {
++	if s == nil || authID == "" {
+ 		return
+ 	}
++	s.resetMu.Lock()
++	defer s.resetMu.Unlock()
++	s.resetGeneration++
++	if s.authInvalidatedAt == nil {
++		s.authInvalidatedAt = make(map[string]uint64)
++	}
++	s.authInvalidatedAt[authID] = s.resetGeneration
+ 	if s.cache != nil {
+ 		s.cache.InvalidateAuth(authID)
+ 	}
+@@ -1263,6 +1302,12 @@
+ // OnResult handles session affinity binding or release based on execution outcome.
+ func (s *SessionAffinitySelector) OnResult(res Result) {
+ 	if s == nil || res.AuthID == "" {
++		return
++	}
++	s.resetMu.RLock()
++	defer s.resetMu.RUnlock()
++	generation, _ := res.Options.Metadata[fleetSessionAffinityGenerationMetadataKey].(uint64)
++	if generation < s.authInvalidatedAt[res.AuthID] {
+ 		return
+ 	}
+ 
+diff --git a/sdk/cliproxy/auth/fleet_session_affinity_test.go b/sdk/cliproxy/auth/fleet_session_affinity_test.go
+new file mode 100644
+--- /dev/null
++++ b/sdk/cliproxy/auth/fleet_session_affinity_test.go
+@@ -0,0 +1,276 @@
++package auth
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
++	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
++	"github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
++)
++
++func TestFleetSessionAffinityCreditAndDisabledEligibility(t *testing.T) {
++	for _, provider := range []string{"claude", "codex"} {
++		for _, mode := range []string{"never", "last"} {
++			for _, mixed := range []bool{false, true} {
++				path := "/single"
++				if mixed {
++					path = "/mixed"
++				}
++				t.Run(provider+"/"+mode+path, func(t *testing.T) {
++					ctx := context.Background()
++					file := filepath.Join(t.TempDir(), "routing.json")
++					t.Setenv("FLEET_ACCOUNT_ROUTING_FILE", file)
++					setMode := func(mode string) {
++						t.Helper()
++						policy, _ := json.Marshal(map[string]any{"version": 1, "credits": map[string]string{provider: mode}})
++						if err := os.WriteFile(file, policy, 0600); err != nil {
++							t.Fatal(err)
++						}
++					}
++					available := `{"rate_limit":{"limit_reached":false,"primary_window":{"used_percent":0}},"credits":{"has_credits":true}}`
++					exhausted := `{"rate_limit":{"limit_reached":true,"primary_window":{"used_percent":100}},"credits":{"has_credits":true}}`
++					if provider == "claude" {
++						available = `{"five_hour":{"utilization":0},"seven_day":{"utilization":0},"extra_usage":{"is_enabled":true,"monthly_limit":100,"used_credits":0}}`
++						exhausted = `{"five_hour":{"utilization":100},"seven_day":{"utilization":0},"extra_usage":{"is_enabled":true,"monthly_limit":100,"used_credits":0}}`
++					}
++					executor := &fleetCreditTestExecutor{schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: provider}, bodies: map[string]string{"a": exhausted, "b": available}}
++					affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: &FillFirstSelector{}, TTL: time.Hour})
++					defer affinity.Stop()
++					manager := NewManager(nil, affinity, nil)
++					manager.RegisterExecutor(executor)
++					for id, priority := range map[string]string{"a": "2", "b": "1"} {
++						if _, err := manager.Register(ctx, &Auth{ID: id, Provider: provider, Status: StatusActive, Attributes: map[string]string{AttributeAuthKind: AuthKindOAuth, "priority": priority}}); err != nil {
++							t.Fatal(err)
++						}
++					}
++					opts := cliproxyexecutor.Options{Headers: http.Header{"Session-Id": []string{"stable-session"}}}
++					pick := func(want string) {
++						t.Helper()
++						var got *Auth
++						var err error
++						if mixed {
++							got, _, _, err = manager.pickNextMixed(ctx, []string{provider}, "", opts, nil)
++						} else {
++							got, _, err = manager.pickNext(ctx, provider, "", opts, nil)
++						}
++						if want == "" {
++							if err == nil || got != nil {
++								t.Fatalf("got %v, %v; want blocked", got, err)
++							}
++						} else if err != nil || got == nil || got.ID != want {
++							t.Fatalf("got %v, %v; want %s", got, err, want)
++						}
++					}
++					setMode("same-account")
++					pick("a")
++					for _, account := range manager.List() {
++						if account.ID == "b" {
++							account.Attributes["priority"] = "3"
++							if _, err := manager.Update(ctx, account); err != nil {
++								t.Fatal(err)
++							}
++						}
++					}
++					pick("a")
++					setMode(mode)
++					pick("b")
++					for _, account := range manager.List() {
++						if account.ID == "b" {
++							account.Disabled = true
++							account.Status = StatusDisabled
++							if _, err := manager.Update(ctx, account); err != nil {
++								t.Fatal(err)
++							}
++						}
++					}
++					if mode == "last" {
++						pick("a")
++					} else {
++						pick("")
++					}
++				})
++			}
++		}
++	}
++}
++
++func TestFleetSessionAffinityResetRejectsDelayedResults(t *testing.T) {
++	for _, explicit := range []bool{false, true} {
++		name := "legacy"
++		if explicit {
++			name = "explicit"
++		}
++		t.Run(name, func(t *testing.T) {
++			s := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: &FillFirstSelector{}, TTL: time.Hour})
++			defer s.Stop()
++			auths := []*Auth{{ID: "a", Attributes: map[string]string{"priority": "2"}}, {ID: "b", Attributes: map[string]string{"priority": "1"}}}
++			opts := cliproxyexecutor.Options{
++				SourceFormat:    translator.FormatOpenAI,
++				OriginalRequest: []byte(`{"messages":[{"role":"user","content":"hello"}]}`),
++				Metadata:        map[string]any{cliproxyexecutor.CallerScopeMetadataKey: "caller"},
++			}
++			if explicit {
++				opts.Headers = http.Header{"Session-Id": []string{"native-session"}}
++			}
++			first, err := s.Pick(context.Background(), "claude", "model", opts, auths)
++			if err != nil || first == nil || first.ID != "a" {
++				t.Fatalf("initial selection = %v, %v; want a", first, err)
++			}
++			auths[1].Attributes["priority"] = "3"
++			s.InvalidateAuth("a")
++			s.InvalidateAuth("b")
++			done := make(chan struct{})
++			go func() {
++				defer close(done)
++				for i := 0; i < 100; i++ {
++					s.OnResult(Result{AuthID: "a", Provider: "claude", Model: "model", Success: true, Options: opts})
++				}
++			}()
++			for i := 0; i < 100; i++ {
++				s.InvalidateAuth("a")
++			}
++			<-done
++			next, err := s.Pick(context.Background(), "claude", "model", opts, auths)
++			if err != nil || next == nil || next.ID != "b" {
++				t.Fatalf("selection after delayed result = %v, %v; want manual choice b", next, err)
++			}
++		})
++	}
++}
++
++func TestFleetSessionAffinityResetPreservesOtherProviderResults(t *testing.T) {
++	s := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: &FillFirstSelector{}, TTL: time.Hour})
++	defer s.Stop()
++	auths := []*Auth{{ID: "codex-a", Attributes: map[string]string{"priority": "2"}}, {ID: "codex-b", Attributes: map[string]string{"priority": "1"}}}
++	opts := cliproxyexecutor.Options{
++		SourceFormat:    translator.FormatOpenAI,
++		OriginalRequest: []byte(`{"messages":[{"role":"user","content":"hello"}]}`),
++		Metadata:        map[string]any{cliproxyexecutor.CallerScopeMetadataKey: "caller"},
++	}
++	first, err := s.Pick(context.Background(), "codex", "model", opts, auths)
++	if err != nil || first == nil || first.ID != "codex-a" {
++		t.Fatalf("initial selection = %v, %v; want codex-a", first, err)
++	}
++	s.InvalidateAuth("claude-a")
++	s.matcher.InvalidateAuth("codex-a")
++	s.OnResult(Result{AuthID: "codex-a", Provider: "codex", Model: "model", Success: true, Options: opts})
++	auths[1].Attributes["priority"] = "3"
++	next, err := s.Pick(context.Background(), "codex", "model", opts, auths)
++	if err != nil || next == nil || next.ID != "codex-a" {
++		t.Fatalf("other provider result binding = %v, %v; want codex-a", next, err)
++	}
++}
++
++func TestFleetSessionAffinityResetRejectsStaleCandidateBinding(t *testing.T) {
++	for _, provider := range []string{"claude", "codex"} {
++		for _, mixed := range []bool{false, true} {
++			for _, explicit := range []bool{false, true} {
++				name := provider + "/single/legacy"
++				if mixed {
++					name = provider + "/mixed/legacy"
++				}
++				if explicit {
++					name += "/explicit"
++				}
++				t.Run(name, func(t *testing.T) {
++					ctx := context.Background()
++					s := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: &FillFirstSelector{}, TTL: time.Hour})
++					defer s.Stop()
++					manager := NewManager(nil, s, nil)
++					manager.RegisterExecutor(schedulerProviderTestExecutor{provider: provider})
++					for id, priority := range map[string]string{"a": "2", "b": "1"} {
++						if _, err := manager.Register(ctx, &Auth{ID: id, Provider: provider, Attributes: map[string]string{"priority": priority}}); err != nil {
++							t.Fatal(err)
++						}
++					}
++					first := true
++					manager.SetPluginScheduler(&fakePluginScheduler{pick: func(context.Context, pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, bool, error) {
++						if first {
++							first = false
++							for _, account := range manager.List() {
++								if account.ID == "b" {
++									account.Attributes["priority"] = "3"
++									if _, err := manager.Update(ctx, account); err != nil {
++										t.Fatal(err)
++									}
++								}
++							}
++							s.InvalidateAuth("a")
++							s.InvalidateAuth("b")
++						}
++						return pluginapi.SchedulerPickResponse{}, false, nil
++					}})
++					opts := cliproxyexecutor.Options{
++						SourceFormat:    translator.FormatOpenAI,
++						OriginalRequest: []byte(`{"messages":[{"role":"user","content":"hello"}]}`),
++						Metadata:        map[string]any{cliproxyexecutor.CallerScopeMetadataKey: "caller"},
++					}
++					if explicit {
++						opts.Headers = http.Header{"Session-Id": []string{"native-session"}}
++					}
++					pick := func() (*Auth, error) {
++						if mixed {
++							auth, _, _, err := manager.pickNextMixed(ctx, []string{provider}, "", opts, nil)
++							return auth, err
++						}
++						auth, _, err := manager.pickNext(ctx, provider, "", opts, nil)
++						return auth, err
++					}
++					old, err := pick()
++					if err != nil || old == nil {
++						t.Fatalf("in-flight selection = %v, %v", old, err)
++					}
++					s.OnResult(Result{AuthID: old.ID, Provider: provider, Success: true, Options: opts})
++					next, err := pick()
++					if err != nil || next == nil || next.ID != "b" {
++						t.Fatalf("selection after stale candidate = %v, %v; want manual choice b", next, err)
++					}
++				})
++			}
++		}
++	}
++}
++
++func TestFleetSessionAffinityPluginResultUsesCurrentGeneration(t *testing.T) {
++	ctx := context.Background()
++	s := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: &FillFirstSelector{}, TTL: time.Hour})
++	defer s.Stop()
++	manager := NewManager(nil, s, nil)
++	manager.RegisterExecutor(schedulerProviderTestExecutor{provider: "claude"})
++	for id, priority := range map[string]string{"a": "2", "b": "1"} {
++		if _, err := manager.Register(ctx, &Auth{ID: id, Provider: "claude", Attributes: map[string]string{"priority": priority}}); err != nil {
++			t.Fatal(err)
++		}
++	}
++	s.InvalidateAuth("a")
++	manager.SetPluginScheduler(&fakePluginScheduler{handled: true, resp: pluginapi.SchedulerPickResponse{Handled: true, AuthID: "a"}})
++	opts := cliproxyexecutor.Options{
++		SourceFormat:    translator.FormatOpenAI,
++		OriginalRequest: []byte(`{"messages":[{"role":"user","content":"hello"}]}`),
++		Metadata:        map[string]any{cliproxyexecutor.CallerScopeMetadataKey: "caller"},
++	}
++	selected, _, err := manager.pickNext(ctx, "claude", "", opts, nil)
++	if err != nil || selected == nil || selected.ID != "a" {
++		t.Fatalf("plugin selection = %v, %v; want a", selected, err)
++	}
++	s.OnResult(Result{AuthID: "a", Provider: "claude", Success: true, Options: opts})
++	manager.SetPluginScheduler(nil)
++	for _, account := range manager.List() {
++		if account.ID == "b" {
++			account.Attributes["priority"] = "3"
++			if _, err := manager.Update(ctx, account); err != nil {
++				t.Fatal(err)
++			}
++		}
++	}
++	next, _, err := manager.pickNext(ctx, "claude", "", opts, nil)
++	if err != nil || next == nil || next.ID != "a" {
++		t.Fatalf("plugin result binding = %v, %v; want a", next, err)
++	}
++}
