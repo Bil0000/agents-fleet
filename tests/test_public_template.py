@@ -125,17 +125,18 @@ class PublicMcpTemplateTest(unittest.TestCase):
 class PublicMemoryTemplateTest(unittest.TestCase):
     def test_missing_shared_memory_config_uses_local_plugin_mode(self):
         with tempfile.TemporaryDirectory() as temporary:
-            line, ok = discovery.memory_status_line(ROOT, Path(temporary), "test-local")
+            line, ok = discovery.memory_status_line(Path(temporary), Path(temporary) / "home", "test-local")
 
         self.assertEqual(line, "memory: local (plugin-managed)")
         self.assertTrue(ok)
 
     def test_shared_memory_command_explains_how_to_enable_it(self):
-        with self.assertRaisesRegex(
-            memory.FleetMemoryError,
-            "Copy memory.example.toml to memory.toml",
-        ):
-            memory.load_config(ROOT)
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                memory.FleetMemoryError,
+                "Copy memory.example.toml to memory.toml",
+            ):
+                memory.load_config(Path(temporary))
 
 
 class PublicPluginTemplateTest(unittest.TestCase):
@@ -143,15 +144,15 @@ class PublicPluginTemplateTest(unittest.TestCase):
         def missing_client(name, home):
             raise AssertionError(f"looked for {name}")
 
-        self.assertEqual(
-            apply.sync_plugins(
-                ROOT,
-                Path("/tmp/fleet-test-home"),
-                "test-local",
-                clients=(missing_client, None),
-            ),
-            {"claude": [], "codex": []},
-        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "plugins.json").write_text(json.dumps({
+                client: {"marketplaces": {}, "plugins": []} for client in ("claude", "codex")
+            }))
+            self.assertEqual(
+                apply.sync_plugins(root, root / "home", "test-local", clients=(missing_client, None)),
+                {"claude": [], "codex": []},
+            )
 
 
 class PublicRepositoryValidationTest(unittest.TestCase):

@@ -15,6 +15,8 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
+from fleet_fixture import copy_fixture
+
 
 ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).parents[1]).resolve()
 sys.dont_write_bytecode = True
@@ -87,7 +89,7 @@ class FleetApplyTest(unittest.TestCase):
         self.home = Path(self.temporary.name) / "home"
         self.home.mkdir()
         self.repo = Path(self.temporary.name) / "repo"
-        shutil.copytree(ROOT, self.repo, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+        copy_fixture(ROOT, self.repo)
         host = self.repo / "hosts/test-linux"
         host.mkdir()
         (host / "host.toml").write_text('id = "test-linux"\nos = "linux"\nrole = "workstation"\n')
@@ -141,6 +143,35 @@ class FleetApplyTest(unittest.TestCase):
         self.assertEqual((self.home / ".local/bin/fleet-claude").readlink(), Path("../share/fleet/current/bin/fleet-client"))
         self.assertEqual(result["managed_mcp"], [])
         self.assertEqual(result["plugins"], {"claude": [], "codex": []})
+
+    def test_shared_memory_config_is_available_in_the_installed_release(self):
+        contents = (ROOT / "memory.example.toml").read_text()
+        (self.repo / "memory.toml").write_text(contents)
+        (self.repo / "rules/common.md").write_text("Use shared memory.\n")
+        self.commit()
+
+        self.apply()
+
+        release = self.home / ".local/share/fleet/current"
+        spec = importlib.util.spec_from_file_location("installed_memory", release / "lib/fleet_memory.py")
+        memory = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(memory)
+        self.assertEqual(memory.load_config(release).server_host, "memory-server")
+        self.assertEqual((release / "memory.toml").read_text(), contents)
+
+    def test_personal_memory_and_plugins_do_not_break_template_tests(self):
+        (self.repo / "memory.toml").write_text((ROOT / "memory.example.toml").read_text())
+        (self.repo / "plugins.json").write_text(json.dumps({
+            "codex": {"marketplaces": {"own-tools": "example/own-tools"}, "plugins": []},
+            "claude": {"marketplaces": {}, "plugins": []},
+        }))
+
+        result = subprocess.run(
+            [sys.executable, "-B", str(self.repo / "tests/test_public_template.py"), str(self.repo)],
+            cwd=self.repo, capture_output=True, text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_provider_models_and_account_routing_stay_unmanaged(self):
         self.apply()
