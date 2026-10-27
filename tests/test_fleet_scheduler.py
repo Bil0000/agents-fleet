@@ -13,6 +13,8 @@ from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 
+from fleet_fixture import copy_fixture
+
 
 ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).parents[1]).resolve()
 sys.dont_write_bytecode = True
@@ -122,7 +124,7 @@ class FleetSchedulerTest(unittest.TestCase):
         self.home = Path(self.temporary.name) / "home"
         self.home.mkdir()
         self.repo = Path(self.temporary.name) / "repo"
-        shutil.copytree(ROOT, self.repo, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+        copy_fixture(ROOT, self.repo)
         host = self.repo / "hosts/test-mac"
         host.mkdir(parents=True, exist_ok=True)
         (host / "host.toml").write_text(

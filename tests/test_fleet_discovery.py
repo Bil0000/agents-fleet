@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import importlib.util
 import json
-import shutil
 import stat
 import subprocess
 import sys
@@ -10,6 +9,8 @@ import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
+
+from fleet_fixture import copy_fixture
 
 
 ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).parents[1]).resolve()
@@ -30,7 +31,7 @@ class FleetDiscoveryTest(unittest.TestCase):
         self.home = self.base / "home"
         self.home.mkdir()
         self.repo = self.base / "repo"
-        shutil.copytree(ROOT, self.repo, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+        copy_fixture(ROOT, self.repo)
         host = self.repo / "hosts/test-mac"
         host.mkdir()
         (host / "host.toml").write_text('id = "test-mac"\nos = "macos"\nrole = "workstation"\n')
@@ -250,7 +251,7 @@ class FleetMemoryStatusLineTest(unittest.TestCase):
     def test_memory_status_line_is_available_before_memory_is_enabled(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
-            line, ok = discovery.memory_status_line(ROOT, home, "test-mac")
+            line, ok = discovery.memory_status_line(home / "repo", home, "test-mac")
 
         self.assertEqual(line, "memory: local (plugin-managed)")
         self.assertTrue(ok)
