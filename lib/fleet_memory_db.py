@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,6 +10,7 @@ import re
 import sqlite3
 import stat
 import tempfile
+import time
 
 
 DURABLE_TABLES = ("sdk_sessions", "observations", "session_summaries", "user_prompts")
@@ -71,22 +73,27 @@ def readonly_connection(path):
     return connection
 
 
-def check_database(path):
+def check_database(path, *, timeout=None, integrity=True):
     try:
-        connection = readonly_connection(path)
-        quick_rows = tuple(row[0] for row in connection.execute("PRAGMA quick_check"))
-        if quick_rows != ("ok",):
-            raise FleetMemoryDatabaseError(f"SQLite quick check failed: {quick_rows[0] if quick_rows else 'no result'}")
-        foreign = tuple(tuple(row) for row in connection.execute("PRAGMA foreign_key_check"))
-        schema = connection.execute("SELECT max(version) FROM schema_versions").fetchone()[0]
-        if not isinstance(schema, int):
-            raise FleetMemoryDatabaseError("Claude-mem schema version is missing.")
-        counts = {table: connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in DURABLE_TABLES}
-        counts["pending_messages"] = connection.execute("SELECT count(*) FROM pending_messages").fetchone()[0]
-        counts["pending"] = connection.execute("SELECT count(*) FROM pending_messages WHERE status='pending'").fetchone()[0]
-        counts["processing"] = connection.execute("SELECT count(*) FROM pending_messages WHERE status='processing'").fetchone()[0]
-        connection.close()
-        return DatabaseReport("ok", foreign, schema, counts)
+        with closing(readonly_connection(path)) as connection:
+            if timeout is not None:
+                deadline = time.monotonic() + timeout
+                connection.execute("PRAGMA busy_timeout=200")
+                connection.set_progress_handler(lambda: time.monotonic() > deadline, 1000)
+            quick_rows = tuple(row[0] for row in connection.execute("PRAGMA quick_check")) if integrity else ("not checked",)
+            if integrity and quick_rows != ("ok",):
+                raise FleetMemoryDatabaseError(f"SQLite quick check failed: {quick_rows[0] if quick_rows else 'no result'}")
+            foreign = tuple(tuple(row) for row in connection.execute("PRAGMA foreign_key_check")) if integrity else ()
+            schema = connection.execute("SELECT max(version) FROM schema_versions").fetchone()[0]
+            if not isinstance(schema, int):
+                raise FleetMemoryDatabaseError("Claude-mem schema version is missing.")
+            counts = {table: connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in DURABLE_TABLES}
+            counts["pending_messages"] = connection.execute("SELECT count(*) FROM pending_messages").fetchone()[0]
+            counts["pending"] = connection.execute("SELECT count(*) FROM pending_messages WHERE status='pending'").fetchone()[0]
+            counts["processing"] = connection.execute("SELECT count(*) FROM pending_messages WHERE status='processing'").fetchone()[0]
+            if timeout is not None and time.monotonic() > deadline:
+                raise FleetMemoryDatabaseError("SQLite check exceeded its time budget.")
+        return DatabaseReport(quick_rows[0], foreign, schema, counts)
     except FleetMemoryDatabaseError:
         raise
     except (OSError, sqlite3.Error) as error:
@@ -404,7 +411,7 @@ def prune_daily_backups(directory, keep):
         raise FleetMemoryDatabaseError("Backup retention must be positive.")
     daily = sorted(
         path for path in directory.iterdir()
-        if path.is_file() and not path.is_symlink() and re.fullmatch(r"daily-[0-9]{8}T[0-9]{6}Z\.db", path.name)
+        if path.is_file() and not path.is_symlink() and re.fullmatch(r"daily-[0-9]{8}T[0-9]{6}Z\.db(?:\.gz)?", path.name)
     )
     removed = daily[:-keep]
     for path in removed:

@@ -263,6 +263,8 @@ class FleetMemoryDatabaseTest(unittest.TestCase):
         backups = self.root / "backups"
         backups.mkdir()
         paths = [backups / f"daily-202608{day:02d}T000000Z.db" for day in (20, 21, 22)]
+        paths[0] = paths[0].with_suffix(".db.gz")
+        paths[2] = paths[2].with_suffix(".db.gz")
         for path in paths:
             path.write_bytes(b"daily")
         archive = backups / "pre-migration.db"

@@ -41,6 +41,7 @@ GITHUB_SOURCE = re.compile(r"^(?:https://github\.com/)?([A-Za-z0-9_.-]+)/([A-Za-
 CODEX_SCALARS = ("personality", "web_search", "service_tier")
 CODEX_FEATURES = ("multi_agent", "memories", "chronicle", "context_management")
 CODEX_AGENTS = ("max_concurrent_threads_per_session",)
+CODEX_MEMORIES = ("generate_memories", "use_memories", "max_rollouts_per_startup")
 CODEX_REMOVED_FEATURES = ("plugin_hooks", "js_repl")
 CODEX_HOOK_EVENTS = {
     "PermissionRequest", "PostCompact", "PostToolUse", "PreCompact", "PreToolUse",
@@ -63,7 +64,7 @@ CLAUDE_BOOLEAN_LEAVES = {
 }
 CLAUDE_OBJECT_LEAVES = {"hooks", "permissions", "statusLine"}
 CLAUDE_LEAVES = CLAUDE_STRING_LEAVES | CLAUDE_BOOLEAN_LEAVES | CLAUDE_OBJECT_LEAVES
-CLAUDE_NESTED = {"env": {"CLAUDE_CODE_DISABLE_AUTO_MEMORY"}, "attribution": {"commit", "pr"}}
+CLAUDE_NESTED = {"env": {"CLAUDE_CODE_DISABLE_AUTO_MEMORY", "ENABLE_TOOL_SEARCH", "MCP_DISCOVERY_CACHE"}, "attribution": {"commit", "pr"}}
 MAC_UPDATER_LABEL = "dev.agents-fleet.update"
 
 
@@ -187,7 +188,7 @@ def check_repository(root):
                     if set(data) != {"id", "os", "role"} or data["id"] != path.parent.name or data["os"] not in {"macos", "linux"} or not isinstance(data["role"], str) or not data["role"].strip():
                         fail(f"Invalid host manifest: {relative}")
                 if path.name == "codex.toml" and (path.parent == root / "settings" or path.parent.parent == root / "hosts"):
-                    allowed = set(CODEX_SCALARS) | {"features", "agents"}
+                    allowed = set(CODEX_SCALARS) | {"features", "agents", "memories"}
                     if not isinstance(data, dict) or set(data) - allowed:
                         fail(f"Invalid managed Codex settings: {relative}")
                     if any(key in data and not isinstance(data[key], str) for key in CODEX_SCALARS):
@@ -198,6 +199,11 @@ def check_repository(root):
                     agents = data.get("agents", {})
                     if not isinstance(agents, dict) or set(agents) - set(CODEX_AGENTS) or any(type(value) is not int or value < 1 for value in agents.values()):
                         fail(f"Invalid managed Codex agents: {relative}")
+                    memories = data.get("memories", {})
+                    if not isinstance(memories, dict) or set(memories) - set(CODEX_MEMORIES) or any(type(value) is not bool for key, value in memories.items() if key != "max_rollouts_per_startup"):
+                        fail(f"Invalid managed Codex memories: {relative}")
+                    if "max_rollouts_per_startup" in memories and (type(memories["max_rollouts_per_startup"]) is not int or not 0 <= memories["max_rollouts_per_startup"] <= 128):
+                        fail(f"Invalid managed Codex memories: {relative}")
             if path.name == "claude.json" and (path.parent == root / "settings" or path.parent.parent == root / "hosts"):
                 data = json.loads(path.read_text())
                 allowed = CLAUDE_LEAVES | set(CLAUDE_NESTED)
@@ -1106,6 +1112,7 @@ def strip_codex_managed(text, managed_servers, settings):
             (not section and match.group(1) in settings)
             or (section == ("features",) and match.group(1) in settings.get("features", {}))
             or (section == ("agents",) and match.group(1) in settings.get("agents", {}))
+            or (section == ("memories",) and match.group(1) in settings.get("memories", {}))
         ):
             continue
         output.append(line)
@@ -1115,7 +1122,7 @@ def strip_codex_managed(text, managed_servers, settings):
 def codex_unmanaged(data, managed_servers, settings):
     value = deepcopy(data)
     for key in settings:
-        if key != "features":
+        if key not in {"features", "agents", "memories"}:
             value.pop(key, None)
     features = value.get("features")
     if isinstance(features, dict):
@@ -1129,6 +1136,12 @@ def codex_unmanaged(data, managed_servers, settings):
             agents.pop(key, None)
         if not agents:
             value.pop("agents", None)
+    memories = value.get("memories")
+    if isinstance(memories, dict):
+        for key in settings.get("memories", {}):
+            memories.pop(key, None)
+        if not memories:
+            value.pop("memories", None)
     servers = value.get("mcp_servers")
     if isinstance(servers, dict):
         for name in managed_servers:
@@ -1153,7 +1166,7 @@ def render_codex(current, settings, servers, source_blocks):
             lines.pop(first_table - 1)
             first_table -= 1
         lines[first_table:first_table] = scalars + ([""] if first_table < len(lines) else [])
-    for section, keys in (("features", CODEX_FEATURES), ("agents", CODEX_AGENTS)):
+    for section, keys in (("features", CODEX_FEATURES), ("agents", CODEX_AGENTS), ("memories", CODEX_MEMORIES)):
         values = settings.get(section, {})
         if not values:
             continue
@@ -1461,6 +1474,10 @@ def fingerprint_node(path, base, output, managed_mcp):
                 if not isinstance(features, dict):
                     raise TypeError
                 managed["features"] = {key: features[key] for key in CODEX_FEATURES if key in features}
+                memories = config.get("memories", {})
+                if not isinstance(memories, dict):
+                    raise TypeError
+                managed["memories"] = {key: memories[key] for key in CODEX_MEMORIES if key in memories}
                 servers = config.get("mcp_servers", {})
                 hooks = config.get("hooks", {})
                 if not isinstance(servers, dict) or not isinstance(hooks, dict):

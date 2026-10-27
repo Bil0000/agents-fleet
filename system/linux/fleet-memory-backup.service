@@ -3,4 +3,6 @@ Description=Back up shared Fleet Claude-mem database
 
 [Service]
 Type=oneshot
+Nice=10
+IOSchedulingClass=idle
 ExecStart=%h/.local/bin/fleet memory backup
