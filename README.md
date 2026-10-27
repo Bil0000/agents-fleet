@@ -17,17 +17,19 @@ This template has **blank configuration**. Add only what Fleet should manage. Ke
 
 ## Start here
 
-1. Click [Use this template](https://github.com/new?template_owner=Bil0000&template_name=agents-fleet&visibility=private). Create a **private** repository. Leave **Include all branches** off. **Do not fork** for personal configuration.
-2. Clone your repository. Open it with Claude Code or Codex.
-3. Paste:
+Give Claude Code or Codex this prompt. You do not need to clone this public repo first.
 
 ```text
-Set up Fleet using SETUP_WITH_AN_AGENT.md. First verify that origin points to my own private repository, not Bil0000/agents-fleet. Preserve my current setup. Start with one device and local Claude-Mem. Keep secrets and session data out of Git.
+Set up https://github.com/Bil0000/agents-fleet for me. Read and follow SETUP_WITH_AN_AGENT.md from that repo. Create my own private copy, preserve my current setup, and finish the install and checks. Use the Fleet engine and workflow with my own rules, MCP servers, skills, accounts, and data. Start with this device and local memory. Install account routing, but keep fallback off until I have added my own accounts. Ask me only for a login, a missing secret, a paid service, or an action that can lose data.
 ```
 
-The [setup guide](SETUP_WITH_AN_AGENT.md) covers backups, installation, checks, and adding devices. Local-only use without a remote is supported with manual apply.
+The agent checks your device, creates your private repo, backs up your files, imports your chosen configuration, installs Fleet and Claude-Mem, tests it, and enables updates from your repo. Login and secret entry still need you.
 
-**Needs:** macOS or Linux, Git, Bash, Python 3.11+, and Claude Code and/or Codex. Claude-Mem needs Node.js 20.12+. Automated onboarding also needs both clients and Bun. Linux MCP secrets need `systemd-creds` with non-interactive sudo access.
+For manual setup, click [Use this template](https://github.com/new?template_owner=Bil0000&template_name=agents-fleet&visibility=private), create a private repo, and give the agent the same prompt with your repo URL. Leave **Include all branches** off. **Do not fork** for personal configuration.
+
+The [setup guide](SETUP_WITH_AN_AGENT.md) is the full agent checklist. This template includes the shared engine, account router, retry bridge, MCP startup tools, and optional shared memory. You supply your own configuration and private data. It does not contain a model list; your clients supply models and reasoning options. The public template keeps rules, hooks, skills, MCP declarations, and host profiles empty.
+
+**Needs:** macOS or Linux, Git, Bash, Python 3.11+, and Claude Code and/or Codex. Claude-Mem needs Node.js 20.12+. The agent installs missing tools through their supported installers. GitHub sync needs `gh` and your GitHub login. Automated `fleet onboard` also needs both clients and Bun; the guide supports one client through the manual apply path. Building the patched account router needs Go 1.26+ and a C compiler. Linux MCP secrets need `systemd-creds` with non-interactive sudo access.
 
 ## How sync works
 
@@ -64,6 +66,8 @@ Replace uppercase names with your values. `[VALUE]` is optional. `HOST` names a 
 
 ### Accounts and fallback
 
+The setup guide installs the tested patched router with `python3 -B lib/fleet_cliproxy_update.py --bootstrap`. Major upstream updates stay blocked until their config migration is verified.
+
 Routing sends requests through a local proxy so Fleet can choose the account. To enable it, run `fleet account setup`, open a new terminal, then use the normal provider commands: `codex login` or `claude auth login`. Repeated login refreshes the account. Native logout removes its routed account.
 
 Every command below starts with `fleet account`.
@@ -82,13 +86,15 @@ Every command below starts with `fleet account`.
 | `order PROVIDER` | Show saved order. |
 | `order PROVIDER PRIMARY BACKUP...` | Set manual order. Include every enrolled account once, primary first. |
 | `order PROVIDER reset` | Sort by soonest weekly reset, after login and during hourly updates. |
+| `order PROVIDER reset-fallbacks` | Keep the primary first; sort fallback accounts by soonest reset. |
 | `order PROVIDER manual` | Keep current order; stop automatic sorting. |
 | `order PROVIDER rebalance` | Refresh enabled reset ordering now. Omit `PROVIDER` for both providers. |
 | `auto PROVIDER on` / `off` | Enable limit-based fallback / use only the primary. |
 | `auto PROVIDER on --when any` | Also switch on temporary provider errors; can spend fallback quota. `--when limits` selects limit-only behavior. |
+| `credits PROVIDER never` / `last` / `same-account` | Stop at allowance limits, use credits after all allowances, or use each account's credits before switching. Needs the patched router. |
 | `auto --help` | Explain fallback modes. |
 
-For example: `fleet account use codex "Work Pro"`. Use accounts you own. Fallback happens before output starts; Fleet never replays partially delivered requests. It returns to the primary when ready.
+For example: `fleet account use codex "Work Pro"`. Use accounts you own. Fallback happens before output starts; Fleet never replays partially delivered requests. New sessions try the primary. Existing sessions keep their available account. A manual account change resets that choice on the next request. Retries stop after three attempts or 120 seconds; longer provider waits return to the client.
 
 ### Share an account router
 
@@ -101,7 +107,7 @@ Install Tailscale with MagicDNS and run `fleet account setup` on each device fir
 | `fleet account hub` | Show role and check connection. |
 | `fleet account hub leave` | Return to the local router. |
 
-Client endpoints stay on localhost. Hub account priority changes affect all connected devices.
+Client endpoints stay on localhost. Hub account priority changes affect all connected devices. Run credit changes on the hub.
 
 ### Secrets, tools, and memory
 
@@ -115,8 +121,16 @@ Declare secret names in `mcp/required-secrets.txt`. Values stay in macOS Keychai
 | `fleet memory status` | Check shared-memory services and health. |
 | `fleet memory enable` | Configure and start this device's shared-memory services. |
 | `fleet memory disable` | Stop those services; retain the database and settings. |
-| `fleet memory backup` | Back up the database on the configured Linux server. |
+| `fleet memory backup` | Back up and verify the database on the configured Linux server, then compress it. |
 | `fleet memory harden` | Apply supported worker session/health fixes. Included in `enable`. |
+| `fleet memory save` / `update` | Save or update a memory without a model call. Read JSON from standard input. |
+| `fleet media track PR-URL IMAGE-URL...` | Track published ghdrop images and their GitHub references. Needs a host cleanup config. |
+| `fleet media keep IMAGE-URL...` | Protect tracked images from cleanup. |
+| `fleet media cleanup --dry-run` | Show tracked images eligible for deletion. Omit `--dry-run` to delete them. |
+
+Tracked images need ten days since last use and since every known GitHub reference closed. Open references, `keep-media` labels, and unknown states block deletion. Cleanup is off until you configure it.
+
+Shared memory queues captures on disk and delivers them in the background. Status checks do not send model requests. Idle sessions stop model work and retain queued items.
 
 Local Claude-Mem is the default. Memory commands need `memory.toml`: copy [memory.example.toml](memory.example.toml), then follow the [shared-memory steps](SETUP_WITH_AN_AGENT.md#optional-shared-memory).
 
@@ -134,7 +148,7 @@ These also start with `fleet`; aliases accept the same arguments.
 - `account order --auto PROVIDER reset` / `manual`: older sorting syntax.
 - `account hub status`: `account hub`.
 - `onboard --os OS --role ROLE`: create the profile before onboarding. Both flags go together; prefer separate `host add` so you can commit first.
-- Internal: `account native-auth` wraps provider login/logout; `memory worker` runs the server worker; `memory proxy` maintains the client's SSH tunnel.
+- Internal: `account native-auth` wraps provider login/logout; `memory worker` runs the server worker; `memory proxy` maintains the client's SSH tunnel. `memory enqueue`, `init`, `drain`, and `deliver` manage capture delivery.
 
 </details>
 

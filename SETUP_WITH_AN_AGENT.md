@@ -2,6 +2,26 @@
 
 This file is an execution contract for the agent that sets up Fleet. Finish every required step. Do not stop after a plan.
 
+## Start from the repository URL
+
+The user can give you only `https://github.com/Bil0000/agents-fleet` and ask for setup. Read this file from that repository first. Then execute it. Do not make the user clone the template or write configuration by hand.
+
+The goal is the same Fleet engine and workflow with the new owner's configuration. The public repo has no personal rules, hooks, skills, host profiles, MCP registrations, accounts, or memory data. Do not try to retrieve the maintainer's private Fleet. The private dashboard is not part of this template.
+
+Inspect the user's current clients and device. Use one device, local memory, account routing with fallback off, and no paid add-ons unless the user requested a different setup. Keep the user's model choices. Reuse working tools and logins. Install missing prerequisites with supported installers. Do not install a second client unless requested.
+
+If the user already supplied a private Fleet repository, use it after the ownership checks below. Otherwise, use an authenticated GitHub CLI to create a private template copy. Choose a free repo name under the user's account, such as `my-agent-fleet`, in a new local directory. Check `gh auth status` and `gh repo view OWNER/NAME` first. A repository that already exists must not be replaced.
+
+```bash
+gh repo create OWNER/my-agent-fleet --private --template Bil0000/agents-fleet --clone
+cd my-agent-fleet
+gh repo view --json nameWithOwner,isPrivate,isFork,defaultBranchRef,url
+```
+
+Replace `OWNER` with the authenticated user's login. Do not use `--include-all-branches`. If GitHub login is missing, let the user complete `gh auth login`, then continue. The manual alternative is GitHub's **Use this template** button with private visibility. Local-only setup is available when the user requests it.
+
+Creation is not permission to put secrets in Git. Verify the private destination before importing any personal content. Complete all safe work while a login or key entry is pending. Resume from the last completed step; do not start another repository or repeat completed installs.
+
 ## Before anything else: confirm repository ownership
 
 Do not fork `Bil0000/agents-fleet`. A public fork stays public.
@@ -18,7 +38,7 @@ git status --short --branch
 
 If `origin` points to `Bil0000/agents-fleet`, do not continue in that clone.
 
-- For GitHub sync, have the user create a private repository from the template, clone it, and continue there.
+- For GitHub sync, create a private repository from the template with the authenticated GitHub CLI, clone it, and continue there. Use the manual template flow only if the CLI is unavailable.
 - For a local-only setup, run `git remote remove origin` only after the user confirms they do not want GitHub sync.
 
 For a GitHub setup, verify all of these before continuing:
@@ -43,8 +63,8 @@ Never push personal rules, host profiles, or setup data to the public template.
 - Use one local device unless the user explicitly asks for multiple devices.
 - Use local Claude-Mem unless the user explicitly asks for one shared memory database.
 - Use a private repository owned by the user. A local clone with no remote is also supported.
-- Leave multi-account routing off unless the user asks for it.
-- Add the smallest configuration that reproduces the user's current intent.
+- Install local account routing for the standard setup. Leave automatic account fallback off until the user adds their own fallback account. Keep paid credit use off unless requested.
+- Import the user's existing portable rules, allowed settings, chosen MCPs, and their own skills. Show a short inventory before applying. Retain blank defaults where the user has no configuration.
 - Do not copy third-party skills or plugins into this repository. Declare or install them from their original source.
 - Stop only for a login, an OAuth screen, a missing key that only the user can provide, payment, or an irreversible action.
 
@@ -94,7 +114,7 @@ Never add this backup to Git.
 
 ## 3. Create the host profile
 
-Choose a lowercase host ID that uses only letters, numbers, and hyphens. Create `hosts/HOST/host.toml`:
+Choose a lowercase host ID that uses only letters, numbers, and hyphens. Use `fleet host add` when both clients and managed plugin installation are wanted. For a single-client setup, create `hosts/HOST/host.toml` directly and declare plugins only for installed clients:
 
 ```toml
 id = "HOST"
@@ -105,6 +125,8 @@ role = "workstation"
 Use `os = "linux"` on Linux. Keep device-only settings, hooks, skills, and MCPs under `hosts/HOST/`.
 
 ## 4. Add the user's configuration
+
+Read the backed-up setup. Import portable rules and supported settings without changing their meaning. Put device paths only in the host profile. Keep third-party skills and plugins tied to their original sources. Recreate chosen MCP registrations in both manifests using the examples in `mcp/README.md`; keep their secret values in local credential storage. If no configuration exists, keep the shared files blank and finish the basic install.
 
 The files are blank by design:
 
@@ -135,7 +157,7 @@ Claude-Mem is required for this setup. Follow its [official installation guide](
 npx claude-mem install
 ```
 
-Select every installed client that the user wants, including Claude Code and Codex CLI. Let the user complete provider login or enter a provider key when the installer asks. Do not print or copy the credential.
+Select every installed client that the user wants, including Claude Code and Codex CLI. Check the installer's current help and official guide before running it. Keep an existing working memory provider. For a new install, use the user's existing Claude plan when available; do not accept a paid provider or trial without permission. Let the user complete provider login or enter a provider key when needed. Do not print or copy the credential.
 
 For the default local mode:
 
@@ -155,7 +177,7 @@ npx claude-mem repair
 
 Use this only when the user asks for one database shared by macOS or Linux clients and a Linux server. It uses an SSH tunnel. It does not expose the database or worker to the public internet.
 
-1. Install Claude-Mem 13.24.0 on the server and all clients. Run `fleet account setup` on the server before enabling shared memory.
+1. Install the supported Claude-Mem 13.24.0 bundle on the server and all clients. Fleet's shared-memory patches target this version; an unpinned latest install is not a substitute. Verify the installed version before proceeding. Run `fleet account setup` on the server before enabling shared memory.
 2. Back up every existing `~/.claude-mem/claude-mem.db` with SQLite's backup API before any merge or move.
 3. Copy `memory.example.toml` to `memory.toml`.
 4. Set `server_host`, `client_hosts`, `ssh_target`, and the installed Claude-Mem `version`.
@@ -164,6 +186,8 @@ Use this only when the user asks for one database shared by macOS or Linux clien
 7. Apply Fleet on each client, then run `~/.local/bin/fleet memory enable --host CLIENT_HOST`.
 8. Run `~/.local/bin/fleet memory status --host HOST` on all devices.
 9. Confirm new observations written from each client appear in the server database.
+
+Shared memory keeps captures in a local queue while the worker is unavailable. `fleet memory status` reports pending work. It does not send a model request. Backups are verified before compression; `backup_retention_days` controls how many daily backups remain. The worker uses the local Fleet router and can fall back from Claude to `gpt-6.1-terra` when its allowance is unavailable. This applies only to shared memory; client model choices stay separate.
 
 Do not merge old databases unless the user asks. When a merge is required, work on snapshots, verify schema compatibility and foreign keys, keep both originals, and replace nothing until the merged copy passes checks.
 
@@ -182,7 +206,7 @@ Fleet stores the value in macOS Keychain or as a host-bound `systemd-creds` cred
 
 ## 7. Verify before apply
 
-Commit the configuration so Fleet can build an exact release. Then run:
+Run `fleet check` and inspect the diff for secrets first. Commit only the chosen configuration so Fleet can build an exact release. Then run:
 
 ```bash
 ./bin/fleet check
@@ -218,7 +242,24 @@ Apply the tested commit:
 
 The apply installs `~/.local/bin/fleet`. Make sure the user's shell includes `~/.local/bin` in `PATH`. Preserve the startup file, do not add the path twice, and do not use sudo. Start a fresh login shell in `/tmp` and confirm that `fleet status` works.
 
-If the user wants multi-account routing, run `fleet account setup` once on this device. It must finish with `fleet account setup --check` passing. Then open a new terminal and let the user add accounts with the normal `codex login` or `claude auth login` flow. Do not add OAuth files to the repository. Keep the proxy on localhost. Use `fleet account auto PROVIDER on` only after the user has added a fallback account.
+For the standard setup, run `fleet account setup` once on this device. Skip it only when the user requested native client routing. It must finish with `fleet account setup --check` passing. Then open a new terminal and let the user add accounts with the normal `codex login` or `claude auth login` flow. Do not add OAuth files to the repository. Keep the proxy on localhost. Use `fleet account auto PROVIDER on` only after the user has added a fallback account.
+
+Install Go 1.26 or newer and a working C compiler before the patched router step. On macOS, check that the Command Line Tools compiler works. On Linux, use the distribution's C build tools. Then build and activate Fleet's tested router version:
+
+```bash
+python3 -B lib/fleet_cliproxy_update.py --bootstrap
+fleet account setup --check
+```
+
+This uses version 7.2.151 and runs its Go and local proxy tests before activation. It keeps a newer installed version. It does not fetch an untested major release. The updater blocks major-version changes until a configuration migration is verified. Do not bypass that check to finish setup.
+
+Install the proxy updater after bootstrap:
+
+```bash
+python3 -B lib/fleet_cliproxy_update.py --install
+```
+
+It checks upstream every six hours. A blocked major update keeps the installed tested router in use. Report that state separately from a failed Fleet install. Confirm credit routing and session-affinity support through the local router's read-only management config before enabling advanced account controls. Never use model requests for health checks.
 
 Enable automatic updates:
 
@@ -228,18 +269,20 @@ Enable automatic updates:
 
 For a clone with no remote, use `./bin/fleet apply --host HOST` after local checks. Do not push or enable the updater.
 
-Restart Claude Code and Codex. Confirm:
+Restart each selected client. Confirm only the files for installed clients:
 
 - `~/.codex/AGENTS.md` has common and Codex rules.
 - `~/.claude/CLAUDE.md` has common and Claude rules.
 - Managed skills, commands, and hooks resolve to the Fleet release.
 - Existing unmanaged configuration remains present.
-- Native Claude and Codex commands still work, and optional account routing changes only quota consumption.
+- Native Claude and Codex commands still work, and the router uses only the user's own enrolled accounts. Credit use stays off unless requested.
 - Declared plugins and MCPs are available.
 - Claude-Mem loads memory in a new session.
 - The update service is active when a remote is configured.
 
 ## 9. Add more devices
+
+Add devices only when the user asks. Use their own host IDs and SSH targets. Do not invent or copy the maintainer's server. Shared-memory mode needs the supported pinned bundle on every device; keep local mode if those prerequisites are absent.
 
 For each device:
 
