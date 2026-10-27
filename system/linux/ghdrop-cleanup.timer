@@ -1,0 +1,10 @@
+[Unit]
+Description=Check tracked ghdrop images daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=ghdrop-cleanup.service
+
+[Install]
+WantedBy=timers.target

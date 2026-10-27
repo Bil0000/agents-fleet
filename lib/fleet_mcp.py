@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import getpass
+import importlib.util
 import json
 import os
 import pwd
@@ -75,8 +76,11 @@ def load_runner_files(root, files):
         data = tomllib.loads(path.read_text())
         for server, entry in data["servers"].items():
             if server in servers:
-                fail(f"Invalid MCP runner: {server}")
-            servers[server] = entry
+                if set(entry) != {"env"}:
+                    fail(f"Invalid MCP runner: {server}")
+                servers[server] = {**servers[server], "env": {**servers[server].get("env", {}), **entry["env"]}}
+            else:
+                servers[server] = entry
     return servers
 
 
@@ -141,27 +145,34 @@ def validate_mcp_file(root, path, client):
     return data[key]
 
 
-def validate_runner_file(root, path):
+def validate_runner_file(root, path, shared=None):
     data = tomllib.loads(path.read_text())
     if not isinstance(data, dict) or set(data) != {"servers"} or not isinstance(data["servers"], dict):
         fail(f"Invalid managed MCP runner manifest: {path.relative_to(root)}")
     for name, entry in data["servers"].items():
         if not SERVER.fullmatch(name) or not isinstance(entry, dict):
             fail(f"Invalid managed MCP runner manifest: {path.relative_to(root)}")
+        override = set(entry) == {"env"} and name in (shared or {})
         allowed = {"secrets", "command", "cwd", "env"}
         valid_shape = {"secrets", "command"}.issubset(entry) and not set(entry) - allowed
-        if not valid_shape:
+        if not valid_shape and not override:
             fail(f"Invalid managed MCP runner manifest: {path.relative_to(root)}")
-        secrets = entry.get("secrets")
+        secrets = entry.get("secrets", [] if override else None)
         if not isinstance(secrets, list) or secrets != sorted(set(secrets)) or any(not NAME.fullmatch(secret) for secret in secrets):
             fail(f"Invalid managed MCP runner manifest: {path.relative_to(root)}")
         arguments = entry.get("command")
-        if not isinstance(arguments, list) or not arguments or any(not isinstance(value, str) or not value for value in arguments):
+        if not override and (not isinstance(arguments, list) or not arguments or any(not isinstance(value, str) or not value for value in arguments)):
             fail(f"Invalid managed MCP runner manifest: {path.relative_to(root)}")
         if "cwd" in entry and (not isinstance(entry["cwd"], str) or not Path(entry["cwd"]).is_absolute()):
             fail(f"Invalid managed MCP runner manifest: {path.relative_to(root)}")
         if "env" in entry and (not isinstance(entry["env"], dict) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in entry["env"].items())):
             fail(f"Invalid managed MCP runner manifest: {path.relative_to(root)}")
+        environment = entry.get("env", {})
+        if not isinstance(environment, dict) or any(
+            not NAME.fullmatch(key) or not isinstance(value, str) or "\0" in value
+            for key, value in environment.items()
+        ):
+            fail(f"Invalid managed MCP environment: {path.relative_to(root)}")
         reject_static_credentials(entry.get("env", {}))
     reject_unsafe_urls(data)
     reject_credential_args(data)
@@ -202,11 +213,13 @@ def validate_mcp_bundle(root, directory):
     runner_path = directory / "runners.toml"
     codex = validate_mcp_file(root, codex_path, "codex")
     claude = validate_mcp_file(root, claude_path, "claude")
-    runners = validate_runner_file(root, runner_path)
+    shared = load_runner_files(root, [root / "mcp/runners.toml"]) if directory != root / "mcp" else {}
+    runners = validate_runner_file(root, runner_path, shared)
+    overrides = {name for name, entry in runners.items() if set(entry) == {"env"}}
     if set(codex) != set(claude):
         fail("MCP servers need matching Codex and Claude entries.")
     stdio = {name for name, entry in codex.items() if "url" not in entry}
-    if set(runners) != stdio:
+    if set(runners) - overrides != stdio:
         fail(f"Invalid managed MCP runner manifest: {runner_path.relative_to(root)}")
     paths = (codex_path.relative_to(root), runner_path.relative_to(root))
     for name in codex:
@@ -214,8 +227,46 @@ def validate_mcp_bundle(root, directory):
     return runners
 
 
-def validate_all(root):
-    mcp_entries = sorted(path.relative_to(root).as_posix() for path in (root / "mcp").iterdir())
+def legacy_catalogs(root, *, strict=False):
+    directory = root / "mcp/catalogs"
+    if not directory.exists():
+        return []
+    helper = Path(__file__).with_name("fleet_mcp_lazy.py")
+    if not helper.is_file():
+        if strict:
+            fail("Legacy MCP compatibility helper is missing.")
+        return []
+    try:
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError
+        paths = sorted(directory.iterdir())
+        spec = importlib.util.spec_from_file_location("fleet_mcp_legacy", helper)
+        legacy = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(legacy)
+    except (OSError, ValueError, ImportError):
+        if strict:
+            fail("Invalid legacy MCP compatibility data.")
+        return []
+    result = []
+    for path in paths:
+        try:
+            if path.is_symlink() or not path.is_file() or path.suffix != ".json":
+                raise ValueError
+            catalog = json.loads(path.read_text())
+            command = catalog.get("command") if isinstance(catalog, dict) else None
+            if (not isinstance(command, list) or not command
+                or any(not isinstance(argument, str) or not argument for argument in command)
+                or not legacy.valid(catalog, command)):
+                raise ValueError
+            result.append((path, catalog))
+        except (OSError, ValueError, TypeError):
+            if strict:
+                fail("Invalid legacy MCP compatibility data.")
+    return result
+
+
+def validate_all(root, *, catalog_required=True):
+    mcp_entries = sorted(path.relative_to(root).as_posix() for path in (root / "mcp").iterdir() if path.name != "catalogs")
     if mcp_entries != [
         "mcp/README.md",
         "mcp/claude.json",
@@ -224,14 +275,17 @@ def validate_all(root):
         "mcp/runners.toml",
     ]:
         fail("Invalid managed MCP files.")
+    if catalog_required:
+        legacy_catalogs(root, strict=True)
     registered = set(required_names(root))
     runners = validate_mcp_bundle(root, root / "mcp")
+    used = {secret for entry in runners.values() for secret in entry["secrets"]}
     for directory in sorted((root / "hosts").glob("*/mcp")):
         entries = sorted(path.name for path in directory.iterdir())
         if entries != ["claude.json", "codex.toml", "runners.toml"]:
             fail("Invalid managed MCP host overlay.")
-        runners.update(validate_mcp_bundle(root, directory))
-    used = {secret for entry in runners.values() for secret in entry["secrets"]}
+        entries = validate_mcp_bundle(root, directory)
+        used.update(secret for entry in entries.values() for secret in entry.get("secrets", []))
     missing = sorted(used - registered)
     if missing:
         fail(f"Unregistered MCP secret: {missing[0]}")
@@ -480,6 +534,17 @@ def auth(root, arguments):
     return 1 if failed else 0
 
 
+def proxy_registration(home, command, python=sys.executable):
+    if (not isinstance(command, (list, tuple)) or not command or not isinstance(command[0], str) or not command[0]
+        or any(not isinstance(argument, str) or "\0" in argument for argument in command)):
+        fail("A native MCP command is required.")
+    script = ('proxy=$1; python=$2; shift 2; '
+              'if [ "${FLEET_MCP_EAGER:-}" != 1 ] && [ -r "$proxy" ] && [ -x "$python" ]; then '
+              'exec "$python" -B -I "$proxy" -- "$@"; fi; exec "$@"')
+    return {"command": "/bin/sh", "args": ["-c", script, "fleet-mcp",
+            str(Path(home) / ".local/share/fleet/current/lib/fleet_mcp_proxy.py"), python, *command]}
+
+
 def mcp(
     root,
     arguments,
@@ -491,7 +556,17 @@ def mcp(
     home=None,
     trusted_root_resolver=resolve_runner_root,
 ):
-    validate_all(root)
+    if arguments[:1] in (["proxy"], ["command"]):
+        if len(arguments) < 3 or arguments[1] != "--":
+            fail("Usage: fleet mcp proxy|command -- COMMAND...")
+        if arguments[0] == "command":
+            print(json.dumps(proxy_registration(fixed_home() if home is None else home, arguments[2:])))
+            return 0
+        environment = dict(os.environ if ambient is None else ambient)
+        command = [sys.executable, "-B", "-I", str(root / "lib/fleet_mcp_proxy.py"), "--", *arguments[2:]]
+        executor(command[0], command, environment)
+        return 0
+    validate_all(root, catalog_required=False)
     if len(arguments) < 2 or arguments[0] != "run":
         fail("Usage: fleet mcp run SERVER [-- COMMAND...]")
     server = arguments[1]
@@ -515,6 +590,13 @@ def mcp(
             environment[name] = credential_reader(name)
         except MissingCredential:
             fail(f"Missing Fleet credential: {name}")
+    if (os.environ if ambient is None else ambient).get("FLEET_MCP_EAGER") != "1":
+        catalog = next((path for path, value in legacy_catalogs(root) if value["command"] == command), None)
+        if catalog is not None:
+            command = [sys.executable, "-B", str(root / "lib/fleet_mcp_lazy.py"), str(catalog), *command]
+        else:
+            command = [sys.executable, "-B", "-I", str(root / "lib/fleet_mcp_proxy.py"), "--managed", "--",
+                       str(root / "bin/fleet"), "mcp", *arguments]
     previous = os.open(".", os.O_RDONLY)
     try:
         os.chdir(trusted_root)

@@ -109,11 +109,19 @@ PY
     ;;
   auth|mcp)
     python=$(find_python)
+    if [ "${1:-}:${2:-}" = "mcp:proxy" ]; then
+      PATH=$native_path
+      export PATH
+    fi
     exec "$python" -B -I "$root/lib/fleet_mcp.py" "$root" "$@"
     ;;
   memory)
     python=$(find_python)
     exec "$python" -B -I "$root/lib/fleet_memory.py" "$root" "${@:2}"
+    ;;
+  media)
+    python=$(find_python)
+    exec "$python" -B -I "$root/lib/fleet_ghdrop.py" "$root" "${@:2}"
     ;;
   account)
     python=$(find_python)
@@ -140,7 +148,7 @@ PY
     exec "$python" -B -I "$root/lib/fleet_apply.py" "$root" "$@"
     ;;
   *)
-    echo "Usage: fleet check | fleet apply | fleet status | fleet scan | fleet adopt ... | fleet onboard ... | fleet update [on|off] | fleet rollback | fleet auth ... | fleet mcp ... | fleet memory ... | fleet account ..." >&2
+    echo "Usage: fleet check | fleet apply | fleet status | fleet scan | fleet adopt ... | fleet onboard ... | fleet update [on|off] | fleet rollback | fleet auth ... | fleet mcp ... | fleet memory ... | fleet media ... | fleet account ..." >&2
     exit 2
     ;;
 esac

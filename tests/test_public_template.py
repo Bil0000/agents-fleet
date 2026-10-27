@@ -91,6 +91,36 @@ class PublicMcpTemplateTest(unittest.TestCase):
         with self.assertRaisesRegex(mcp.FleetError, "Invalid managed MCP runner manifest"):
             mcp.validate_runner_file(self.root, self.root / "mcp/runners.toml")
 
+    def test_host_environment_override_preserves_the_shared_command(self):
+        wrapper = ["mcp", "run", "docs", "--", "docs-mcp"]
+        (self.root / "mcp/codex.toml").write_text(
+            '[mcp_servers.docs]\ncommand = "fleet"\nargs = ' + json.dumps(wrapper) + '\n'
+        )
+        (self.root / "mcp/claude.json").write_text(json.dumps({"mcpServers": {
+            "docs": {"type": "stdio", "command": "fleet", "args": wrapper}
+        }}))
+        (self.root / "mcp/runners.toml").write_text('[servers.docs]\nsecrets = []\ncommand = ["docs-mcp"]\n')
+        host = self.root / "hosts/test-local/mcp"
+        host.mkdir(parents=True)
+        (host / "codex.toml").write_text('[mcp_servers]\n')
+        (host / "claude.json").write_text('{"mcpServers": {}}\n')
+        runner = host / "runners.toml"
+        runner.write_text('[servers.docs.env]\nJAVA_HOME = "/trusted/java"\n')
+        mcp.validate_all(self.root)
+        self.assertEqual(mcp.load_runners(self.root, "test-local")["docs"], {
+            "secrets": [], "command": ["docs-mcp"], "env": {"JAVA_HOME": "/trusted/java"}
+        })
+        for contents in (
+            '[servers.unknown.env]\nJAVA_HOME = "/trusted/java"\n',
+            '[servers.docs.env]\nAPI_TOKEN = "forbidden"\n',
+            '[servers.docs.env]\nJAVA_HOME = 21\n',
+            '[servers.docs]\ncommand = ["other"]\n[servers.docs.env]\nJAVA_HOME = "/trusted/java"\n',
+        ):
+            with self.subTest(contents=contents):
+                runner.write_text(contents)
+                with self.assertRaises(mcp.FleetError):
+                    mcp.validate_all(self.root)
+
 
 class PublicMemoryTemplateTest(unittest.TestCase):
     def test_missing_shared_memory_config_uses_local_plugin_mode(self):

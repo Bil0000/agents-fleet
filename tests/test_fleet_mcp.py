@@ -133,11 +133,19 @@ with tempfile.TemporaryDirectory() as temporary:
     finally:
         os.chdir(previous)
 
-    assert captured["arguments"] == command
+    assert captured["arguments"] == [sys.executable, "-B", "-I", str(fixture / "lib/fleet_mcp_proxy.py"),
+                                     "--managed", "--", str(fixture / "bin/fleet"), "mcp",
+                                     "run", "docs", "--", *command]
     assert captured["cwd"] == trusted.resolve()
     assert captured["environment"]["DOCS_TOKEN"] == "docs-secret"
     assert captured["environment"]["DOCS_URL"] == "https://docs.example.com"
     assert "AWS_SECRET_ACCESS_KEY" not in captured["environment"]
+
+    fleet.mcp(fixture, ["run", "docs", "--", *command], host="test-local",
+              credential_reader=lambda name: "docs-secret", executor=execute,
+              ambient={**ambient, "FLEET_MCP_EAGER": "1"}, home=Path("/fixed/home"))
+    assert captured["arguments"] == command
+    assert "FLEET_MCP_EAGER" not in captured["environment"]
 
     for arguments in (["run", "docs"], ["run", "docs", "--", "wrong"]):
         try:

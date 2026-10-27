@@ -1,0 +1,7 @@
+[Unit]
+Description=Remove expired tracked PR images from ghdrop
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=%h/.local/bin/fleet media cleanup
