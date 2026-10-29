@@ -629,7 +629,7 @@ diff --git a/sdk/api/handlers/openai/openai_responses_interrupt_test.go b/sdk/ap
 new file mode 100644
 --- /dev/null
 +++ b/sdk/api/handlers/openai/openai_responses_interrupt_test.go
-@@ -0,0 +1,485 @@
+@@ -0,0 +1,489 @@
 +package openai
 +
 +import (
@@ -889,8 +889,9 @@ new file mode 100644
 +}
 +
 +type blockingHTTPInterruptExecutor struct {
-+	calls    atomic.Int32
-+	canceled atomic.Bool
++	calls      atomic.Int32
++	canceled   atomic.Bool
++	cancelDone chan struct{}
 +}
 +
 +func (*blockingHTTPInterruptExecutor) Identifier() string { return "codex" }
@@ -913,6 +914,7 @@ new file mode 100644
 +		chunks <- coreexecutor.StreamChunk{Payload: []byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"partial","type":"function_call","call_id":"discarded-call","name":"tool","arguments":"{}"}}`)}
 +		<-ctx.Done()
 +		e.canceled.Store(true)
++		close(e.cancelDone)
 +	}()
 +	return &coreexecutor.StreamResult{Chunks: chunks}, nil
 +}
@@ -935,7 +937,7 @@ new file mode 100644
 +
 +func TestResponsesInterruptStopsHTTPUpstream(t *testing.T) {
 +	gin.SetMode(gin.TestMode)
-+	executor := &blockingHTTPInterruptExecutor{}
++	executor := &blockingHTTPInterruptExecutor{cancelDone: make(chan struct{})}
 +	manager := coreauth.NewManager(nil, nil, nil)
 +	manager.SetConfig(&config.Config{})
 +	manager.RegisterExecutor(executor)
@@ -1007,7 +1009,9 @@ new file mode 100644
 +	if got := gjson.GetBytes(interrupted, "response.output").Raw; got != "[]" {
 +		t.Fatalf("discarded output = %s", got)
 +	}
-+	if !executor.canceled.Load() {
++	select {
++	case <-executor.cancelDone:
++	case <-time.After(time.Second):
 +		t.Fatal("http upstream was not canceled")
 +	}
 +	if errSend := client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.interrupt","response_id":"r-http"}`)); errSend != nil {
