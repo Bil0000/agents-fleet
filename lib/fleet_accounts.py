@@ -152,6 +152,8 @@ def load_account_routing(home, *, allow_missing=False):
         or any(providers[provider] not in ROUTING_MODES for provider in PROVIDERS)
         or not isinstance(value.get("credits", {}), dict)
         or any(provider not in PROVIDERS or mode not in CREDIT_MODES for provider, mode in value.get("credits", {}).items())
+        or not isinstance(value.get("selection", {}), dict)
+        or any(provider not in PROVIDERS or mode != "priority" for provider, mode in value.get("selection", {}).items())
     ):
         raise fleet.FleetError("Invalid Fleet account routing policy.")
     return value
@@ -1521,7 +1523,7 @@ def valid_state(state):
         return False
     for provider in PROVIDERS:
         policy = state["providers"][provider]
-        if not isinstance(policy, dict) or set(policy) - {"order", "rebalance"} != {"accounts", "primary", "auto"}:
+        if not isinstance(policy, dict) or set(policy) - {"order", "rebalance", "preferred", "override"} != {"accounts", "primary", "auto"}:
             return False
         if "rebalance" in policy and (policy["rebalance"] not in ("reset", "reset-fallbacks") or "order" not in policy):
             return False
@@ -1536,6 +1538,9 @@ def valid_state(state):
             return False
         if policy["primary"] is not None and policy["primary"] not in accounts:
             return False
+        for field in ("preferred", "override"):
+            if field in policy and (not isinstance(policy[field], str) or policy[field] not in accounts):
+                return False
         if policy["auto"] is not None and type(policy["auto"]) is not bool:
             return False
         if "order" in policy:
@@ -1620,6 +1625,39 @@ def write_account_routing_transaction(home, routing, expected):
             client_config_snapshot,
             "Fleet account routing policy changed during rollback.",
         )
+
+    return rollback
+
+
+def write_policy_transaction(home, provider, state, expected):
+    routing_snapshot = client_config_snapshot(account_routing_path(home))
+    routing = load_account_routing(home, allow_missing=True)
+    previous = dict(routing.get("selection", {}))
+    selection = dict(previous)
+    policy = state["providers"][provider]
+    if policy["accounts"] and (policy.get("rebalance") == "reset" or policy.get("override")):
+        selection[provider] = "priority"
+    else:
+        selection.pop(provider, None)
+    if selection:
+        routing["selection"] = selection
+    else:
+        routing.pop("selection", None)
+    state_rollback = write_state_transaction(home, state, expected)
+    routing_rollback = None
+    try:
+        if selection != previous:
+            routing_rollback = write_account_routing_transaction(home, routing, routing_snapshot)
+    except BaseException:
+        state_rollback()
+        raise
+
+    def rollback():
+        try:
+            if routing_rollback:
+                routing_rollback()
+        finally:
+            state_rollback()
 
     return rollback
 
@@ -1858,6 +1896,10 @@ def list_accounts(home, provider=None):
             auto += " · reset order"
         elif policy.get("rebalance") == "reset-fallbacks":
             auto += " · fallback reset"
+        if policy.get("override") == entry["name"]:
+            order += " · Override"
+        if policy.get("preferred") == entry["name"] and policy["preferred"] != policy["primary"]:
+            order += " · Preferred"
         try:
             cells = {label: f"{used:.0f}% · {format_reset(reset)}" for label, used, reset in account_usage(client, entry)}
         except fleet.FleetError:
@@ -2047,7 +2089,7 @@ def runtime_for_mutation(home):
     return client, config, entries
 
 
-def use_account(home, provider, wanted, *, order=None, keep_rebalance=False):
+def use_account(home, provider, wanted, *, order=None, keep_rebalance=False, override=None, rebalance_mode=None):
     if provider not in PROVIDERS:
         raise fleet.FleetError("Account provider must be claude or codex.")
     state_before = client_config_snapshot(state_path(home))
@@ -2060,6 +2102,19 @@ def use_account(home, provider, wanted, *, order=None, keep_rebalance=False):
         selected = resolve_account(state, provider, entries, wanted)
     except fleet.FleetError:
         raise fleet.FleetError("Account is not enrolled. Run fleet account enroll first.") from None
+    previous_primary = policy["primary"]
+    if keep_rebalance or override is not None:
+        policy.setdefault("preferred", previous_primary or selected["name"])
+    else:
+        policy["preferred"] = selected["name"]
+    if override is True:
+        policy["override"] = selected["name"]
+    elif override is False or (order is not None and not keep_rebalance):
+        policy.pop("override", None)
+    elif not keep_rebalance and "override" in policy:
+        policy["override"] = selected["name"]
+    if rebalance_mode is not None:
+        policy["rebalance"] = rebalance_mode
     if order is not None:
         names = [resolve_account(state, provider, entries, name)["name"] for name in order]
         if len(names) != len(policy["accounts"]) or set(names) != set(policy["accounts"]):
@@ -2076,13 +2131,18 @@ def use_account(home, provider, wanted, *, order=None, keep_rebalance=False):
     operations.extend(priority_operations(entries, selected["name"], policy.get("order")))
     if policy["auto"] is False:
         operations.extend(("disabled", entry, True, entry["disabled"]) for entry in entries if entry["name"] != selected["name"])
-    reset_affinity = policy["auto"] and not keep_rebalance
+    reset_affinity = policy["auto"] and (
+        not keep_rebalance or override is not None
+        or (policy.get("rebalance") == "reset" and previous_primary != selected["name"])
+    )
     if reset_affinity and config.get("fleet-session-affinity-supported") is not True:
         raise fleet.FleetError("Update the Fleet proxy before selecting an account with session affinity.")
+    if (policy.get("rebalance") == "reset" or policy.get("override")) and config.get("fleet-priority-selection-supported") is not True:
+        raise fleet.FleetError("Update the Fleet proxy before using reset order or an account override.")
     secure_credentials(home, config, entries)
 
     def save():
-        rollback = write_state_transaction(home, state, state_before)
+        rollback = write_policy_transaction(home, provider, state, state_before)
         try:
             if reset_affinity:
                 client.request("POST", "routing/session-affinity/reset", {"provider": provider})
@@ -2094,7 +2154,7 @@ def use_account(home, provider, wanted, *, order=None, keep_rebalance=False):
     if order is not None:
         show_account_order(home, provider)
     if policy["auto"]:
-        sessions = "existing sessions keep their available account" if keep_rebalance else "existing sessions rebind on their next request"
+        sessions = "existing sessions rebind on their next request" if reset_affinity else "existing sessions keep their available account"
         print(f"Primary {provider.title()} account: {account_label(state, selected)}. Auto switching is on; new sessions try it first and {sessions}.")
     else:
         print(
@@ -2132,7 +2192,29 @@ def show_account_order(home, provider):
     else:
         suffix = {"reset": " (auto: soonest reset first)", "reset-fallbacks": " (auto: primary first, fallbacks by soonest reset)"}.get(policy.get("rebalance"), "")
         print(f"{provider.title()} account order: " + " -> ".join(policy["accounts"][name] for name in policy["order"]) + suffix)
+    if policy.get("preferred"):
+        print(f"Preferred {provider.title()} account: {policy['accounts'][policy['preferred']]}.")
+    if policy.get("override"):
+        print(f"{provider.title()} override: {policy['accounts'][policy['override']]}. Clear with fleet account override {provider} off.")
 
+
+def override_account(home, provider, wanted):
+    if provider not in PROVIDERS:
+        raise fleet.FleetError("Account provider must be claude or codex.")
+    policy = load_state(home)["providers"][provider]
+    if wanted == "off":
+        if "override" not in policy:
+            print(f"{provider.title()} override is already off.")
+            return
+        client = ManagementClient()
+        entries = enrolled_accounts(policy, accounts_for(client.accounts(), provider))
+        if {entry["name"] for entry in entries} != set(policy["accounts"]):
+            raise fleet.FleetError(f"Enrolled {provider} accounts changed; run fleet account list.")
+        order = reset_policy_order(policy | {"override": None}, entries, client)
+        use_account(home, provider, order[0], order=order, keep_rebalance=True, override=False)
+    else:
+        use_account(home, provider, wanted, keep_rebalance=True, override=True)
+    print(f"{provider.title()} override: {wanted}.")
 
 
 
@@ -2232,7 +2314,7 @@ def account_usage(client, entry):
                     label = "5-hour" if duration <= 18000 else "weekly"
                 windows.append((label, float(window["used_percent"]), float(window["reset_at"])))
     else:
-        for label, key in (("5-hour", "five_hour"), ("weekly", "seven_day")):
+        for label, key in (("5-hour", "five_hour"), ("weekly", "seven_day"), ("Fable weekly", "seven_day_fable")):
             window = body.get(key)
             if not isinstance(window, dict) or type(window.get("utilization")) not in {int, float} or not isinstance(window.get("resets_at"), str):
                 continue
@@ -2241,17 +2323,47 @@ def account_usage(client, entry):
             except ValueError:
                 continue
             windows.append((label, float(window["utilization"]), reset))
+        limits = body.get("limits")
+        for window in limits if isinstance(limits, list) else []:
+            if not isinstance(window, dict):
+                continue
+            label = None
+            if window.get("kind") == "session":
+                label = "5-hour"
+            elif window.get("kind") == "weekly_all":
+                label = "weekly"
+            elif window.get("kind") == "weekly_scoped":
+                scope = window.get("scope")
+                model = scope.get("model") if isinstance(scope, dict) else None
+                if isinstance(model, dict) and (model.get("display_name") == "Fable" or "fable" in str(model.get("id", "")).lower()):
+                    label = "Fable weekly"
+            if label is None or type(window.get("percent")) not in {int, float} or not isinstance(window.get("resets_at"), str):
+                continue
+            try:
+                reset = datetime.datetime.fromisoformat(window["resets_at"]).timestamp()
+            except ValueError:
+                continue
+            windows = [item for item in windows if item[0] != label]
+            windows.append((label, float(window["percent"]), reset))
     if not windows:
         raise fleet.FleetError(f"Provider usage has no limit windows for {entry['name']}.")
     return windows
 
 
-def reset_order(entries, usage):
+def reset_order(entries, usage, preferred=None):
     def soonest(entry):
-        windows = usage[entry["name"]]
-        return ([window for window in windows if window[0] == "weekly"] or windows)[0][2], entry["name"]
+        resets = [reset for label, _used, reset in usage[entry["name"]] if label in {"weekly", "Fable weekly"}]
+        return min(resets, default=float("inf")), entry["name"] != preferred
 
     return [entry["name"] for entry in sorted(entries, key=soonest)]
+
+
+def reset_policy_order(policy, entries, client):
+    usage = {entry["name"]: account_usage(client, entry) for entry in entries}
+    preferred = policy.get("preferred", policy["primary"])
+    order = reset_order(entries, usage, preferred)
+    first = policy.get("override") or (preferred if policy.get("rebalance") == "reset-fallbacks" else None)
+    return [first, *[name for name in order if name != first]] if first else order
 
 
 def rebalance_provider(home, provider):
@@ -2263,11 +2375,10 @@ def rebalance_provider(home, provider):
     entries = enrolled_accounts(policy, accounts_for(client.accounts(), provider))
     if {entry["name"] for entry in entries} != set(policy["accounts"]):
         raise fleet.FleetError(f"Enrolled {provider} accounts changed; run fleet account list.")
-    usage = {entry["name"]: account_usage(client, entry) for entry in entries}
-    order = reset_order(entries, usage)
-    if policy["rebalance"] == "reset-fallbacks":
-        order = [policy["primary"], *[name for name in order if name != policy["primary"]]]
-    if order == policy["order"] and all(value == previous for _, _, value, previous in priority_operations(entries, order[0], order)):
+    order = reset_policy_order(policy, entries, client)
+    selection = load_account_routing(home, allow_missing=True).get("selection", {}).get(provider)
+    expected_selection = "priority" if policy.get("override") or policy["rebalance"] == "reset" else None
+    if order == policy["order"] and selection == expected_selection and all(value == previous for _, _, value, previous in priority_operations(entries, order[0], order)):
         return False
     use_account(home, provider, order[0], order=order, keep_rebalance=True)
     print(f"{provider.title()} order rebalanced by soonest reset: " + " -> ".join(policy["accounts"][name] for name in order))
@@ -2289,21 +2400,24 @@ def set_rebalance(home, provider, mode):
     if provider not in PROVIDERS or mode not in {"reset", "reset-fallbacks", "manual"}:
         raise fleet.FleetError("Usage: fleet account order <claude|codex> <reset|reset-fallbacks|manual>")
     with fleet.operation_lock(home):
+        state_before = client_config_snapshot(state_path(home))
         state = load_state(home)
         policy = state["providers"][provider]
         if mode != "manual":
             if len(policy["accounts"]) < 2:
                 raise fleet.FleetError(f"Reset ordering needs at least two enrolled {provider} accounts.")
-            if "order" not in policy:
-                policy["order"] = [policy["primary"], *sorted(name for name in policy["accounts"] if name != policy["primary"])]
-            policy["rebalance"] = mode
+            client = ManagementClient()
+            entries = enrolled_accounts(policy, accounts_for(client.accounts(), provider))
+            if {entry["name"] for entry in entries} != set(policy["accounts"]):
+                raise fleet.FleetError(f"Enrolled {provider} accounts changed; run fleet account list.")
+            order = reset_policy_order(policy | {"rebalance": mode}, entries, client)
+            use_account(home, provider, order[0], order=order, keep_rebalance=True, rebalance_mode=mode)
         else:
             policy.pop("rebalance", None)
-        write_state(home, state)
+            write_policy_transaction(home, provider, state, state_before)
     if mode != "manual":
         order = "primary first, then the soonest limit reset" if mode == "reset-fallbacks" else "the soonest limit reset"
         print(f"{provider.title()} order now follows {order}. Fleet rebalances after each login and every hour.")
-        rebalance(home, provider)
     else:
         print(f"{provider.title()} order is manual again. Set it with fleet account order {provider} <primary> <fallback> ...")
 
@@ -2913,6 +3027,10 @@ def remove_account(home, provider, wanted=None):
     remaining = [entry for entry in entries if entry["name"] != selected["name"]]
     was_primary = policy["primary"] == selected["name"]
     del policy["accounts"][selected["name"]]
+    if policy.get("preferred") == selected["name"]:
+        policy.pop("preferred")
+    if policy.get("override") == selected["name"]:
+        policy.pop("override")
     if "order" in policy:
         policy["order"].remove(selected["name"])
     if was_primary and policy.get("order") and not any(entry["name"] == policy["order"][0] for entry in remaining):
@@ -2937,7 +3055,7 @@ def remove_account(home, provider, wanted=None):
     secure_credentials(home, config, entries)
 
     def save_and_delete():
-        rollback = write_state_transaction(home, state, state_before)
+        rollback = write_policy_transaction(home, provider, state, state_before)
         try:
             client.delete(selected)
         except BaseException:
@@ -3009,6 +3127,7 @@ USAGE = """Usage: fleet account <command>
 
   list [claude|codex]                    accounts, order, auto, usage, and reset
   use <p> [account]                      pick the primary account
+  override <p> <account|off>             hold an account first until cleared
   order <p> [accounts... | reset | reset-fallbacks | manual | rebalance]
   auto <p> on|off [--when limits|any]    quota failover
   credits <p> never|last|same-account    credit use and account switching
@@ -3097,6 +3216,10 @@ def main(arguments):
         if command == "use" and len(rest) == 2:
             with fleet.operation_lock(home):
                 use_account(home, rest[0], rest[1])
+            return
+        if command == "override" and len(rest) == 2:
+            with fleet.operation_lock(home):
+                override_account(home, rest[0], rest[1])
             return
         if command == "use" and len(rest) == 1:
             with fleet.operation_lock(home):

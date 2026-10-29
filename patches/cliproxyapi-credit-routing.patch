@@ -40,6 +40,15 @@ diff --git a/sdk/cliproxy/auth/conductor_selection.go b/sdk/cliproxy/auth/conduc
  	opts.EnsureMetadata()
  	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
  
+@@ -1544,7 +1555,7 @@
+ 	}
+ 	if !handled {
+ 		selectorCtx := withWeightedSelectorStateModel(ctx, selector, model)
+-		selected, errPick = selector.Pick(selectorCtx, provider, selectionModelArgForSelector(selector, model, eligibility), opts, selectorAuths)
++		selected, errPick = selector.Pick(selectorCtx, provider, selectionModelArgForSelector(selector, model, eligibility), opts, fleetPriorityCandidates(ctx, selectorAuths))
+ 		if errPick != nil {
+ 			if isBuiltInSelector(selector) {
+ 				errPick = restoreModelCooldownErrorModel(errPick, model)
 @@ -1734,6 +1745,12 @@
  }
  
@@ -66,6 +75,15 @@ diff --git a/sdk/cliproxy/auth/conductor_selection.go b/sdk/cliproxy/auth/conduc
  	}
  
  	opts.EnsureMetadata()
+@@ -1877,7 +1900,7 @@
+ 	}
+ 	if !handled {
+ 		selectorCtx := withWeightedSelectorStateModel(ctx, selector, model)
+-		selected, errPick = selector.Pick(selectorCtx, "mixed", selectionModelArgForSelector(selector, model, eligibility), opts, selectorAuths)
++		selected, errPick = selector.Pick(selectorCtx, "mixed", selectionModelArgForSelector(selector, model, eligibility), opts, fleetPriorityCandidates(ctx, selectorAuths))
+ 		if errPick != nil {
+ 			if isBuiltInSelector(selector) {
+ 				errPick = restoreModelCooldownErrorModel(errPick, model)
 @@ -1907,6 +1930,12 @@
  }
  
@@ -94,7 +112,7 @@ diff --git a/sdk/cliproxy/auth/fleet_quota_probe.go b/sdk/cliproxy/auth/fleet_qu
  	var url string
  	headers := make(http.Header)
  	headers.Set("Accept", "application/json")
-@@ -80,48 +85,59 @@
+@@ -80,48 +85,66 @@
  		headers.Set("User-Agent", "claude-cli/2.1.258 (external, cli)")
  		headers.Set("Anthropic-Beta", "oauth-2025-04-20")
  	default:
@@ -155,19 +173,20 @@ diff --git a/sdk/cliproxy/auth/fleet_quota_probe.go b/sdk/cliproxy/auth/fleet_qu
 -	case "codex":
 -		main := root.Get("rate_limit")
 -		if !main.Exists() || main.Get("limit_reached").Bool() {
+-			return false
+-		}
+-		for _, extra := range root.Get("additional_rate_limits").Array() {
+-			if extra.Get("rate_limit.limit_reached").Bool() {
 +	available, known, _ := fleetUsageFunding(provider, "", body)
 +	if !known || !available {
 +		return false
 +	}
-+	for _, extra := range gjson.GetBytes(body, "additional_rate_limits").Array() {
-+		if extra.Get("rate_limit.limit_reached").Bool() {
- 			return false
++	if provider == "claude" {
++		for _, key := range []string{"seven_day_opus", "seven_day_sonnet", "seven_day_fable"} {
++			if gjson.GetBytes(body, key+".utilization").Float() >= 100 {
+ 				return false
+ 			}
  		}
--		for _, extra := range root.Get("additional_rate_limits").Array() {
--			if extra.Get("rate_limit.limit_reached").Bool() {
--				return false
--			}
--		}
 -		return true
 -	case "claude":
 -		limits := root.Get("limits").Array()
@@ -175,7 +194,11 @@ diff --git a/sdk/cliproxy/auth/fleet_quota_probe.go b/sdk/cliproxy/auth/fleet_qu
 -			if limit.Get("percent").Float() >= 100 {
 -				return false
 -			}
--		}
++	}
++	for _, extra := range gjson.GetBytes(body, "additional_rate_limits").Array() {
++		if extra.Get("rate_limit.limit_reached").Bool() {
++			return false
+ 		}
 -		return len(limits) > 0
  	}
 -	return false
@@ -185,7 +208,7 @@ diff --git a/sdk/cliproxy/auth/fleet_credit_routing.go b/sdk/cliproxy/auth/fleet
 new file mode 100644
 --- /dev/null
 +++ b/sdk/cliproxy/auth/fleet_credit_routing.go
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,281 @@
 +package auth
 +
 +import (
@@ -204,36 +227,69 @@ new file mode 100644
 +)
 +
 +type fleetCreditContextKey struct{}
++type fleetPriorityContextKey struct{}
 +
-+func fleetCreditModes() (map[string]string, error) {
++type fleetRoutingPolicy struct {
++	Version   int               `json:"version"`
++	Credits   map[string]string `json:"credits"`
++	Selection map[string]string `json:"selection"`
++}
++
++func fleetPriorityCandidates(ctx context.Context, auths []*Auth) []*Auth {
++	modes, _ := ctx.Value(fleetPriorityContextKey{}).(map[string]string)
++	if len(modes) == 0 {
++		return auths
++	}
++	best := map[string]int{}
++	for _, a := range auths {
++		if modes[a.Provider] != "priority" {
++			continue
++		}
++		rank := authPriority(a)
++		if previous, ok := best[a.Provider]; !ok || rank > previous {
++			best[a.Provider] = rank
++		}
++	}
++	filtered := make([]*Auth, 0, len(auths))
++	for _, a := range auths {
++		if modes[a.Provider] != "priority" || authPriority(a) == best[a.Provider] {
++			filtered = append(filtered, a)
++		}
++	}
++	return filtered
++}
++
++func fleetCreditPolicy() (fleetRoutingPolicy, error) {
 +	path := os.Getenv("FLEET_ACCOUNT_ROUTING_FILE")
 +	if path == "" {
 +		home, err := os.UserHomeDir()
 +		if err != nil {
-+			return nil, err
++			return fleetRoutingPolicy{}, err
 +		}
 +		path = filepath.Join(home, ".local", "state", "fleet", "account-routing.json")
 +	}
 +	body, err := os.ReadFile(path)
 +	if errors.Is(err, os.ErrNotExist) {
-+		return nil, nil
++		return fleetRoutingPolicy{}, nil
 +	}
 +	if err != nil {
-+		return nil, err
++		return fleetRoutingPolicy{}, err
 +	}
-+	var policy struct {
-+		Version int               `json:"version"`
-+		Credits map[string]string `json:"credits"`
-+	}
++	var policy fleetRoutingPolicy
 +	if err = json.Unmarshal(body, &policy); err != nil || policy.Version != 1 {
-+		return nil, errors.New("invalid Fleet credit policy")
++		return fleetRoutingPolicy{}, errors.New("invalid Fleet credit policy")
 +	}
 +	for provider, mode := range policy.Credits {
 +		if (provider != "claude" && provider != "codex") || (mode != "never" && mode != "last" && mode != "same-account") {
-+			return nil, errors.New("invalid Fleet credit policy")
++			return fleetRoutingPolicy{}, errors.New("invalid Fleet credit policy")
 +		}
 +	}
-+	return policy.Credits, nil
++	for provider, mode := range policy.Selection {
++		if (provider != "claude" && provider != "codex") || mode != "priority" {
++			return fleetRoutingPolicy{}, errors.New("invalid Fleet selection policy")
++		}
++	}
++	return policy, nil
 +}
 +
 +func (m *Manager) fleetCreditContext(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options) (context.Context, error) {
@@ -243,13 +299,14 @@ new file mode 100644
 +	if ctx.Value(fleetCreditContextKey{}) != nil {
 +		return ctx, nil
 +	}
-+	modes, err := fleetCreditModes()
++	policy, err := fleetCreditPolicy()
 +	if err != nil {
 +		return ctx, &Error{Code: "fleet_credit_policy_invalid", Message: "Fleet credit policy is unavailable; request stopped to protect credits", HTTPStatus: 503}
 +	}
++	ctx = context.WithValue(ctx, fleetPriorityContextKey{}, policy.Selection)
 +	active := map[string]string{}
 +	for _, provider := range providers {
-+		if mode := modes[provider]; mode == "never" || mode == "last" {
++		if mode := policy.Credits[provider]; mode == "never" || mode == "last" {
 +			active[provider] = mode
 +		}
 +	}
@@ -280,6 +337,15 @@ new file mode 100644
 +			continue
 +		}
 +		if available {
++			if blocked, reason, _ := isAuthBlockedForModel(a, m.selectionModelKeyForAuth(a, model), time.Now()); policy.Selection[a.Provider] == "priority" && blocked && reason == blockReasonCooldown && fleetQuotaCooled(a, time.Now()) {
++				onlyModel := model
++				if fleetUsageAvailable(a.Provider, body) {
++					onlyModel = ""
++				}
++				if _, _, err := m.resetQuota(ctx, a.ID, onlyModel); err != nil {
++					return ctx, err
++				}
++			}
 +			allowed[a.ID] = true
 +			plan[a.Provider] = true
 +		}
@@ -333,10 +399,20 @@ new file mode 100644
 +	}
 +	body, retry := m.fleetUsage(ctx, a)
 +	entry.body = nil
++	entry.until = time.Time{}
 +	entry.token = authAccessToken(a)
 +	if gjson.GetBytes(body, "extra_usage.is_enabled").Type == gjson.False && fleetUsageAvailable(a.Provider, body) {
 +		entry.body = body
 +		entry.until = time.Now().Add(5 * time.Minute)
++		windows := gjson.GetBytes(body, "limits").Array()
++		for _, key := range []string{"five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "seven_day_fable"} {
++			windows = append(windows, gjson.GetBytes(body, key))
++		}
++		for _, window := range windows {
++			if reset, err := time.Parse(time.RFC3339, window.Get("resets_at").String()); err == nil && reset.Before(entry.until) {
++				entry.until = reset
++			}
++		}
 +	} else if retry > 0 && ctx.Err() == nil {
 +		entry.until = time.Now().Add(retry)
 +	} else {
@@ -384,6 +460,18 @@ new file mode 100644
 +			}
 +		}
 +		for _, w := range root.Get("limits").Array() {
++			if scope := w.Get("scope.model"); model != "" && scope.IsObject() {
++				named, matches := false, false
++				for _, field := range []string{"id", "display_name"} {
++					if name := scope.Get(field).String(); name != "" {
++						named = true
++						matches = matches || strings.Contains(strings.ToLower(model), strings.ToLower(name))
++					}
++				}
++				if named && !matches {
++					continue
++				}
++			}
 +			percent := w.Get("percent")
 +			if percent.Type == gjson.Number {
 +				known = true
@@ -406,12 +494,13 @@ diff --git a/sdk/cliproxy/auth/fleet_credit_routing_test.go b/sdk/cliproxy/auth/
 new file mode 100644
 --- /dev/null
 +++ b/sdk/cliproxy/auth/fleet_credit_routing_test.go
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,464 @@
 +package auth
 +
 +import (
 +	"context"
 +	"encoding/json"
++	"fmt"
 +	"io"
 +	"net/http"
 +	"os"
@@ -518,6 +607,8 @@ new file mode 100644
 +		{"claude", "opus", `{"five_hour":{"utilization":0},"seven_day_sonnet":{"utilization":100}}`, true, true, false},
 +		{"claude", "sonnet", `{"five_hour":{"utilization":0},"seven_day_sonnet":{"utilization":100}}`, false, true, false},
 +		{"claude", "", `{"limits":[{"kind":"session","percent":100}],"extra_usage":{"is_enabled":false}}`, false, true, false},
++		{"claude", "claude-opus-4-6", `{"limits":[{"kind":"weekly_all","percent":0},{"kind":"weekly_scoped","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"percent":100}]}`, true, true, false},
++		{"claude", "claude-fable-5", `{"limits":[{"kind":"weekly_all","percent":0},{"kind":"weekly_scoped","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"percent":100}]}`, false, true, false},
 +		{"claude", "", `{"extra_usage":{"is_enabled":true}}`, false, false, true},
 +		{"codex", "", `{}`, false, false, false},
 +		{"codex", "", `{"rate_limit":{"limit_reached":"false"}}`, false, false, false},
@@ -629,18 +720,258 @@ new file mode 100644
 +		}
 +	}
 +}
++
++func TestFleetPrioritySelectionReturnsToRecoveredAccount(t *testing.T) {
++	for _, provider := range []string{"claude", "codex"} {
++		for _, path := range []string{"single", "mixed", "legacy", "mixed-legacy", "select"} {
++			for _, priority := range []bool{false, true} {
++				for _, exhausted := range []string{"session", "weekly", "model"} {
++					t.Run(provider+"/"+path+"/"+fmt.Sprint(priority)+"/"+exhausted, func(t *testing.T) {
++						file := filepath.Join(t.TempDir(), "routing.json")
++						t.Setenv("FLEET_ACCOUNT_ROUTING_FILE", file)
++						policy := map[string]any{"version": 1, "credits": map[string]string{provider: map[string]string{"claude": "never", "codex": "last"}[provider]}}
++						if priority {
++							policy["selection"] = map[string]string{provider: "priority"}
++						}
++						body, _ := json.Marshal(policy)
++						if err := os.WriteFile(file, body, 0600); err != nil {
++							t.Fatal(err)
++						}
++						available := `{"five_hour":{"utilization":0},"seven_day":{"utilization":0},"seven_day_fable":{"utilization":0},"extra_usage":{"is_enabled":true}}`
++						blocked := map[string]string{
++							"session": `{"five_hour":{"utilization":100},"seven_day":{"utilization":0},"extra_usage":{"is_enabled":true}}`,
++							"weekly":  `{"five_hour":{"utilization":0},"seven_day":{"utilization":100},"extra_usage":{"is_enabled":true}}`,
++							"model":   `{"five_hour":{"utilization":0},"limits":[{"kind":"weekly_scoped","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"percent":100,"resets_at":null}],"extra_usage":{"is_enabled":true}}`,
++						}[exhausted]
++						model := "claude-fable-5"
++						if provider == "codex" {
++							model = "gpt-6.1-sol"
++							available = `{"rate_limit":{"limit_reached":false},"credits":{"has_credits":true}}`
++							blocked = map[string]string{
++								"session": `{"rate_limit":{"limit_reached":false,"primary_window":{"used_percent":100}},"credits":{"has_credits":true}}`,
++								"weekly":  `{"rate_limit":{"limit_reached":false,"secondary_window":{"used_percent":100}},"credits":{"has_credits":true}}`,
++								"model":   `{"rate_limit":{"limit_reached":false},"model_usage":{"gpt-6.1-sol":{"available":false}},"credits":{"has_credits":true}}`,
++							}[exhausted]
++						}
++						executor := &fleetCreditTestExecutor{schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: provider}, bodies: map[string]string{"a": available, "b": available}}
++						affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: &FillFirstSelector{}, TTL: time.Hour})
++						defer affinity.Stop()
++						manager := NewManager(nil, affinity, nil)
++						manager.RegisterExecutor(executor)
++						for id, rank := range map[string]string{"a": "2", "b": "1"} {
++							if _, err := manager.Register(context.Background(), &Auth{ID: id, Provider: provider, Status: StatusActive, Attributes: map[string]string{AttributeAuthKind: AuthKindOAuth, "priority": rank}}); err != nil {
++								t.Fatal(err)
++							}
++						}
++						opts := cliproxyexecutor.Options{Headers: http.Header{"Session-Id": []string{"stable-session"}}, Metadata: map[string]any{cliproxyexecutor.ProviderRouteMetadataKey: true}}
++						pick := func(want string) {
++							t.Helper()
++							var got *Auth
++							var err error
++							switch path {
++							case "single":
++								got, _, err = manager.pickNext(context.Background(), provider, model, opts, nil)
++							case "mixed":
++								got, _, _, err = manager.pickNextMixed(context.Background(), []string{provider}, model, opts, nil)
++							case "legacy":
++								got, _, err = manager.pickNextLegacy(context.Background(), provider, model, opts, nil)
++							case "mixed-legacy":
++								got, _, _, err = manager.pickNextMixedLegacy(context.Background(), []string{provider}, model, opts, nil)
++							case "select":
++								got, err = manager.SelectAuth(context.Background(), provider, model, opts)
++							}
++							if err != nil || got == nil || got.ID != want {
++								t.Fatalf("got %v, %v; want %s", got, err, want)
++							}
++						}
++						pick("a")
++						executor.bodies["a"] = blocked
++						pick("b")
++						for _, a := range manager.List() {
++							if a.ID == "a" {
++								a.Quota = QuotaState{Exceeded: true, Reason: "credential_quota", NextRecoverAt: time.Now().Add(time.Hour)}
++								a.Unavailable = true
++								a.NextRetryAfter = a.Quota.NextRecoverAt
++								if _, err := manager.Update(context.Background(), a); err != nil {
++									t.Fatal(err)
++								}
++							}
++						}
++						executor.bodies["a"] = available
++						if priority {
++							pick("a")
++						} else {
++							pick("b")
++						}
++					})
++				}
++			}
++		}
++	}
++}
++
++func TestFleetClaudeFullModelUsageIsRechecked(t *testing.T) {
++	for _, reset := range []string{"", `,"resets_at":null`, `,"resets_at":"2099-01-01T00:00:00Z"`} {
++		t.Run(reset, func(t *testing.T) {
++			executor := &fleetCreditTestExecutor{schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "claude"}, bodies: map[string]string{"a": `{"five_hour":{"utilization":0},"seven_day_fable":{"utilization":100` + reset + `},"extra_usage":{"is_enabled":false}}`}}
++			manager := NewManager(nil, &FillFirstSelector{}, nil)
++			manager.RegisterExecutor(executor)
++			a := &Auth{ID: "a", Provider: "claude"}
++			if available, known, _ := fleetUsageFunding("claude", "claude-fable-5", manager.fleetCreditUsage(context.Background(), a)); available || !known {
++				t.Fatal("full Fable allowance was not blocked")
++			}
++			executor.bodies["a"] = `{"five_hour":{"utilization":0},"seven_day_fable":{"utilization":0},"extra_usage":{"is_enabled":false}}`
++			if available, known, _ := fleetUsageFunding("claude", "claude-fable-5", manager.fleetCreditUsage(context.Background(), a)); !available || !known || executor.calls != 2 {
++				t.Fatalf("recovered Fable allowance was cached as full; calls=%d", executor.calls)
++			}
++		})
++	}
++}
++
++func TestFleetClaudeUsageCacheExpiresAtReportedReset(t *testing.T) {
++	for _, key := range []string{"five_hour", "seven_day", "seven_day_fable", "limits"} {
++		t.Run(key, func(t *testing.T) {
++			reset := time.Now().Add(time.Minute).UTC().Format(time.RFC3339)
++			executor := &fleetCreditTestExecutor{schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "claude"}, bodies: map[string]string{"a": fmt.Sprintf(`{"five_hour":{"utilization":0},"%s":{"utilization":4,"resets_at":%q},"extra_usage":{"is_enabled":false}}`, key, reset)}}
++			if key == "five_hour" {
++				executor.bodies["a"] = fmt.Sprintf(`{"five_hour":{"utilization":0,"resets_at":%q},"extra_usage":{"is_enabled":false}}`, reset)
++			}
++			if key == "limits" {
++				executor.bodies["a"] = fmt.Sprintf(`{"limits":[{"kind":"weekly_scoped","scope":{"model":{"id":null,"display_name":"Fable"}},"percent":0,"resets_at":%q}],"extra_usage":{"is_enabled":false}}`, reset)
++			}
++			manager := NewManager(nil, &FillFirstSelector{}, nil)
++			manager.RegisterExecutor(executor)
++			manager.fleetCreditUsage(context.Background(), &Auth{ID: "a", Provider: "claude"})
++			cached, _ := manager.fleetCreditUsageCache.Load("a")
++			deadline, _ := time.Parse(time.RFC3339, reset)
++			if cached.(*fleetCreditUsageEntry).until.IsZero() || cached.(*fleetCreditUsageEntry).until.After(deadline) {
++				t.Fatal("usage cache outlives provider reset")
++			}
++		})
++	}
++}
++
++func TestFleetQuotaProbeDoesNotClearFullModelAllowance(t *testing.T) {
++	for _, key := range []string{"seven_day_opus", "seven_day_sonnet", "seven_day_fable"} {
++		for _, reset := range []string{"", `,"resets_at":null`, `,"resets_at":"2000-01-01T00:00:00Z"`} {
++			body := fmt.Sprintf(`{"five_hour":{"utilization":0},"seven_day":{"utilization":0},"%s":{"utilization":100%s}}`, key, reset)
++			if fleetUsageAvailable("claude", []byte(body)) {
++				t.Errorf("full model allowance treated as reset: %s", body)
++			}
++		}
++	}
++}
++
++func TestFleetPrioritySelectionWithoutCreditChecks(t *testing.T) {
++	for _, provider := range []string{"claude", "codex"} {
++		for _, credit := range []string{"", "same-account"} {
++			for _, mixed := range []bool{false, true} {
++				t.Run(provider+"/"+credit+"/"+fmt.Sprint(mixed), func(t *testing.T) {
++					file := filepath.Join(t.TempDir(), "routing.json")
++					t.Setenv("FLEET_ACCOUNT_ROUTING_FILE", file)
++					policy := map[string]any{"version": 1, "selection": map[string]string{provider: "priority"}}
++					if credit != "" {
++						policy["credits"] = map[string]string{provider: credit}
++					}
++					body, _ := json.Marshal(policy)
++					if err := os.WriteFile(file, body, 0600); err != nil {
++						t.Fatal(err)
++					}
++					executor := &fleetCreditTestExecutor{schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: provider}}
++					affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: &FillFirstSelector{}, TTL: time.Hour})
++					defer affinity.Stop()
++					manager := NewManager(nil, affinity, nil)
++					manager.RegisterExecutor(executor)
++					opts := cliproxyexecutor.Options{Headers: http.Header{"Session-Id": []string{"stable-session"}}}
++					for _, id := range []string{"a", "b"} {
++						if _, err := manager.Register(context.Background(), &Auth{ID: id, Provider: provider, Status: StatusActive, Attributes: map[string]string{AttributeAuthKind: AuthKindOAuth, "priority": "2"}}); err != nil {
++							t.Fatal(err)
++						}
++						var got *Auth
++						var err error
++						if mixed {
++							got, _, _, err = manager.pickNextMixed(context.Background(), []string{provider}, "", opts, nil)
++						} else {
++							got, _, err = manager.pickNext(context.Background(), provider, "", opts, nil)
++						}
++						if err != nil || got == nil {
++							t.Fatalf("pick: %v, %v", got, err)
++						}
++						if id == "b" && got.ID != "a" {
++							t.Fatalf("equal priority changed the binding: %s", got.ID)
++						}
++					}
++					for _, a := range manager.List() {
++						if a.ID == "b" {
++							a.Attributes["priority"] = "3"
++							if _, err := manager.Update(context.Background(), a); err != nil {
++								t.Fatal(err)
++							}
++						}
++					}
++					var got *Auth
++					var err error
++					if mixed {
++						got, _, _, err = manager.pickNextMixed(context.Background(), []string{provider}, "", opts, nil)
++					} else {
++						got, _, err = manager.pickNext(context.Background(), provider, "", opts, nil)
++					}
++					if err != nil || got == nil || got.ID != "b" || executor.calls != 0 {
++						t.Fatalf("priority lost without credit checks: %v, %v, usage calls=%d", got, err, executor.calls)
++					}
++				})
++			}
++		}
++	}
++}
++
++func TestFleetPriorityRecoveryPreservesOtherModelCooldown(t *testing.T) {
++	file := filepath.Join(t.TempDir(), "routing.json")
++	t.Setenv("FLEET_ACCOUNT_ROUTING_FILE", file)
++	if err := os.WriteFile(file, []byte(`{"version":1,"credits":{"claude":"never"},"selection":{"claude":"priority"}}`), 0600); err != nil {
++		t.Fatal(err)
++	}
++	body := `{"five_hour":{"utilization":0},"seven_day":{"utilization":0},"limits":[{"kind":"weekly_scoped","scope":{"model":{"id":null,"display_name":"Fable"}},"percent":100}],"extra_usage":{"is_enabled":false}}`
++	executor := &fleetCreditTestExecutor{schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "claude"}, bodies: map[string]string{"a": body, "b": `{"five_hour":{"utilization":0},"extra_usage":{"is_enabled":false}}`}}
++	manager := NewManager(nil, &FillFirstSelector{}, nil)
++	manager.RegisterExecutor(executor)
++	for id, rank := range map[string]string{"a": "2", "b": "1"} {
++		a := &Auth{ID: id, Provider: "claude", Status: StatusActive, Attributes: map[string]string{AttributeAuthKind: AuthKindOAuth, "priority": rank}}
++		if id == "a" {
++			a.ModelStates = map[string]*ModelState{}
++			for _, model := range []string{"claude-opus-4-6", "claude-fable-5"} {
++				next := time.Now().Add(time.Hour)
++				a.ModelStates[model] = &ModelState{Unavailable: true, Status: StatusError, NextRetryAfter: next, Quota: QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: next}}
++			}
++		}
++		if _, err := manager.Register(context.Background(), a); err != nil {
++			t.Fatal(err)
++		}
++	}
++	opts := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.ProviderRouteMetadataKey: true}}
++	got, _, err := manager.pickNext(context.Background(), "claude", "claude-opus-4-6", opts, nil)
++	if err != nil || got == nil || got.ID != "a" {
++		t.Fatalf("recovered Opus did not return: %v, %v", got, err)
++	}
++	for _, a := range manager.List() {
++		if a.ID == "a" && (!a.ModelStates["claude-fable-5"].Quota.Exceeded || a.ModelStates["claude-opus-4-6"].Quota.Exceeded) {
++			t.Fatalf("model recovery changed the wrong quotas: %#v", a.ModelStates)
++		}
++	}
++}
 diff --git a/internal/api/handlers/management/config_basic.go b/internal/api/handlers/management/config_basic.go
 --- a/internal/api/handlers/management/config_basic.go
 +++ b/internal/api/handlers/management/config_basic.go
-@@ -28,7 +28,10 @@
+@@ -28,7 +28,11 @@
  		c.JSON(200, gin.H{})
  		return
  	}
 -	c.JSON(200, new(*h.cfg))
 +	c.JSON(200, struct {
 +		*config.Config
-+		FleetCreditRoutingSupported bool `json:"fleet-credit-routing-supported"`
-+	}{new(*h.cfg), true})
++		FleetCreditRoutingSupported     bool `json:"fleet-credit-routing-supported"`
++		FleetPrioritySelectionSupported bool `json:"fleet-priority-selection-supported"`
++	}{new(*h.cfg), true, true})
  }
  
  type releaseInfo struct {
@@ -657,3 +988,43 @@ diff --git a/sdk/cliproxy/auth/conductor.go b/sdk/cliproxy/auth/conductor.go
  	// refreshLocks serializes credential refresh per auth ID so concurrent
  	// 401 recoveries and auto-refresh workers do not race the same refresh_token.
  	refreshLocks sync.Map
+diff --git a/sdk/cliproxy/auth/conductor_cooldown.go b/sdk/cliproxy/auth/conductor_cooldown.go
+--- a/sdk/cliproxy/auth/conductor_cooldown.go
++++ b/sdk/cliproxy/auth/conductor_cooldown.go
+@@ -450,6 +450,10 @@
+ 
+ // ResetQuota clears quota/cooldown state for an auth and resumes registry routing.
+ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []string, error) {
++	return m.resetQuota(ctx, authID, "")
++}
++
++func (m *Manager) resetQuota(ctx context.Context, authID, onlyModel string) (*Auth, []string, error) {
+ 	if m == nil {
+ 		return nil, nil, nil
+ 	}
+@@ -477,7 +481,13 @@
+ 		cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
+ 	}
+ 
++	if onlyModel != "" {
++		onlyModel = m.selectionModelKeyForAuth(auth, onlyModel)
++	}
+ 	for modelKey, state := range auth.ModelStates {
++		if onlyModel != "" && (canonicalModelKey(modelKey) != onlyModel || state == nil || !state.Quota.Exceeded || (state.Quota.Reason != "quota" && state.Quota.Reason != "credential_quota")) {
++			continue
++		}
+ 		if strings.TrimSpace(modelKey) == "" {
+ 			continue
+ 		}
+@@ -486,7 +496,10 @@
+ 			resetModelState(state, now)
+ 		}
+ 	}
+-	if clearCooldownStateForAuth(auth, now) {
++	if onlyModel != "" {
++		clearAggregatedAvailability(auth)
++		updateAggregatedAvailability(auth, now)
++	} else if clearCooldownStateForAuth(auth, now) {
+ 		if len(models) == 0 {
+ 			models = append(models, registeredModels...)
+ 		}

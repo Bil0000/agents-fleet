@@ -440,6 +440,28 @@ class CLIProxyFailoverTest(unittest.TestCase):
                     response.read()
                 self.assertEqual(self.upstream.calls[-1][0].removeprefix("Bearer "), "account-a")
 
+    def test_priority_policy_returns_bound_session_to_recovered_main(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                self.stop_proxy()
+                self.upstream.calls.clear()
+                self.upstream.mode = "ordered"
+                self.upstream.exhausted = set()
+                (self.base / "account-routing.json").write_text(json.dumps({
+                    "version": 1, "selection": {provider: "priority"},
+                }))
+                self.start_proxy(["account-a", "account-b"], protocol=provider, affinity=True, plugin=self.build_router_plugin())
+                request = self.claude_request if provider == "claude" else lambda turn, session: self.provider_request("gpt-5.4", session=session, turn=turn)
+                for turn, exhausted, expected in (
+                    ("turn-1", set(), "account-a"),
+                    ("turn-2", {"account-a"}, "account-b"),
+                    ("turn-3", set(), "account-a"),
+                ):
+                    self.upstream.exhausted = exhausted
+                    with request(turn, session="stable-session") as response:
+                        response.read()
+                    self.assertEqual(self.upstream.calls[-1][0].removeprefix("Bearer "), expected)
+
     def test_model_access_failure_uses_fallback_and_only_cools_that_model(self):
         for stream in (False, True):
             with self.subTest(stream=stream):

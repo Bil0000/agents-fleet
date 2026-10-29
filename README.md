@@ -138,10 +138,11 @@ All commands below start with `fleet account`.
 | `login PROVIDER --existing ACCOUNT` | Add credentials that are already in CLIProxyAPI. |
 | `logout PROVIDER [ACCOUNT]` | Remove an account. The default is the primary. |
 | `rename PROVIDER ACCOUNT LABEL` | Change an account's display name. |
-| `use PROVIDER [ACCOUNT]` | Choose the primary account. Without `ACCOUNT`, it opens a picker. |
+| `use PROVIDER [ACCOUNT]` | Choose the primary and save it as the preferred account for reset ties. Without `ACCOUNT`, it opens a picker. |
+| `override PROVIDER ACCOUNT` / `override PROVIDER off` | Hold an account first, or return to normal reset order. Limit fallback stays on if auto is on. |
 | `order PROVIDER` | Show the saved order. |
 | `order PROVIDER PRIMARY BACKUP...` | Set the order by hand. List every account once, primary first. |
-| `order PROVIDER reset` | Sort by soonest weekly reset, after login and during hourly updates. |
+| `order PROVIDER reset` | Sort by soonest weekly or Claude Fable weekly reset, after login and during hourly updates. Session reset times do not set order. |
 | `order PROVIDER reset-fallbacks` | Keep the primary first. Sort the fallback accounts by soonest reset. |
 | `order PROVIDER manual` | Keep the current order. Stop automatic sorting. |
 | `order PROVIDER rebalance` | Sort now. Use `order rebalance` for both providers. |
@@ -155,7 +156,10 @@ Example: `fleet account use codex "Work Pro"`. Use only accounts you own.
 How fallback behaves:
 
 - It switches only before output starts. Fleet never replays a request that has partly arrived.
-- New sessions try the primary first. Existing sessions keep their account while it works. A manual account change applies on the next request.
+- Reset mode uses the highest eligible account on each request. When reset times match, it uses your saved preferred account first. It returns to the first account when allowance recovers.
+- Manual order and `reset-fallbacks` keep existing session bindings unless an override is active. Account changes apply on the next request and do not cut off running replies.
+- `fleet account override codex "Backup"` holds that account first until `fleet account override codex off`. Replace `codex` with `claude` for Claude. A full session, weekly, or required model limit still causes fallback when auto is on.
+- Reset mode and overrides need a router that reports `fleet-priority-selection-supported`. Older routers are rejected before account changes. Claude uses the live `limits` list when present and keeps support for legacy weekly fields.
 - Retries stop after three attempts or 120 seconds. Longer provider waits go back to the client.
 
 ### Move an existing CLIProxyAPI

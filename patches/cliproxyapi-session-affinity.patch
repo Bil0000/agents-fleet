@@ -1,15 +1,15 @@
 diff --git a/internal/api/handlers/management/config_basic.go b/internal/api/handlers/management/config_basic.go
 --- a/internal/api/handlers/management/config_basic.go
 +++ b/internal/api/handlers/management/config_basic.go
-@@ -30,8 +30,9 @@
+@@ -30,9 +30,10 @@
  	}
  	c.JSON(200, struct {
  		*config.Config
--		FleetCreditRoutingSupported bool `json:"fleet-credit-routing-supported"`
--	}{new(*h.cfg), true})
-+		FleetCreditRoutingSupported   bool `json:"fleet-credit-routing-supported"`
-+		FleetSessionAffinitySupported bool `json:"fleet-session-affinity-supported"`
-+	}{new(*h.cfg), true, true})
++		FleetSessionAffinitySupported   bool `json:"fleet-session-affinity-supported"`
+ 		FleetCreditRoutingSupported     bool `json:"fleet-credit-routing-supported"`
+ 		FleetPrioritySelectionSupported bool `json:"fleet-priority-selection-supported"`
+-	}{new(*h.cfg), true, true})
++	}{new(*h.cfg), true, true, true})
  }
  
  type releaseInfo struct {
