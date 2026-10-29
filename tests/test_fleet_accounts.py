@@ -233,6 +233,7 @@ class FakeManagement:
         self.server.accounts = {}
         self.server.config = {
             "fleet-session-affinity-supported": True,
+            "fleet-priority-selection-supported": True,
             "host": "127.0.0.1",
             "auth-dir": str(auth),
             "api-keys": ["test-client-key"],
@@ -2000,6 +2001,246 @@ class FleetAccountsTest(unittest.TestCase):
                 manual = self.run_fleet("order", provider, "manual")
                 self.assertEqual(manual.returncode, 0, manual.stderr)
                 self.assertNotIn("rebalance", ACCOUNTS.load_state(self.home)["providers"][provider])
+
+    def test_reset_order_preserves_preference_across_primary_changes_and_ties(self):
+        for provider in ACCOUNTS.PROVIDERS:
+            with self.subTest(provider=provider):
+                names = [f"{provider}-{stem}.json" for stem in ("z-main", "a-first", "b-next")]
+                for stem in ("z-main", "a-first", "b-next"):
+                    self.add_account(provider, stem)
+                self.write_state(**{provider: {"accounts": dict(zip(names, ("Main", "First", "Next"))), "primary": names[0], "auto": True}})
+                self.management.server.usage = {
+                    f"index-{name}": {"rate_limit": {"primary_window": {"used_percent": 0, "reset_at": session, "limit_window_seconds": 18000}, "secondary_window": {"used_percent": 10, "reset_at": reset, "limit_window_seconds": 604800}}} if provider == "codex" else {"seven_day": {"utilization": 10, "resets_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(reset))}, "five_hour": {"utilization": 0, "resets_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(session))}}
+                    for name, reset, session in zip(names, (9000, 1000, 5000), (1, 3, 2))
+                }
+                with mock.patch.dict(os.environ, self.environment):
+                    ACCOUNTS.set_rebalance(self.home, provider, "reset")
+                    policy = ACCOUNTS.load_state(self.home)["providers"][provider]
+                    self.assertEqual(policy["order"], [names[1], names[2], names[0]])
+                    self.assertEqual(policy["preferred"], names[0])
+                    for body in self.management.server.usage.values():
+                        if provider == "codex":
+                            body["rate_limit"]["secondary_window"]["reset_at"] = 7000
+                        else:
+                            body["seven_day"]["resets_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(7000))
+                    ACCOUNTS.rebalance_provider(self.home, provider)
+                    policy = ACCOUNTS.load_state(self.home)["providers"][provider]
+                    self.assertEqual(policy["order"], [names[0], names[1], names[2]])
+                    self.assertEqual(policy["preferred"], names[0])
+                    resets = [item for item in self.management.server.history if item[0].endswith("/session-affinity/reset") and item[1] == provider]
+                    self.assertEqual(len(resets), 2)
+
+    def test_reset_order_ignores_session_only_accounts(self):
+        for name in ("main", "session", "weekly"):
+            self.add_account("claude", name)
+        entries = list(self.management.server.accounts.values())
+        names = [entry["name"] for entry in entries]
+        policy = {"primary": names[0], "preferred": names[0]}
+        self.management.server.usage = {
+            f"index-{name}": {"limits": [{"kind": "session" if index < 2 else "weekly_all", "percent": 0, "resets_at": f"2999-01-0{index + 1}T00:00:00Z"}]}
+            for index, name in enumerate(names)
+        }
+        with mock.patch.dict(os.environ, self.environment):
+            self.assertEqual(ACCOUNTS.reset_policy_order(policy, entries, ACCOUNTS.ManagementClient()), [names[2], names[0], names[1]])
+
+    def test_claude_reset_order_uses_earliest_weekly_or_fable_expiry(self):
+        for stem in ("main", "fable", "weekly"):
+            self.add_account("claude", stem)
+        names = [f"claude-{stem}.json" for stem in ("main", "fable", "weekly")]
+        for model in (None, {"id": None, "display_name": "Fable"}, {"id": "claude-fable-1", "display_name": "Other"}):
+            with self.subTest(model=model):
+                self.write_state(claude={"accounts": dict(zip(names, ("Main", "Fable", "Weekly"))), "primary": names[0], "auto": True})
+                self.management.server.usage = {}
+                for name, weekly, fable in zip(names, (9, 8, 3), (10, 2, 7)):
+                    body = {
+                        "seven_day": {"utilization": 10, "resets_at": f"2999-01-{weekly:02d}T00:00:00Z"},
+                        "five_hour": {"utilization": 0, "resets_at": "2999-01-01T00:00:00Z"},
+                    }
+                    if model is None:
+                        body["seven_day_fable"] = {"utilization": 20, "resets_at": f"2999-01-{fable:02d}T00:00:00Z"}
+                    else:
+                        body["limits"] = [
+                            {"kind": "session", "scope": None, "percent": 63, "resets_at": "2999-01-01T00:00:00.812665+00:00"},
+                            {"kind": "weekly_all", "scope": None, "percent": 78, "resets_at": f"2999-01-{weekly:02d}T00:00:00.812683+00:00"},
+                            {"kind": "weekly_scoped", "scope": {"model": model, "surface": None}, "percent": 0, "resets_at": f"2999-01-{fable:02d}T00:00:00+00:00", "is_active": False},
+                        ]
+                    self.management.server.usage[f"index-{name}"] = body
+                result = self.run_fleet("order", "claude", "reset")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(ACCOUNTS.load_state(self.home)["providers"]["claude"]["order"], [names[1], names[2], names[0]])
+                if model is not None:
+                    for name in names:
+                        body = self.management.server.usage[f"index-{name}"]
+                        body["seven_day"]["resets_at"] = "2999-01-05T00:00:00Z" if name == names[0] else "2999-01-04T23:59:59Z"
+                        body["limits"][1]["resets_at"] = "2999-01-05T00:00:00.812683+00:00"
+                        body["limits"][2]["resets_at"] = "2999-01-10T00:00:00+00:00"
+                    result = self.run_fleet("order", "claude", "rebalance")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(ACCOUNTS.load_state(self.home)["providers"]["claude"]["order"], [names[0], names[1], names[2]])
+
+    def test_override_survives_rebalance_and_off_restores_reset_order(self):
+        for provider in ACCOUNTS.PROVIDERS:
+            with self.subTest(provider=provider):
+                names = [f"{provider}-{stem}.json" for stem in ("main", "early", "override")]
+                for stem in ("main", "early", "override"):
+                    self.add_account(provider, stem)
+                self.write_state(**{provider: {"accounts": dict(zip(names, ("Main", "Early", "Chosen"))), "primary": names[0], "auto": True, "order": names, "rebalance": "reset"}})
+                self.policy.write_bytes(ACCOUNTS.account_routing_bytes({"version": 1, "providers": {"claude": "limits", "codex": "limits"}, "credits": {"claude": "never", "codex": "last"}}))
+                self.policy.chmod(0o600)
+                routing_before = self.policy.read_bytes()
+                self.management.server.usage = {
+                    f"index-{name}": {"rate_limit": {"primary_window": {"used_percent": 10, "reset_at": reset}}} if provider == "codex" else {"seven_day": {"utilization": 10, "resets_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(reset))}}
+                    for name, reset in zip(names, (9000, 1000, 5000))
+                }
+                result = self.run_fleet("override", provider, "Chosen")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                policy = ACCOUNTS.load_state(self.home)["providers"][provider]
+                self.assertEqual(policy["override"], names[2])
+                self.assertEqual(policy["preferred"], names[0])
+                self.assertEqual(policy["primary"], names[2])
+                result = self.run_fleet("order", provider, "rebalance")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(ACCOUNTS.load_state(self.home)["providers"][provider]["order"], [names[2], names[1], names[0]])
+                self.assertTrue(all(not self.management.server.accounts[name]["disabled"] for name in names))
+                self.assertEqual(ACCOUNTS.load_account_routing(self.home), json.loads(routing_before) | {"selection": {provider: "priority"}})
+                result = self.run_fleet("override", provider, "off")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                policy = ACCOUNTS.load_state(self.home)["providers"][provider]
+                self.assertNotIn("override", policy)
+                self.assertEqual(policy["preferred"], names[0])
+                self.assertEqual(policy["order"], [names[1], names[2], names[0]])
+                self.assertEqual(ACCOUNTS.load_account_routing(self.home), json.loads(routing_before) | {"selection": {provider: "priority"}})
+                resets = [item for item in self.management.server.history if item[0].endswith("/session-affinity/reset") and item[1] == provider]
+                self.assertEqual(len(resets), 2)
+
+    def test_override_reset_failure_restores_policy_and_priorities(self):
+        for wanted in ("Second", "off"):
+            with self.subTest(wanted=wanted):
+                for stem in ("first", "second"):
+                    self.add_account("claude", stem, priority=9 if stem == "first" else 4)
+                names = ["claude-first.json", "claude-second.json"]
+                policy = {"accounts": dict(zip(names, ("First", "Second"))), "primary": names[0], "auto": True, "order": names, "rebalance": "reset"}
+                if wanted == "off":
+                    policy["override"] = names[0]
+                    policy.pop("rebalance")
+                self.write_state(claude=policy)
+                before = self.state.read_bytes()
+                routing = ACCOUNTS.default_account_routing() | {"credits": {"claude": "never"}, "selection": {"codex": "priority", **({"claude": "priority"} if wanted == "off" else {})}}
+                self.policy.write_bytes(ACCOUNTS.account_routing_bytes(routing))
+                self.policy.chmod(0o600)
+                routing_before = self.policy.read_bytes()
+                self.management.server.affinity_reset_fail = True
+                self.management.server.usage = {f"index-{name}": {"seven_day": {"utilization": 0, "resets_at": f"2999-01-0{day}T00:00:00Z"}} for name, day in zip(names, (9, 1))}
+                result = self.run_fleet("override", "claude", wanted)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("rolled back", result.stderr)
+                self.assertEqual(self.state.read_bytes(), before)
+                self.assertEqual(self.policy.read_bytes(), routing_before)
+                self.assertEqual([self.management.server.accounts[name]["priority"] for name in names], [9, 4])
+
+    def test_optional_preference_and_override_state_is_validated(self):
+        names = ["codex-first.json", "codex-second.json"]
+        self.write_state(codex={"accounts": dict(zip(names, ("First", "Second"))), "primary": names[0], "auto": True})
+        state = ACCOUNTS.load_state(self.home)
+        policy = state["providers"]["codex"]
+        for field in ("preferred", "override"):
+            policy[field] = names[1]
+            self.assertTrue(ACCOUNTS.valid_state(state))
+            for invalid in ("codex-missing.json", [], {}, True, None):
+                policy[field] = invalid
+                self.assertFalse(ACCOUNTS.valid_state(state))
+            del policy[field]
+
+    def test_reset_switch_failure_restores_the_previous_mode(self):
+        for failure in ("priority", "override", "unsupported", "reset"):
+            with self.subTest(failure=failure):
+                for stem in ("main", "early"):
+                    self.add_account("codex", stem, priority=9 if stem == "main" else 4)
+                names = ["codex-main.json", "codex-early.json"]
+                self.write_state(codex={"accounts": dict(zip(names, ("Main", "Early"))), "primary": names[0], "auto": True})
+                before = self.state.read_bytes()
+                routing_before = ACCOUNTS.client_config_snapshot(self.policy)
+                history_start = len(self.management.server.history)
+                self.management.server.config["fleet-priority-selection-supported"] = True
+                if failure in {"priority", "override"}:
+                    self.management.server.config.pop("fleet-priority-selection-supported")
+                self.management.server.config["fleet-session-affinity-supported"] = failure != "unsupported"
+                self.management.server.affinity_reset_fail = failure == "reset"
+                self.management.server.usage = {f"index-{name}": {"rate_limit": {"primary_window": {"used_percent": 10, "reset_at": reset}}} for name, reset in zip(names, (9000, 1000))}
+                result = self.run_fleet("override", "codex", "Early") if failure == "override" else self.run_fleet("order", "codex", "reset")
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertEqual(self.state.read_bytes(), before)
+                self.assertEqual([self.management.server.accounts[name]["priority"] for name in names], [9, 4])
+                self.assertEqual(ACCOUNTS.client_config_snapshot(self.policy), routing_before)
+                if failure in {"priority", "override", "unsupported"}:
+                    self.assertEqual([entry for entry in self.management.server.history[history_start:] if not entry[0].endswith("/api-call")], [])
+                    self.assertIn("Update the Fleet proxy", result.stderr)
+
+    def test_priority_selection_tracks_reset_and_override_without_changing_other_policies(self):
+        for provider in ACCOUNTS.PROVIDERS:
+            with self.subTest(provider=provider):
+                other = next(item for item in ACCOUNTS.PROVIDERS if item != provider)
+                names = [f"{provider}-{stem}.json" for stem in ("main", "early")]
+                for stem in ("main", "early"):
+                    self.add_account(provider, stem)
+                self.write_state(**{provider: {"accounts": dict(zip(names, ("Main", "Early"))), "primary": names[0], "auto": True}})
+                routing = {"version": 1, "providers": {"claude": "any", "codex": "limits"}, "credits": {"claude": "never", "codex": "last"}, "selection": {other: "priority"}}
+                self.policy.write_bytes(ACCOUNTS.account_routing_bytes(routing))
+                self.policy.chmod(0o600)
+                self.management.server.usage = {f"index-{name}": {"rate_limit": {"primary_window": {"used_percent": 10, "reset_at": reset}}} if provider == "codex" else {"seven_day": {"utilization": 10, "resets_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(reset))}} for name, reset in zip(names, (9000, 1000))}
+                history_start = len(self.management.server.history)
+                for command, selected in (
+                    (("order", provider, "reset"), True),
+                    (("order", provider, "reset-fallbacks"), False),
+                    (("order", provider, "reset"), True),
+                    (("order", provider, "manual"), False),
+                    (("override", provider, "Main"), True),
+                    (("order", provider, "manual"), True),
+                    (("override", provider, "off"), False),
+                    (("override", provider, "Main"), True),
+                    (("order", provider, "Early", "Main"), False),
+                ):
+                    if selected:
+                        self.management.server.config["fleet-priority-selection-supported"] = True
+                    else:
+                        self.management.server.config.pop("fleet-priority-selection-supported", None)
+                    result = self.run_fleet(*command)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    saved = ACCOUNTS.load_account_routing(self.home)
+                    self.assertEqual(saved["providers"], routing["providers"])
+                    self.assertEqual(saved["credits"], routing["credits"])
+                    self.assertEqual(saved["selection"], {other: "priority", **({provider: "priority"} if selected else {})})
+                resets = [item[1] for item in self.management.server.history[history_start:] if item[0].endswith("/session-affinity/reset")]
+                self.assertEqual(set(resets), {provider})
+
+    def test_priority_selection_rejects_invalid_saved_policy(self):
+        for invalid in (None, [], "priority", {"other": "priority"}, {"claude": "invalid"}, {"claude": []}):
+            with self.subTest(selection=invalid):
+                self.policy.write_bytes(ACCOUNTS.account_routing_bytes(ACCOUNTS.default_account_routing() | {"selection": invalid}))
+                self.policy.chmod(0o600)
+                with self.assertRaises(ACCOUNTS.fleet.FleetError):
+                    ACCOUNTS.load_account_routing(self.home)
+
+    def test_selection_save_failure_rolls_back_priorities_and_account_state(self):
+        for stem in ("main", "early"):
+            self.add_account("claude", stem, priority=9 if stem == "main" else 4)
+        names = ["claude-main.json", "claude-early.json"]
+        self.write_state(claude={"accounts": dict(zip(names, ("Main", "Early"))), "primary": names[0], "auto": True})
+        before = self.state.read_bytes()
+        atomic_write = ACCOUNTS.fleet.atomic_write
+
+        def fail_routing(home, path, *args, **kwargs):
+            if path == self.policy:
+                raise OSError("injected policy save failure")
+            return atomic_write(home, path, *args, **kwargs)
+
+        with mock.patch.dict(os.environ, self.environment), mock.patch.object(ACCOUNTS.fleet, "atomic_write", side_effect=fail_routing):
+            with self.assertRaises(ACCOUNTS.fleet.FleetError):
+                ACCOUNTS.override_account(self.home, "claude", "Early")
+        self.assertEqual(self.state.read_bytes(), before)
+        self.assertFalse(self.policy.exists())
+        self.assertEqual([self.management.server.accounts[name]["priority"] for name in names], [9, 4])
+        self.assertFalse(any(item[0].endswith("/session-affinity/reset") for item in self.management.server.history))
 
     def test_list_shows_usage_windows_and_reset_countdown(self):
         self.add_account("codex", "work", priority=100)
